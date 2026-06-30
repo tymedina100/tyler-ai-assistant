@@ -47,13 +47,27 @@ def ask_ai(prompt):
 def show_help():
     print("""
 Available commands:
-/help   - Show this help menu
-/clear  - Clear the current conversation memory
-/quit   - Exit the assistant
+/help    - Show this help menu
+/clear   - Clear the current conversation memory
+/history - Show the current conversation memory
+/quit    - Exit the assistant
 
 Anything else will be sent to the AI.
 """)
     
+    
+def show_history():
+    if len(conversation_history) == 0:
+        print("Conversation history is empty.")
+        return
+
+    print("\nConversation history:")
+
+    for message in conversation_history:
+        role = message["role"]
+        content = message["content"]
+
+        print(f"\n{role.upper()}: {content}")
     
 
 def main():
@@ -78,6 +92,10 @@ def main():
         if command in ["quit", "/quit"]:
             print("Goodbye!")
             break
+        
+        if command == "/history":
+            show_history()
+            continue
 
         answer = ask_ai(user_prompt)
 
