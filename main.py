@@ -42,19 +42,23 @@ def ask_ai(prompt):
         return "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
 
 
-while True:
-    user_prompt = input("\nAsk the AI something, or type 'quit' to exit: ")
+def main():
+    while True:
+        user_prompt = input("\nAsk the AI something, or type 'quit' to exit: ")
 
-    if user_prompt.strip() == "":
-        print("Please type something before pressing Enter.")
-        continue
+        if user_prompt.strip() == "":
+            print("Please type something before pressing Enter.")
+            continue
 
-    if user_prompt.lower().strip() == "quit":
-        print("Goodbye!")
-        break
+        if user_prompt.lower().strip() == "quit":
+            print("Goodbye!")
+            break
 
-    answer = ask_ai(user_prompt)
+        answer = ask_ai(user_prompt)
 
-    print()
-    print("AI response:")
-    print(answer)
+        print()
+        print("AI response:")
+        print(answer)
+
+if __name__ == "__main__":
+    main()
