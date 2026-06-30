@@ -21,6 +21,8 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
 - `/search <query>` command to search the web and get a summarized answer
 - `/remember <fact>` command to explicitly save something to long-term memory
 - `/recall <query>` command to see what long-term memory has stored about a topic
+- Four specialist agents, each with its own role and curated tool access — see
+  "Specialist agents" below
 - `/quit` command to exit
 - API keys stored safely in a `.env` file (never committed to git)
 
@@ -104,3 +106,27 @@ for itself which capability to use, instead of you having to know the right comm
   exactly as before — they're deterministic and don't involve the AI deciding anything.
   Use them when you want to do exactly one specific thing; use plain chat when you want
   the assistant to figure out what's needed on its own.
+
+## Specialist agents
+
+Beyond the general assistant, four specialist commands each use the same tool-calling
+machinery as plain chat, but with a different system prompt and a **curated subset**
+of tools — not every specialist can do everything:
+
+| Command | Specialist | Tools it has |
+|---|---|---|
+| `/code <task>` | Coding Agent | read file, write file, search the web, recall memory |
+| `/research <topic>` | Researcher Agent | search the web, recall memory, remember a fact |
+| `/write <prompt>` | Writer Agent | read file, write file, recall memory |
+| `/task <request>` | Personal Assistant Agent | remember a fact, recall memory, write file, read file |
+
+This is deliberate: for example, the Researcher Agent *cannot* call `write_file` even
+if asked to — it genuinely doesn't have access to that tool, so it'll tell you it can't
+and offer the content for you to save yourself, rather than faking it. Scoping each
+agent to only the tools its role needs is a basic safety practice (least privilege),
+not just an organizational nicety.
+
+All specialists share the same `conversation_history` and long-term memory as plain
+chat and each other — there's one memory store for the whole assistant, not one per
+agent. A fact saved via `/task` (Personal Assistant) can be recalled later in plain
+chat or by any other specialist.

@@ -84,42 +84,32 @@ def get_embedding(text):
         return None
 
 
-def ask_ai(prompt):
+def build_augmented_prompt(prompt):
     memories = recall_memories(prompt, n_results=3)
 
-    if len(memories) > 0:
-        memory_text = "\n".join(f"- {memory['text']}" for memory in memories)
-        augmented_prompt = f"""
+    if len(memories) == 0:
+        return prompt
+
+    memory_text = "\n".join(f"- {memory['text']}" for memory in memories)
+    return f"""
 Relevant memories from earlier conversations:
 {memory_text}
 
 Current message:
 {prompt}
 """
-    else:
-        augmented_prompt = prompt
 
-    # Real history keeps the plain prompt; only this one-off call sees the
-    # memory-augmented version, so /history never shows the injected memories.
-    conversation_history.append({
-        "role": "user",
-        "content": prompt
-    })
 
-    input_items = conversation_history[:-1] + [{
-        "role": "user",
-        "content": augmented_prompt
-    }]
-
+def run_with_tools(instructions, input_items, tools):
     assistant_response = "Sorry, I tried too many tool calls without finishing. Please try rephrasing."
 
     try:
         for _ in range(MAX_TOOL_ITERATIONS):
             response = client.responses.create(
                 model=MODEL_NAME,
-                instructions=ASSISTANT_INSTRUCTIONS,
+                instructions=instructions,
                 input=input_items,
-                tools=TOOLS
+                tools=tools
             )
 
             function_calls = [item for item in response.output if item.type == "function_call"]
@@ -140,6 +130,26 @@ Current message:
 
     except Exception:
         assistant_response = "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
+
+    return assistant_response
+
+
+def ask_ai(prompt):
+    augmented_prompt = build_augmented_prompt(prompt)
+
+    # Real history keeps the plain prompt; only this one-off call sees the
+    # memory-augmented version, so /history never shows the injected memories.
+    conversation_history.append({
+        "role": "user",
+        "content": prompt
+    })
+
+    input_items = conversation_history[:-1] + [{
+        "role": "user",
+        "content": augmented_prompt
+    }]
+
+    assistant_response = run_with_tools(ASSISTANT_INSTRUCTIONS, input_items, TOOLS)
 
     conversation_history.append({
         "role": "assistant",
@@ -162,6 +172,10 @@ Available commands:
 /search <query>             - Search the web and get an AI-summarized answer
 /remember <fact>            - Save a fact to long-term memory
 /recall <query>             - See what long-term memory has stored about a topic
+/code <task>                - Ask the Coding Agent
+/research <topic>           - Ask the Researcher Agent
+/write <prompt>             - Ask the Writer Agent
+/task <request>             - Ask the Personal Assistant Agent
 /quit                       - Exit the assistant
 
 Anything else will be sent to the AI.
@@ -438,6 +452,77 @@ def execute_tool(name, arguments):
     return f"Unknown tool: {name}"
 
 
+SPECIALISTS = {
+    "code": {
+        "label": "Coding Agent",
+        "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories"],
+        "instructions": """
+You are a careful coding assistant. Help the user write, read, and debug code.
+Use write_file to save code you're asked to create or change, and read_file to
+check existing files before editing them. Use search_the_web if you need to look
+up an error or current documentation. Explain your reasoning briefly and prefer
+simple, correct solutions over clever ones.
+"""
+    },
+    "research": {
+        "label": "Researcher Agent",
+        "tool_names": ["search_the_web", "recall_memories", "remember_fact"],
+        "instructions": """
+You are a thorough research assistant. Use search_the_web to find current,
+accurate information and cite your sources. Use remember_fact to save important
+findings for later, and recall_memories to check what's already been researched
+before searching again. Be clear about what is verified fact versus speculation.
+"""
+    },
+    "write": {
+        "label": "Writer Agent",
+        "tool_names": ["read_file", "write_file", "recall_memories"],
+        "instructions": """
+You are a skilled writing assistant. Help the user draft, edit, and improve
+written content. Use read_file to review an existing draft before editing it,
+and write_file to save a finished draft when asked. Match the tone the user
+requests and keep writing clear.
+"""
+    },
+    "task": {
+        "label": "Personal Assistant Agent",
+        "tool_names": ["remember_fact", "recall_memories", "write_file", "read_file"],
+        "instructions": """
+You are an organized personal assistant. Use remember_fact to save important
+personal information, reminders, and preferences, and recall_memories to recall
+them later. Use write_file to maintain simple notes or to-do lists when asked.
+Be concise and proactive.
+"""
+    },
+}
+
+
+def ask_specialist(specialist_key, prompt):
+    profile = SPECIALISTS[specialist_key]
+    specialist_tools = [tool for tool in TOOLS if tool["name"] in profile["tool_names"]]
+
+    augmented_prompt = build_augmented_prompt(prompt)
+    input_items = [{"role": "user", "content": augmented_prompt}]
+
+    answer = run_with_tools(profile["instructions"], input_items, specialist_tools)
+
+    conversation_history.append({
+        "role": "user",
+        "content": f"Asked {profile['label']}: {prompt}"
+    })
+
+    conversation_history.append({
+        "role": "assistant",
+        "content": answer
+    })
+
+    store_memory(f"Asked {profile['label']}: {prompt}\n{profile['label']} replied: {answer[:200]}", source="chat")
+
+    print()
+    print(f"{profile['label']} response:")
+    print(answer)
+
+
 def main():
     while True:
         user_prompt = input("\nAsk the AI something, or type 'quit' to exit: ")
@@ -511,6 +596,46 @@ def main():
                 continue
 
             show_recall(query)
+            continue
+
+        if command.startswith("/code "):
+            task = user_prompt[6:].strip()
+
+            if task == "":
+                print("Usage: /code <task>")
+                continue
+
+            ask_specialist("code", task)
+            continue
+
+        if command.startswith("/research "):
+            topic = user_prompt[10:].strip()
+
+            if topic == "":
+                print("Usage: /research <topic>")
+                continue
+
+            ask_specialist("research", topic)
+            continue
+
+        if command.startswith("/write "):
+            task = user_prompt[7:].strip()
+
+            if task == "":
+                print("Usage: /write <prompt>")
+                continue
+
+            ask_specialist("write", task)
+            continue
+
+        if command.startswith("/task "):
+            request = user_prompt[6:].strip()
+
+            if request == "":
+                print("Usage: /task <request>")
+                continue
+
+            ask_specialist("task", request)
             continue
 
         answer = ask_ai(user_prompt)
