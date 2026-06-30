@@ -1,19 +1,29 @@
+import uuid
+from datetime import datetime
 from pathlib import Path
 
+import chromadb
 from dotenv import load_dotenv
 from openai import OpenAI
+from tavily import TavilyClient
 
 
 load_dotenv()
 
 client = OpenAI()
+tavily_client = TavilyClient()
 
 conversation_history = []
 
 MODEL_NAME = "gpt-5.5"
+EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 
 BASE_DIR = Path(__file__).parent
 FILES_DIR = BASE_DIR / "files"
+
+MEMORY_DIR = BASE_DIR / "memory_db"
+chroma_client = chromadb.PersistentClient(path=str(MEMORY_DIR))
+memory_collection = chroma_client.get_or_create_collection(name="long_term_memory")
 
 ASSISTANT_INSTRUCTIONS = """
 You are Tyler's beginner-friendly AI assistant.
@@ -38,18 +48,51 @@ def get_ai_response(input_messages):
         return "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
 
 
+def get_embedding(text):
+    try:
+        response = client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=text)
+        return response.data[0].embedding
+
+    except Exception:
+        print("Sorry, something went wrong while embedding text for memory.")
+        return None
+
+
 def ask_ai(prompt):
+    memories = recall_memories(prompt, n_results=3)
+
+    if len(memories) > 0:
+        memory_text = "\n".join(f"- {memory['text']}" for memory in memories)
+        augmented_prompt = f"""
+Relevant memories from earlier conversations:
+{memory_text}
+
+Current message:
+{prompt}
+"""
+    else:
+        augmented_prompt = prompt
+
+    # Real history keeps the plain prompt; only this one-off call sees the
+    # memory-augmented version, so /history never shows the injected memories.
     conversation_history.append({
         "role": "user",
         "content": prompt
     })
 
-    assistant_response = get_ai_response(conversation_history)
+    temporary_history = conversation_history[:-1] + [{
+        "role": "user",
+        "content": augmented_prompt
+    }]
+
+    assistant_response = get_ai_response(temporary_history)
 
     conversation_history.append({
         "role": "assistant",
         "content": assistant_response
     })
+
+    store_memory(f"User said: {prompt}\nAssistant replied: {assistant_response[:200]}", source="chat")
 
     return assistant_response
 
@@ -62,6 +105,9 @@ Available commands:
 /history                    - Show the current conversation memory
 /read <filename>            - Read a file from the files folder
 /askfile <filename> <question> - Ask a question about a file
+/search <query>             - Search the web and get an AI-summarized answer
+/remember <fact>            - Save a fact to long-term memory
+/recall <query>             - See what long-term memory has stored about a topic
 /quit                       - Exit the assistant
 
 Anything else will be sent to the AI.
@@ -166,6 +212,123 @@ User question:
     print(answer)
 
 
+def search_web(query):
+    try:
+        response = tavily_client.search(query, max_results=5)
+        return response["results"]
+
+    except Exception:
+        print("Sorry, something went wrong while searching the web. Check your Tavily API key or internet connection.")
+        return None
+
+
+def ask_search(query):
+    results = search_web(query)
+
+    if results is None:
+        return
+
+    if len(results) == 0:
+        print(f"No search results found for: {query}")
+        return
+
+    formatted_results = ""
+
+    for result in results:
+        formatted_results += f"\nTitle: {result['title']}\nURL: {result['url']}\nContent: {result['content']}\n"
+
+    prompt = f"""
+Use the web search results below to answer the user's question.
+Mention which source(s) you used when relevant.
+
+Search query: {query}
+
+Search results:
+{formatted_results}
+
+User question:
+{query}
+"""
+
+    temporary_history = conversation_history + [{
+        "role": "user",
+        "content": prompt
+    }]
+
+    answer = get_ai_response(temporary_history)
+
+    conversation_history.append({
+        "role": "user",
+        "content": f"Searched the web for: {query}"
+    })
+
+    conversation_history.append({
+        "role": "assistant",
+        "content": answer
+    })
+
+    print()
+    print("AI response:")
+    print(answer)
+
+
+def store_memory(text, source="chat"):
+    embedding = get_embedding(text)
+
+    if embedding is None:
+        return
+
+    memory_collection.add(
+        ids=[str(uuid.uuid4())],
+        embeddings=[embedding],
+        documents=[text],
+        metadatas=[{"source": source, "timestamp": datetime.now().isoformat()}]
+    )
+
+
+def remember_fact(fact):
+    store_memory(fact, source="remember")
+    print(f"Got it, I'll remember: {fact}")
+
+
+def recall_memories(query, n_results=3):
+    if memory_collection.count() == 0:
+        return []
+
+    embedding = get_embedding(query)
+
+    if embedding is None:
+        return []
+
+    results = memory_collection.query(
+        query_embeddings=[embedding],
+        n_results=min(n_results, memory_collection.count())
+    )
+
+    memories = []
+
+    for document, distance in zip(results["documents"][0], results["distances"][0]):
+        memories.append({"text": document, "distance": distance})
+
+    return memories
+
+
+def show_recall(query):
+    # Chroma always returns its closest matches even if none are truly relevant -
+    # there's no built-in relevance cutoff, so a sparse memory store can surface
+    # unrelated results. Lower distance = more similar.
+    memories = recall_memories(query, n_results=5)
+
+    if len(memories) == 0:
+        print("No memories stored yet.")
+        return
+
+    print(f"\nMemories related to: {query}")
+
+    for memory in memories:
+        print(f"\n[distance {memory['distance']:.4f}] {memory['text']}")
+
+
 def main():
     while True:
         user_prompt = input("\nAsk the AI something, or type 'quit' to exit: ")
@@ -209,6 +372,36 @@ def main():
             question = parts[2]
 
             ask_file(filename, question)
+            continue
+
+        if command.startswith("/search "):
+            query = user_prompt[8:].strip()
+
+            if query == "":
+                print("Usage: /search <query>")
+                continue
+
+            ask_search(query)
+            continue
+
+        if command.startswith("/remember "):
+            fact = user_prompt[10:].strip()
+
+            if fact == "":
+                print("Usage: /remember <fact>")
+                continue
+
+            remember_fact(fact)
+            continue
+
+        if command.startswith("/recall "):
+            query = user_prompt[8:].strip()
+
+            if query == "":
+                print("Usage: /recall <query>")
+                continue
+
+            show_recall(query)
             continue
 
         answer = ask_ai(user_prompt)
