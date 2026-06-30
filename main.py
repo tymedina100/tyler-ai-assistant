@@ -1,3 +1,5 @@
+import json
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +10,11 @@ from openai import OpenAI
 from tavily import TavilyClient
 
 
+# Windows consoles default to a limited encoding (cp1252) that can't print
+# every Unicode character (e.g. em dashes, curly quotes) - web search results
+# and AI output can easily contain these, so force UTF-8 output to avoid crashes.
+sys.stdout.reconfigure(encoding="utf-8")
+
 load_dotenv()
 
 client = OpenAI()
@@ -17,6 +24,25 @@ conversation_history = []
 
 MODEL_NAME = "gpt-5.5"
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+MAX_TOOL_ITERATIONS = 5
+
+TOOLS = [
+    {"type": "function", "name": "read_file", "strict": False,
+     "description": "Read the contents of a file from the sandboxed files/ folder.",
+     "parameters": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]}},
+    {"type": "function", "name": "search_the_web", "strict": False,
+     "description": "Search the web for current information.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"type": "function", "name": "remember_fact", "strict": False,
+     "description": "Save an important fact to long-term memory for future conversations.",
+     "parameters": {"type": "object", "properties": {"fact": {"type": "string"}}, "required": ["fact"]}},
+    {"type": "function", "name": "recall_memories", "strict": False,
+     "description": "Search long-term memory for facts related to a topic.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"type": "function", "name": "write_file", "strict": False,
+     "description": "Create or overwrite a file in the sandboxed files/ folder with given text content.",
+     "parameters": {"type": "object", "properties": {"filename": {"type": "string"}, "content": {"type": "string"}}, "required": ["filename", "content"]}},
+]
 
 BASE_DIR = Path(__file__).parent
 FILES_DIR = BASE_DIR / "files"
@@ -80,12 +106,40 @@ Current message:
         "content": prompt
     })
 
-    temporary_history = conversation_history[:-1] + [{
+    input_items = conversation_history[:-1] + [{
         "role": "user",
         "content": augmented_prompt
     }]
 
-    assistant_response = get_ai_response(temporary_history)
+    assistant_response = "Sorry, I tried too many tool calls without finishing. Please try rephrasing."
+
+    try:
+        for _ in range(MAX_TOOL_ITERATIONS):
+            response = client.responses.create(
+                model=MODEL_NAME,
+                instructions=ASSISTANT_INSTRUCTIONS,
+                input=input_items,
+                tools=TOOLS
+            )
+
+            function_calls = [item for item in response.output if item.type == "function_call"]
+
+            if not function_calls:
+                assistant_response = response.output_text
+                break
+
+            input_items += response.output
+
+            for call in function_calls:
+                result = execute_tool(call.name, json.loads(call.arguments))
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": result
+                })
+
+    except Exception:
+        assistant_response = "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
 
     conversation_history.append({
         "role": "assistant",
@@ -159,6 +213,16 @@ def read_file(filename):
 
     print(f"\nContents of {filename}:")
     print(content)
+
+
+def write_file(filename, content):
+    file_path = get_safe_file_path(filename)
+
+    if file_path is None:
+        return "Access denied. You can only write files inside the files folder."
+
+    file_path.write_text(content, encoding="utf-8")
+    return f"Saved to {filename}."
 
 
 def ask_file(filename, question):
@@ -327,6 +391,51 @@ def show_recall(query):
 
     for memory in memories:
         print(f"\n[distance {memory['distance']:.4f}] {memory['text']}")
+
+
+def execute_tool(name, arguments):
+    print(f"\n[tool] {name}({arguments})")
+
+    if name == "read_file":
+        file_path = get_safe_file_path(arguments["filename"])
+
+        if file_path is None:
+            return "Access denied. You can only read files inside the files folder."
+
+        if not file_path.exists() or not file_path.is_file():
+            return f"File not found: {arguments['filename']}"
+
+        return file_path.read_text(encoding="utf-8")
+
+    if name == "search_the_web":
+        results = search_web(arguments["query"])
+
+        if not results:
+            return "No search results found."
+
+        return "\n".join(f"{r['title']}: {r['content']} ({r['url']})" for r in results)
+
+    if name == "remember_fact":
+        store_memory(arguments["fact"], source="remember")
+        return f"Saved to memory: {arguments['fact']}"
+
+    if name == "recall_memories":
+        memories = recall_memories(arguments["query"], n_results=5)
+
+        if not memories:
+            return "No memories found."
+
+        return "\n".join(memory["text"] for memory in memories)
+
+    if name == "write_file":
+        answer = input(f"The AI wants to write to files/{arguments['filename']}. Allow? (y/n): ")
+
+        if answer.strip().lower() != "y":
+            return "The user denied permission to write this file."
+
+        return write_file(arguments["filename"], arguments["content"])
+
+    return f"Unknown tool: {name}"
 
 
 def main():

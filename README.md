@@ -10,6 +10,9 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
   (see "How long-term memory works" below)
 - Read files from a sandboxed `files/` folder and ask questions about them
 - Search the web (via Tavily) and get an AI-summarized answer with sources
+- Plain chat can autonomously use tools (read a file, search the web, save/recall a
+  memory, write a file) without you needing to type a command — see "How automation
+  works" below
 - `/help` command
 - `/clear` command to reset short-term memory (long-term memory is untouched)
 - `/history` command to view current short-term memory
@@ -81,3 +84,23 @@ database in the `memory_db/` folder. It survives across separate runs of the pro
   the store doesn't have anything better — `/recall` exists so you can see that
   happening instead of it being a black box.
 - `memory_db/` is gitignored (it's local generated data, like `.venv/`).
+
+## How automation works
+
+Plain chat messages (anything you type that *isn't* a `/command`) let the AI decide
+for itself which capability to use, instead of you having to know the right command:
+
+- **Read a file, search the web, save a memory, or recall a memory** — the AI calls
+  the same underlying functions the slash commands use, but decides on its own when
+  they're needed. For example, "what's in sample.txt?" triggers a file read with no
+  `/read` needed.
+- **Write a file** — a new capability (`write_file`), sandboxed to the `files/` folder
+  just like reading. Because this is the one capability that changes something on
+  disk, the assistant always asks for confirmation first: `Allow? (y/n)`. Answering
+  anything other than `y` cancels the write.
+- Every autonomous tool call prints a `[tool] name(arguments)` line first, so you can
+  always see what the AI is doing and why — it's never a silent black box.
+- Slash commands (`/read`, `/askfile`, `/search`, `/remember`, `/recall`) still work
+  exactly as before — they're deterministic and don't involve the AI deciding anything.
+  Use them when you want to do exactly one specific thing; use plain chat when you want
+  the assistant to figure out what's needed on its own.
