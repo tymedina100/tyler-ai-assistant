@@ -10,9 +10,9 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
   (see "How long-term memory works" below)
 - Read files from a sandboxed `files/` folder and ask questions about them
 - Search the web (via Tavily) and get an AI-summarized answer with sources
-- Plain chat can autonomously use tools (read a file, search the web, save/recall a
-  memory, write a file) without you needing to type a command — see "How automation
-  works" below
+- A Manager Agent reads plain chat messages and routes each one to whichever
+  specialist (or the general assistant) fits best — no command needed, see "Manager
+  agent" below
 - `/help` command
 - `/clear` command to reset short-term memory (long-term memory is untouched)
 - `/history` command to view current short-term memory
@@ -89,23 +89,42 @@ database in the `memory_db/` folder. It survives across separate runs of the pro
 
 ## How automation works
 
-Plain chat messages (anything you type that *isn't* a `/command`) let the AI decide
-for itself which capability to use, instead of you having to know the right command:
+Each capability (read a file, search the web, save/recall a memory, write a file) is
+exposed as a tool the AI can call on its own instead of you needing the exact command:
 
-- **Read a file, search the web, save a memory, or recall a memory** — the AI calls
-  the same underlying functions the slash commands use, but decides on its own when
-  they're needed. For example, "what's in sample.txt?" triggers a file read with no
-  `/read` needed.
-- **Write a file** — a new capability (`write_file`), sandboxed to the `files/` folder
-  just like reading. Because this is the one capability that changes something on
-  disk, the assistant always asks for confirmation first: `Allow? (y/n)`. Answering
-  anything other than `y` cancels the write.
+- **Write a file** is the one capability that changes something on disk, so it always
+  asks for confirmation first: `Allow? (y/n)`. Answering anything other than `y`
+  cancels the write.
 - Every autonomous tool call prints a `[tool] name(arguments)` line first, so you can
-  always see what the AI is doing and why — it's never a silent black box.
-- Slash commands (`/read`, `/askfile`, `/search`, `/remember`, `/recall`) still work
-  exactly as before — they're deterministic and don't involve the AI deciding anything.
-  Use them when you want to do exactly one specific thing; use plain chat when you want
-  the assistant to figure out what's needed on its own.
+  always see what's happening and why — it's never a silent black box.
+- Slash commands (`/read`, `/askfile`, `/search`, `/remember`, `/recall`, `/code`,
+  `/research`, `/write`, `/task`) still work exactly as before — they're deterministic
+  and call a specific agent directly, with no routing decision involved.
+
+## Manager agent
+
+Plain chat (anything you type that *isn't* a `/command`) now goes through a **Manager
+Agent** instead of talking to one fixed assistant. The Manager's only job is to read
+your message and delegate it — via a tool call, exactly like the other tools in this
+app — to whichever agent fits best:
+
+- One of the four specialists (`code`, `research`, `write`, `task`)
+- The **general assistant** (the same all-purpose, all-tools assistant from Week 4),
+  for anything that doesn't clearly fit a specialist
+
+You'll see two response blocks for a delegated message: the specialist's own answer
+(e.g. `Coding Agent response: ...`), then the Manager's final answer (`Manager
+response: ...`), which just relays it. That's intentional — it's the delegation chain
+made visible, not a bug. Note the Manager's routing is a real judgment call by the
+model, not a fixed rule: a question like "what's the capital of Norway?" might get
+routed to the Researcher (if it decides a fresh lookup is warranted) or straight to the
+general assistant (if it judges a well-known fact doesn't need a web search) —
+both are reasonable, and which one happens can vary.
+
+`/history` always shows your literal message and the Manager's final answer, never the
+Manager's internal tool-call phrasing of the delegated task — the Manager owns that
+log entry itself rather than relying on the delegated agent to record it, specifically
+so your original wording is never lost or paraphrased in the permanent record.
 
 ## Specialist agents
 

@@ -44,6 +44,24 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {"filename": {"type": "string"}, "content": {"type": "string"}}, "required": ["filename", "content"]}},
 ]
 
+DELEGATION_TOOLS = [
+    {"type": "function", "name": "delegate_to_coding_agent", "strict": False,
+     "description": "Delegate a programming, code-writing, code-reading, or debugging task to the Coding Agent.",
+     "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
+    {"type": "function", "name": "delegate_to_research_agent", "strict": False,
+     "description": "Delegate a research or information-lookup request to the Researcher Agent.",
+     "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}},
+    {"type": "function", "name": "delegate_to_writer_agent", "strict": False,
+     "description": "Delegate a writing, drafting, or editing request to the Writer Agent.",
+     "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
+    {"type": "function", "name": "delegate_to_personal_assistant", "strict": False,
+     "description": "Delegate a personal note, reminder, preference, or to-do request to the Personal Assistant Agent.",
+     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
+    {"type": "function", "name": "delegate_to_general_assistant", "strict": False,
+     "description": "Delegate anything that doesn't clearly fit a specialist to the General Assistant.",
+     "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
+]
+
 BASE_DIR = Path(__file__).parent
 FILES_DIR = BASE_DIR / "files"
 
@@ -57,6 +75,21 @@ Be honest about uncertainty.
 If the user asks for current, live, recent, or real-time information,
 and you do not have a tool for it, say that you cannot verify it yet.
 Keep explanations clear and concise.
+"""
+
+MANAGER_INSTRUCTIONS = """
+You are a manager agent. Your only job is to read the user's request and delegate
+it to exactly one of the following agents using a tool call - never answer the
+user directly yourself:
+- delegate_to_coding_agent: programming, code-writing, code-reading, or debugging
+- delegate_to_research_agent: looking up information, facts, or current events
+- delegate_to_writer_agent: drafting, editing, or improving written content
+- delegate_to_personal_assistant: reminders, personal notes, preferences, to-do lists
+- delegate_to_general_assistant: anything else, or simple questions that don't fit
+  a specialist
+After the agent responds, present its answer back to the user as your final
+answer. Do not significantly rewrite it - relay it, with at most one short
+framing sentence.
 """
 
 
@@ -134,29 +167,35 @@ def run_with_tools(instructions, input_items, tools):
     return assistant_response
 
 
-def ask_ai(prompt):
+def ask_ai(prompt, record_history=True):
     augmented_prompt = build_augmented_prompt(prompt)
 
-    # Real history keeps the plain prompt; only this one-off call sees the
-    # memory-augmented version, so /history never shows the injected memories.
-    conversation_history.append({
-        "role": "user",
-        "content": prompt
-    })
+    if record_history:
+        # Real history keeps the plain prompt; only this one-off call sees the
+        # memory-augmented version, so /history never shows the injected memories.
+        conversation_history.append({
+            "role": "user",
+            "content": prompt
+        })
 
-    input_items = conversation_history[:-1] + [{
-        "role": "user",
-        "content": augmented_prompt
-    }]
+        input_items = conversation_history[:-1] + [{
+            "role": "user",
+            "content": augmented_prompt
+        }]
+    else:
+        # Called as a Manager delegation target - the Manager logs the real
+        # conversation_history entry itself, using the user's verbatim message.
+        input_items = [{"role": "user", "content": augmented_prompt}]
 
     assistant_response = run_with_tools(ASSISTANT_INSTRUCTIONS, input_items, TOOLS)
 
-    conversation_history.append({
-        "role": "assistant",
-        "content": assistant_response
-    })
+    if record_history:
+        conversation_history.append({
+            "role": "assistant",
+            "content": assistant_response
+        })
 
-    store_memory(f"User said: {prompt}\nAssistant replied: {assistant_response[:200]}", source="chat")
+        store_memory(f"User said: {prompt}\nAssistant replied: {assistant_response[:200]}", source="chat")
 
     return assistant_response
 
@@ -178,7 +217,8 @@ Available commands:
 /task <request>             - Ask the Personal Assistant Agent
 /quit                       - Exit the assistant
 
-Anything else will be sent to the AI.
+Anything else is routed by the Manager Agent to whichever specialist (or the
+general assistant) fits best.
 """)
 
 
@@ -449,6 +489,21 @@ def execute_tool(name, arguments):
 
         return write_file(arguments["filename"], arguments["content"])
 
+    if name == "delegate_to_coding_agent":
+        return ask_specialist("code", arguments["task"], record_history=False)
+
+    if name == "delegate_to_research_agent":
+        return ask_specialist("research", arguments["topic"], record_history=False)
+
+    if name == "delegate_to_writer_agent":
+        return ask_specialist("write", arguments["prompt"], record_history=False)
+
+    if name == "delegate_to_personal_assistant":
+        return ask_specialist("task", arguments["request"], record_history=False)
+
+    if name == "delegate_to_general_assistant":
+        return ask_ai(arguments["prompt"], record_history=False)
+
     return f"Unknown tool: {name}"
 
 
@@ -497,7 +552,7 @@ Be concise and proactive.
 }
 
 
-def ask_specialist(specialist_key, prompt):
+def ask_specialist(specialist_key, prompt, record_history=True):
     profile = SPECIALISTS[specialist_key]
     specialist_tools = [tool for tool in TOOLS if tool["name"] in profile["tool_names"]]
 
@@ -506,20 +561,40 @@ def ask_specialist(specialist_key, prompt):
 
     answer = run_with_tools(profile["instructions"], input_items, specialist_tools)
 
-    conversation_history.append({
-        "role": "user",
-        "content": f"Asked {profile['label']}: {prompt}"
-    })
+    if record_history:
+        conversation_history.append({
+            "role": "user",
+            "content": f"Asked {profile['label']}: {prompt}"
+        })
 
-    conversation_history.append({
-        "role": "assistant",
-        "content": answer
-    })
+        conversation_history.append({
+            "role": "assistant",
+            "content": answer
+        })
 
-    store_memory(f"Asked {profile['label']}: {prompt}\n{profile['label']} replied: {answer[:200]}", source="chat")
+        store_memory(f"Asked {profile['label']}: {prompt}\n{profile['label']} replied: {answer[:200]}", source="chat")
 
     print()
     print(f"{profile['label']} response:")
+    print(answer)
+
+    return answer
+
+
+def ask_manager(prompt):
+    input_items = [{"role": "user", "content": prompt}]
+    answer = run_with_tools(MANAGER_INSTRUCTIONS, input_items, DELEGATION_TOOLS)
+
+    # The Manager owns the conversation_history record (using the user's literal
+    # message), not the delegated specialist/general assistant, so /history always
+    # reflects what the user actually typed rather than the Manager's tool-call
+    # phrasing of the delegated task.
+    conversation_history.append({"role": "user", "content": prompt})
+    conversation_history.append({"role": "assistant", "content": answer})
+    store_memory(f"User said: {prompt}\nAssistant replied: {answer[:200]}", source="chat")
+
+    print()
+    print("Manager response:")
     print(answer)
 
 
@@ -638,11 +713,7 @@ def main():
             ask_specialist("task", request)
             continue
 
-        answer = ask_ai(user_prompt)
-
-        print()
-        print("AI response:")
-        print(answer)
+        ask_manager(user_prompt)
 
 
 if __name__ == "__main__":
