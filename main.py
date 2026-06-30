@@ -7,6 +7,8 @@ client = OpenAI()
 
 conversation_history = []
 
+MODEL_NAME = "gpt-5.5"
+
 ASSISTANT_INSTRUCTIONS = """
 You are Tyler's beginner-friendly AI assistant.
 Be honest about uncertainty.
@@ -24,7 +26,7 @@ def ask_ai(prompt):
 
     try:
         response = client.responses.create(
-            model="gpt-5.5",
+            model=MODEL_NAME,
             instructions=ASSISTANT_INSTRUCTIONS,
             input=conversation_history
         )
