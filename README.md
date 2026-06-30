@@ -28,6 +28,8 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
 - Reliability: automatic retries on flaky API calls, a local debug log, specific
   tool-error messages instead of crashes, and a write-overwrite warning — see
   "Reliability features" below
+- A Telegram bot interface so you can message the assistant from your phone, with
+  a Dockerfile for deploying it somewhere that runs 24/7 — see "Running 24/7" below
 
 ## Setup
 
@@ -54,10 +56,14 @@ Create a `.env` file in the project root with your API keys:
 ```
 OPENAI_API_KEY=your-openai-key-here
 TAVILY_API_KEY=your-tavily-key-here
+TELEGRAM_BOT_TOKEN=your-telegram-bot-token-here
+TELEGRAM_ALLOWED_USER_IDS=your-telegram-user-id-here
 ```
 
 - Get an OpenAI key from https://platform.openai.com
 - Get a free Tavily key (used for `/search`) from https://tavily.com
+- `TELEGRAM_BOT_TOKEN`/`TELEGRAM_ALLOWED_USER_IDS` are only needed if you're running
+  the Telegram bot (`bot.py`) — see "Running 24/7" below. Not required for the CLI.
 
 ## Usage
 
@@ -179,3 +185,63 @@ chat or by any other specialist.
   you're not approving a destructive overwrite by accident.
 - **Write size limit.** `write_file` refuses content over 50,000 characters, a basic
   guard against an accidental or runaway oversized write.
+
+## Running 24/7 (Telegram bot)
+
+`bot.py` is a second entry point alongside `main.py` — same assistant, same code
+(`ask_manager`, the specialists, every tool), reused without duplication, but reachable
+from your phone via Telegram instead of a terminal.
+
+**Run it locally first** (no deployment needed to test):
+
+```powershell
+python bot.py
+```
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) on Telegram (`/newbot`),
+   copy the token it gives you into `.env` as `TELEGRAM_BOT_TOKEN`.
+2. The bot refuses to start without `TELEGRAM_ALLOWED_USER_IDS` set — this is
+   deliberate (fail closed, not open): an unprotected bot could let a stranger who
+   finds it spend your OpenAI/Tavily credits or fill your long-term memory with junk.
+   Message your bot once anyway; it'll reply with your numeric Telegram user ID, which
+   you then add to `.env` as `TELEGRAM_ALLOWED_USER_IDS` (comma-separate multiple IDs).
+3. Message it again — now it should respond.
+
+**What's different from the CLI:**
+- **`write_file` is disabled over Telegram** (`WRITE_FILE_ENABLED = False` in `bot.py`).
+  The existing y/n confirmation uses `input()`, which has no real terminal to read from
+  in a deployed container — rather than build real async confirmation (Telegram inline
+  buttons, pending-state tracking), this scopes writing out for now. A good follow-up
+  project once the rest is solid.
+- Everything else — plain chat through the Manager, all four specialists, file
+  reading, web search, long-term memory — works the same as the CLI.
+- Long Telegram messages are split into multiple replies (Telegram's limit is ~4096
+  characters per message).
+
+**Deploying it (so it's actually running when your laptop is off):**
+
+`Dockerfile` containerizes `bot.py`. Build and run it with:
+
+```powershell
+docker build -t ai-assistant-bot .
+docker run --env-file .env ai-assistant-bot
+```
+
+I haven't tested this Docker build in this environment (no Docker available here) —
+verify it builds and runs for you before deploying anywhere.
+
+To actually run it 24/7, push this image to a platform that can keep a container
+running continuously as a **background worker** (not a web service — this bot doesn't
+listen on a port, it polls Telegram). Railway, Render, and Fly.io all support this;
+exact steps and current free-tier terms change over time, so check each platform's own
+docs rather than trusting specifics here. Whichever you pick, you'll need to:
+
+1. Set `OPENAI_API_KEY`, `TAVILY_API_KEY`, `TELEGRAM_BOT_TOKEN`, and
+   `TELEGRAM_ALLOWED_USER_IDS` as environment variables/secrets on the platform (never
+   commit `.env`).
+2. **Mount a persistent volume at `/app/memory_db`** if you want long-term memory to
+   survive restarts and redeploys. A plain container's filesystem is wiped every time
+   it restarts — without a volume, the assistant's memory resets on every deploy,
+   which defeats the point of Week 3. This is the one piece that genuinely needs your
+   attention; everything else in the Dockerfile works without it, just without
+   persistence.

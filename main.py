@@ -499,6 +499,11 @@ def show_recall(query):
         print(f"\n[distance {memory['distance']:.4f}] {memory['text']}")
 
 
+# Set to False by interfaces that can't show an interactive y/n prompt (e.g. the
+# Telegram bot, which has no real input() - see bot.py). The CLI leaves this True.
+WRITE_FILE_ENABLED = True
+
+
 def execute_tool(name, arguments):
     print(f"\n[tool] {name}({arguments})")
     logger.info(f"Tool call: {name}({arguments})")
@@ -536,6 +541,9 @@ def execute_tool(name, arguments):
             return "\n".join(memory["text"] for memory in memories)
 
         if name == "write_file":
+            if not WRITE_FILE_ENABLED:
+                return "File writing is disabled in this interface."
+
             file_path = get_safe_file_path(arguments["filename"])
             file_exists = file_path is not None and file_path.exists()
 
@@ -670,122 +678,132 @@ def ask_manager(prompt):
     print(answer)
 
 
+def handle_command(user_prompt):
+    """Process one line of user input exactly like the CLI does: parse it as a
+    command, print the result. Returns False on /quit, True otherwise - shared
+    by main() and the Telegram bot (bot.py), which captures the printed output
+    instead of reading it off a terminal."""
+    if user_prompt.strip() == "":
+        print("Please type something before pressing Enter.")
+        return True
+
+    command = user_prompt.lower().strip()
+
+    if command == "/help":
+        show_help()
+        return True
+
+    if command == "/clear":
+        conversation_history.clear()
+        print("Conversation memory cleared.")
+        return True
+
+    if command in ["quit", "/quit"]:
+        print("Goodbye!")
+        return False
+
+    if command == "/history":
+        show_history()
+        return True
+
+    if command.startswith("/read "):
+        filename = user_prompt[6:].strip()
+        read_file(filename)
+        return True
+
+    if command.startswith("/askfile "):
+        parts = user_prompt.split(" ", 2)
+
+        if len(parts) < 3:
+            print("Usage: /askfile <filename> <question>")
+            return True
+
+        filename = parts[1]
+        question = parts[2]
+
+        ask_file(filename, question)
+        return True
+
+    if command.startswith("/search "):
+        query = user_prompt[8:].strip()
+
+        if query == "":
+            print("Usage: /search <query>")
+            return True
+
+        ask_search(query)
+        return True
+
+    if command.startswith("/remember "):
+        fact = user_prompt[10:].strip()
+
+        if fact == "":
+            print("Usage: /remember <fact>")
+            return True
+
+        remember_fact(fact)
+        return True
+
+    if command.startswith("/recall "):
+        query = user_prompt[8:].strip()
+
+        if query == "":
+            print("Usage: /recall <query>")
+            return True
+
+        show_recall(query)
+        return True
+
+    if command.startswith("/code "):
+        task = user_prompt[6:].strip()
+
+        if task == "":
+            print("Usage: /code <task>")
+            return True
+
+        ask_specialist("code", task)
+        return True
+
+    if command.startswith("/research "):
+        topic = user_prompt[10:].strip()
+
+        if topic == "":
+            print("Usage: /research <topic>")
+            return True
+
+        ask_specialist("research", topic)
+        return True
+
+    if command.startswith("/write "):
+        task = user_prompt[7:].strip()
+
+        if task == "":
+            print("Usage: /write <prompt>")
+            return True
+
+        ask_specialist("write", task)
+        return True
+
+    if command.startswith("/task "):
+        request = user_prompt[6:].strip()
+
+        if request == "":
+            print("Usage: /task <request>")
+            return True
+
+        ask_specialist("task", request)
+        return True
+
+    ask_manager(user_prompt)
+    return True
+
+
 def main():
     while True:
         user_prompt = input("\nAsk the AI something, or type 'quit' to exit: ")
 
-        if user_prompt.strip() == "":
-            print("Please type something before pressing Enter.")
-            continue
-
-        command = user_prompt.lower().strip()
-
-        if command == "/help":
-            show_help()
-            continue
-
-        if command == "/clear":
-            conversation_history.clear()
-            print("Conversation memory cleared.")
-            continue
-
-        if command in ["quit", "/quit"]:
-            print("Goodbye!")
+        if not handle_command(user_prompt):
             break
-
-        if command == "/history":
-            show_history()
-            continue
-
-        if command.startswith("/read "):
-            filename = user_prompt[6:].strip()
-            read_file(filename)
-            continue
-
-        if command.startswith("/askfile "):
-            parts = user_prompt.split(" ", 2)
-
-            if len(parts) < 3:
-                print("Usage: /askfile <filename> <question>")
-                continue
-
-            filename = parts[1]
-            question = parts[2]
-
-            ask_file(filename, question)
-            continue
-
-        if command.startswith("/search "):
-            query = user_prompt[8:].strip()
-
-            if query == "":
-                print("Usage: /search <query>")
-                continue
-
-            ask_search(query)
-            continue
-
-        if command.startswith("/remember "):
-            fact = user_prompt[10:].strip()
-
-            if fact == "":
-                print("Usage: /remember <fact>")
-                continue
-
-            remember_fact(fact)
-            continue
-
-        if command.startswith("/recall "):
-            query = user_prompt[8:].strip()
-
-            if query == "":
-                print("Usage: /recall <query>")
-                continue
-
-            show_recall(query)
-            continue
-
-        if command.startswith("/code "):
-            task = user_prompt[6:].strip()
-
-            if task == "":
-                print("Usage: /code <task>")
-                continue
-
-            ask_specialist("code", task)
-            continue
-
-        if command.startswith("/research "):
-            topic = user_prompt[10:].strip()
-
-            if topic == "":
-                print("Usage: /research <topic>")
-                continue
-
-            ask_specialist("research", topic)
-            continue
-
-        if command.startswith("/write "):
-            task = user_prompt[7:].strip()
-
-            if task == "":
-                print("Usage: /write <prompt>")
-                continue
-
-            ask_specialist("write", task)
-            continue
-
-        if command.startswith("/task "):
-            request = user_prompt[6:].strip()
-
-            if request == "":
-                print("Usage: /task <request>")
-                continue
-
-            ask_specialist("task", request)
-            continue
-
-        ask_manager(user_prompt)
 
 
 if __name__ == "__main__":
