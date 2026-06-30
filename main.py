@@ -4,7 +4,16 @@ from openai import OpenAI
 load_dotenv()
 
 client = OpenAI()
+
 conversation_history = []
+
+ASSISTANT_INSTRUCTIONS = """
+You are Tyler's beginner-friendly AI assistant.
+Be honest about uncertainty.
+If the user asks for current, live, recent, or real-time information,
+and you do not have a tool for it, say that you cannot verify it yet.
+Keep explanations clear and concise.
+"""
 
 
 def ask_ai(prompt):
@@ -12,14 +21,6 @@ def ask_ai(prompt):
         "role": "user",
         "content": prompt
     })
-
-    ASSISTANT_INSTRUCTIONS = """
-    You are Tyler's beginner-friendly AI assistant.
-    Be honest about uncertainty.
-    If the user asks for current, live, recent, or real-time information,
-    and you do not have a tool for it, say that you cannot verify it yet.
-    Keep explanations clear and concise.
-    """
 
     try:
         response = client.responses.create(
@@ -40,16 +41,17 @@ def ask_ai(prompt):
     except Exception:
         return "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
 
+
 while True:
     user_prompt = input("\nAsk the AI something, or type 'quit' to exit: ")
-
-    if user_prompt == "quit":
-        print("Goodbye!")
-        break
 
     if user_prompt.strip() == "":
         print("Please type something before pressing Enter.")
         continue
+
+    if user_prompt.lower().strip() == "quit":
+        print("Goodbye!")
+        break
 
     answer = ask_ai(user_prompt)
 
