@@ -25,6 +25,9 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
   "Specialist agents" below
 - `/quit` command to exit
 - API keys stored safely in a `.env` file (never committed to git)
+- Reliability: automatic retries on flaky API calls, a local debug log, specific
+  tool-error messages instead of crashes, and a write-overwrite warning — see
+  "Reliability features" below
 
 ## Setup
 
@@ -149,3 +152,30 @@ All specialists share the same `conversation_history` and long-term memory as pl
 chat and each other — there's one memory store for the whole assistant, not one per
 agent. A fact saved via `/task` (Personal Assistant) can be recalled later in plain
 chat or by any other specialist.
+
+## Reliability features
+
+- **Automatic retries.** Every external API call (OpenAI chat, OpenAI embeddings,
+  Tavily search) is wrapped in `call_with_retries()`, which retries up to 3 times with
+  a short delay before giving up. A `[retry] ...` line prints on the console so you can
+  see it happening; this is a simple "retry on any exception" approach rather than
+  distinguishing transient errors (rate limits, network blips) from permanent ones
+  (e.g. a bad API key) — a smarter version would fail fast on the latter instead of
+  wasting two retries on something that will never succeed.
+- **Local debug log (`assistant.log`).** A separate technical record from
+  `conversation_history` — it logs tool calls, retry attempts, and the *real*
+  exception behind any failure (the console only ever shows a friendly, generic
+  message). Gitignored, since it can contain personal request details. It deliberately
+  does **not** log full tool results (e.g. file contents) to avoid duplicating
+  potentially sensitive data into yet another file.
+- **Specific tool errors instead of crashes.** If a tool call has a missing or
+  malformed argument, `execute_tool()` catches it and returns a specific message
+  (e.g. "missing required argument 'filename'") instead of crashing the whole turn
+  with a generic connectivity-sounding error. Returning a clear error as the tool
+  result also gives the model a chance to notice the mistake and retry with corrected
+  arguments on its own.
+- **Write-overwrite warning.** `write_file` now warns explicitly when a file already
+  exists and is about to be overwritten, on top of the existing y/n confirmation, so
+  you're not approving a destructive overwrite by accident.
+- **Write size limit.** `write_file` refuses content over 50,000 characters, a basic
+  guard against an accidental or runaway oversized write.

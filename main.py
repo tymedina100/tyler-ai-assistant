@@ -1,5 +1,7 @@
 import json
+import logging
 import sys
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,23 @@ from tavily import TavilyClient
 # every Unicode character (e.g. em dashes, curly quotes) - web search results
 # and AI output can easily contain these, so force UTF-8 output to avoid crashes.
 sys.stdout.reconfigure(encoding="utf-8")
+
+BASE_DIR = Path(__file__).parent
+
+# Logs technical events (tool calls, retries, errors) to a local file for
+# debugging - separate from conversation_history, which is the user-facing
+# chat record. Not committed to git (see .gitignore) since it can contain
+# personal request details.
+#
+# Uses a dedicated logger + handler instead of logging.basicConfig(), which
+# configures the root logger - that would also capture the openai/httpx
+# libraries' own internal HTTP request logs (they propagate to root by
+# default), flooding the file with noise that isn't ours.
+logger = logging.getLogger("assistant")
+logger.setLevel(logging.INFO)
+log_handler = logging.FileHandler(BASE_DIR / "assistant.log")
+log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(log_handler)
 
 load_dotenv()
 
@@ -62,7 +81,6 @@ DELEGATION_TOOLS = [
      "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
 ]
 
-BASE_DIR = Path(__file__).parent
 FILES_DIR = BASE_DIR / "files"
 
 MEMORY_DIR = BASE_DIR / "memory_db"
@@ -93,12 +111,31 @@ framing sentence.
 """
 
 
+def call_with_retries(func, max_attempts=3, delay_seconds=2, label="API call"):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func()
+
+        except Exception as e:
+            logger.warning(f"{label} failed on attempt {attempt}/{max_attempts}: {e}")
+
+            if attempt == max_attempts:
+                logger.error(f"{label} failed after {max_attempts} attempts: {e}")
+                raise
+
+            print(f"[retry] {label} failed, retrying in {delay_seconds}s... (attempt {attempt}/{max_attempts})")
+            time.sleep(delay_seconds)
+
+
 def get_ai_response(input_messages):
     try:
-        response = client.responses.create(
-            model=MODEL_NAME,
-            instructions=ASSISTANT_INSTRUCTIONS,
-            input=input_messages
+        response = call_with_retries(
+            lambda: client.responses.create(
+                model=MODEL_NAME,
+                instructions=ASSISTANT_INSTRUCTIONS,
+                input=input_messages
+            ),
+            label="OpenAI chat call"
         )
 
         return response.output_text
@@ -109,7 +146,10 @@ def get_ai_response(input_messages):
 
 def get_embedding(text):
     try:
-        response = client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=text)
+        response = call_with_retries(
+            lambda: client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=text),
+            label="OpenAI embedding call"
+        )
         return response.data[0].embedding
 
     except Exception:
@@ -138,11 +178,14 @@ def run_with_tools(instructions, input_items, tools):
 
     try:
         for _ in range(MAX_TOOL_ITERATIONS):
-            response = client.responses.create(
-                model=MODEL_NAME,
-                instructions=instructions,
-                input=input_items,
-                tools=tools
+            response = call_with_retries(
+                lambda: client.responses.create(
+                    model=MODEL_NAME,
+                    instructions=instructions,
+                    input=input_items,
+                    tools=tools
+                ),
+                label="OpenAI chat call"
             )
 
             function_calls = [item for item in response.output if item.type == "function_call"]
@@ -269,7 +312,13 @@ def read_file(filename):
     print(content)
 
 
+MAX_WRITE_FILE_CHARS = 50_000
+
+
 def write_file(filename, content):
+    if len(content) > MAX_WRITE_FILE_CHARS:
+        return f"Refused to write {filename}: content is too large ({len(content)} characters, limit is {MAX_WRITE_FILE_CHARS})."
+
     file_path = get_safe_file_path(filename)
 
     if file_path is None:
@@ -332,7 +381,10 @@ User question:
 
 def search_web(query):
     try:
-        response = tavily_client.search(query, max_results=5)
+        response = call_with_retries(
+            lambda: tavily_client.search(query, max_results=5),
+            label="Tavily search call"
+        )
         return response["results"]
 
     except Exception:
@@ -449,62 +501,82 @@ def show_recall(query):
 
 def execute_tool(name, arguments):
     print(f"\n[tool] {name}({arguments})")
+    logger.info(f"Tool call: {name}({arguments})")
 
-    if name == "read_file":
-        file_path = get_safe_file_path(arguments["filename"])
+    try:
+        if name == "read_file":
+            file_path = get_safe_file_path(arguments["filename"])
 
-        if file_path is None:
-            return "Access denied. You can only read files inside the files folder."
+            if file_path is None:
+                return "Access denied. You can only read files inside the files folder."
 
-        if not file_path.exists() or not file_path.is_file():
-            return f"File not found: {arguments['filename']}"
+            if not file_path.exists() or not file_path.is_file():
+                return f"File not found: {arguments['filename']}"
 
-        return file_path.read_text(encoding="utf-8")
+            return file_path.read_text(encoding="utf-8")
 
-    if name == "search_the_web":
-        results = search_web(arguments["query"])
+        if name == "search_the_web":
+            results = search_web(arguments["query"])
 
-        if not results:
-            return "No search results found."
+            if not results:
+                return "No search results found."
 
-        return "\n".join(f"{r['title']}: {r['content']} ({r['url']})" for r in results)
+            return "\n".join(f"{r['title']}: {r['content']} ({r['url']})" for r in results)
 
-    if name == "remember_fact":
-        store_memory(arguments["fact"], source="remember")
-        return f"Saved to memory: {arguments['fact']}"
+        if name == "remember_fact":
+            store_memory(arguments["fact"], source="remember")
+            return f"Saved to memory: {arguments['fact']}"
 
-    if name == "recall_memories":
-        memories = recall_memories(arguments["query"], n_results=5)
+        if name == "recall_memories":
+            memories = recall_memories(arguments["query"], n_results=5)
 
-        if not memories:
-            return "No memories found."
+            if not memories:
+                return "No memories found."
 
-        return "\n".join(memory["text"] for memory in memories)
+            return "\n".join(memory["text"] for memory in memories)
 
-    if name == "write_file":
-        answer = input(f"The AI wants to write to files/{arguments['filename']}. Allow? (y/n): ")
+        if name == "write_file":
+            file_path = get_safe_file_path(arguments["filename"])
+            file_exists = file_path is not None and file_path.exists()
 
-        if answer.strip().lower() != "y":
-            return "The user denied permission to write this file."
+            if file_exists:
+                print(f"\nWARNING: files/{arguments['filename']} already exists and will be OVERWRITTEN.")
 
-        return write_file(arguments["filename"], arguments["content"])
+            answer = input(f"The AI wants to write to files/{arguments['filename']}. Allow? (y/n): ")
 
-    if name == "delegate_to_coding_agent":
-        return ask_specialist("code", arguments["task"], record_history=False)
+            if answer.strip().lower() != "y":
+                logger.info(f"User denied write to {arguments['filename']}")
+                return "The user denied permission to write this file."
 
-    if name == "delegate_to_research_agent":
-        return ask_specialist("research", arguments["topic"], record_history=False)
+            logger.info(f"User approved write to {arguments['filename']} (overwrite={file_exists})")
+            return write_file(arguments["filename"], arguments["content"])
 
-    if name == "delegate_to_writer_agent":
-        return ask_specialist("write", arguments["prompt"], record_history=False)
+        if name == "delegate_to_coding_agent":
+            return ask_specialist("code", arguments["task"], record_history=False)
 
-    if name == "delegate_to_personal_assistant":
-        return ask_specialist("task", arguments["request"], record_history=False)
+        if name == "delegate_to_research_agent":
+            return ask_specialist("research", arguments["topic"], record_history=False)
 
-    if name == "delegate_to_general_assistant":
-        return ask_ai(arguments["prompt"], record_history=False)
+        if name == "delegate_to_writer_agent":
+            return ask_specialist("write", arguments["prompt"], record_history=False)
 
-    return f"Unknown tool: {name}"
+        if name == "delegate_to_personal_assistant":
+            return ask_specialist("task", arguments["request"], record_history=False)
+
+        if name == "delegate_to_general_assistant":
+            return ask_ai(arguments["prompt"], record_history=False)
+
+        return f"Unknown tool: {name}"
+
+    except KeyError as e:
+        error_message = f"Tool error: missing required argument {e} for {name}."
+        logger.error(error_message)
+        return error_message
+
+    except Exception as e:
+        error_message = f"Tool error: something went wrong while running {name}."
+        logger.error(f"{error_message} ({e})")
+        return error_message
 
 
 SPECIALISTS = {
