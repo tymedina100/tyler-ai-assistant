@@ -1,0 +1,4 @@
+My name is Tyler.
+I am building a personal AI assistant.
+Week 2 is about file reading, web search, and memory.
+My favorite food is sushi.

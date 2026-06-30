@@ -1,5 +1,7 @@
+from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
+
 
 load_dotenv()
 
@@ -8,6 +10,8 @@ client = OpenAI()
 conversation_history = []
 
 MODEL_NAME = "gpt-5.5"
+
+FILES_DIR = Path("files")
 
 ASSISTANT_INSTRUCTIONS = """
 You are Tyler's beginner-friendly AI assistant.
@@ -50,6 +54,7 @@ Available commands:
 /help    - Show this help menu
 /clear   - Clear the current conversation memory
 /history - Show the current conversation memory
+/read <filename>  - Read a file from the files folder
 /quit    - Exit the assistant
 
 Anything else will be sent to the AI.
@@ -69,6 +74,23 @@ def show_history():
 
         print(f"\n{role.upper()}: {content}")
     
+
+def read_file(filename):
+    file_path = FILES_DIR / filename
+
+    if not file_path.exists():
+        print(f"File not found: {filename}")
+        return
+
+    if not file_path.is_file():
+        print(f"That is not a file: {filename}")
+        return
+
+    content = file_path.read_text(encoding="utf-8")
+
+    print(f"\nContents of {filename}:")
+    print(content)
+
 
 def main():
     while True:
@@ -95,6 +117,11 @@ def main():
         
         if command == "/history":
             show_history()
+            continue
+        
+        if command.startswith("/read "):
+            filename = user_prompt[6:].strip()
+            read_file(filename)
             continue
 
         answer = ask_ai(user_prompt)
