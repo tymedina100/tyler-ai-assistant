@@ -52,7 +52,9 @@ Available commands:
 /quit   - Exit the assistant
 
 Anything else will be sent to the AI.
-""") 
+""")
+    
+    
 
 def main():
     while True:
@@ -62,16 +64,18 @@ def main():
             print("Please type something before pressing Enter.")
             continue
 
-        if user_prompt.lower().strip() == "/help":
+        command = user_prompt.lower().strip()
+
+        if command == "/help":
             show_help()
             continue
 
-        if user_prompt.lower().strip() == "/clear":
+        if command == "/clear":
             conversation_history.clear()
             print("Conversation memory cleared.")
             continue
 
-        if user_prompt.lower().strip() in ["quit", "/quit"]:
+        if command in ["quit", "/quit"]:
             print("Goodbye!")
             break
 
