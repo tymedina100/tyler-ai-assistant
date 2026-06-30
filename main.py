@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -23,46 +24,50 @@ Keep explanations clear and concise.
 """
 
 
+def get_ai_response(input_messages):
+    try:
+        response = client.responses.create(
+            model=MODEL_NAME,
+            instructions=ASSISTANT_INSTRUCTIONS,
+            input=input_messages
+        )
+
+        return response.output_text
+
+    except Exception:
+        return "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
+
+
 def ask_ai(prompt):
     conversation_history.append({
         "role": "user",
         "content": prompt
     })
 
-    try:
-        response = client.responses.create(
-            model=MODEL_NAME,
-            instructions=ASSISTANT_INSTRUCTIONS,
-            input=conversation_history
-        )
+    assistant_response = get_ai_response(conversation_history)
 
-        assistant_response = response.output_text
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_response
+    })
 
-        conversation_history.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-
-        return assistant_response
-
-    except Exception:
-        return "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
+    return assistant_response
 
 
 def show_help():
     print("""
 Available commands:
-/help    - Show this help menu
-/clear   - Clear the current conversation memory
-/history - Show the current conversation memory
-/read <filename>  - Read a file from the files folder
+/help                       - Show this help menu
+/clear                      - Clear the current conversation memory
+/history                    - Show the current conversation memory
+/read <filename>            - Read a file from the files folder
 /askfile <filename> <question> - Ask a question about a file
-/quit    - Exit the assistant
+/quit                       - Exit the assistant
 
 Anything else will be sent to the AI.
 """)
-    
-    
+
+
 def show_history():
     if len(conversation_history) == 0:
         print("Conversation history is empty.")
@@ -75,7 +80,7 @@ def show_history():
         content = message["content"]
 
         print(f"\n{role.upper()}: {content}")
-    
+
 
 def get_safe_file_path(filename):
     files_dir_path = FILES_DIR.resolve()
@@ -139,7 +144,22 @@ User question:
 {question}
 """
 
-    answer = ask_ai(prompt)
+    temporary_history = conversation_history + [{
+        "role": "user",
+        "content": prompt
+    }]
+
+    answer = get_ai_response(temporary_history)
+
+    conversation_history.append({
+        "role": "user",
+        "content": f"Asked about file {filename}: {question}"
+    })
+
+    conversation_history.append({
+        "role": "assistant",
+        "content": answer
+    })
 
     print()
     print("AI response:")
@@ -168,16 +188,16 @@ def main():
         if command in ["quit", "/quit"]:
             print("Goodbye!")
             break
-        
+
         if command == "/history":
             show_history()
             continue
-        
+
         if command.startswith("/read "):
             filename = user_prompt[6:].strip()
             read_file(filename)
             continue
-        
+
         if command.startswith("/askfile "):
             parts = user_prompt.split(" ", 2)
 
@@ -189,14 +209,13 @@ def main():
             question = parts[2]
 
             ask_file(filename, question)
-            continue        
+            continue
 
         answer = ask_ai(user_prompt)
 
         print()
         print("AI response:")
         print(answer)
-
 
 
 if __name__ == "__main__":
