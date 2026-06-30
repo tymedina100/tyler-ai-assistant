@@ -42,6 +42,16 @@ def ask_ai(prompt):
         return "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
 
 
+def show_help():
+    print("""
+Available commands:
+/help   - Show this help menu
+/clear  - Clear the current conversation memory
+/quit   - Exit the assistant
+
+Anything else will be sent to the AI.
+""") 
+
 def main():
     while True:
         user_prompt = input("\nAsk the AI something, or type 'quit' to exit: ")
@@ -50,7 +60,16 @@ def main():
             print("Please type something before pressing Enter.")
             continue
 
-        if user_prompt.lower().strip() == "quit":
+        if user_prompt.lower().strip() == "/help":
+            show_help()
+            continue
+
+        if user_prompt.lower().strip() == "/clear":
+            conversation_history.clear()
+            print("Conversation memory cleared.")
+            continue
+
+        if user_prompt.lower().strip() in ["quit", "/quit"]:
             print("Goodbye!")
             break
 
@@ -59,6 +78,8 @@ def main():
         print()
         print("AI response:")
         print(answer)
+
+
 
 if __name__ == "__main__":
     main()
