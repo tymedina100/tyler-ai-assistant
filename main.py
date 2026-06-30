@@ -56,6 +56,7 @@ Available commands:
 /clear   - Clear the current conversation memory
 /history - Show the current conversation memory
 /read <filename>  - Read a file from the files folder
+/askfile <filename> <question> - Ask a question about a file
 /quit    - Exit the assistant
 
 Anything else will be sent to the AI.
@@ -109,6 +110,42 @@ def read_file(filename):
     print(content)
 
 
+def ask_file(filename, question):
+    file_path = get_safe_file_path(filename)
+
+    if file_path is None:
+        print("Access denied. You can only read files inside the files folder.")
+        return
+
+    if not file_path.exists():
+        print(f"File not found: {filename}")
+        return
+
+    if not file_path.is_file():
+        print(f"That is not a file: {filename}")
+        return
+
+    content = file_path.read_text(encoding="utf-8")
+
+    prompt = f"""
+Use the file content below to answer the user's question.
+
+File name: {filename}
+
+File content:
+{content}
+
+User question:
+{question}
+"""
+
+    answer = ask_ai(prompt)
+
+    print()
+    print("AI response:")
+    print(answer)
+
+
 def main():
     while True:
         user_prompt = input("\nAsk the AI something, or type 'quit' to exit: ")
@@ -140,6 +177,19 @@ def main():
             filename = user_prompt[6:].strip()
             read_file(filename)
             continue
+        
+        if command.startswith("/askfile "):
+            parts = user_prompt.split(" ", 2)
+
+            if len(parts) < 3:
+                print("Usage: /askfile <filename> <question>")
+                continue
+
+            filename = parts[1]
+            question = parts[2]
+
+            ask_file(filename, question)
+            continue        
 
         answer = ask_ai(user_prompt)
 
