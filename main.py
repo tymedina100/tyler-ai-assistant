@@ -39,6 +39,10 @@ while True:
         print("Goodbye!")
         break
 
+    if user_prompt.strip() == "":
+        print("Please type something before pressing Enter.")
+        continue
+
     answer = ask_ai(user_prompt)
 
     print()
