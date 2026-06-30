@@ -11,7 +11,8 @@ conversation_history = []
 
 MODEL_NAME = "gpt-5.5"
 
-FILES_DIR = Path("files")
+BASE_DIR = Path(__file__).parent
+FILES_DIR = BASE_DIR / "files"
 
 ASSISTANT_INSTRUCTIONS = """
 You are Tyler's beginner-friendly AI assistant.
@@ -75,8 +76,24 @@ def show_history():
         print(f"\n{role.upper()}: {content}")
     
 
+def get_safe_file_path(filename):
+    files_dir_path = FILES_DIR.resolve()
+    file_path = (FILES_DIR / filename).resolve()
+
+    try:
+        file_path.relative_to(files_dir_path)
+    except ValueError:
+        return None
+
+    return file_path
+
+
 def read_file(filename):
-    file_path = FILES_DIR / filename
+    file_path = get_safe_file_path(filename)
+
+    if file_path is None:
+        print("Access denied. You can only read files inside the files folder.")
+        return
 
     if not file_path.exists():
         print(f"File not found: {filename}")
