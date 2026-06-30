@@ -13,16 +13,18 @@ def ask_ai(prompt):
         "content": prompt
     })
 
+    ASSISTANT_INSTRUCTIONS = """
+    You are Tyler's beginner-friendly AI assistant.
+    Be honest about uncertainty.
+    If the user asks for current, live, recent, or real-time information,
+    and you do not have a tool for it, say that you cannot verify it yet.
+    Keep explanations clear and concise.
+    """
+
     try:
         response = client.responses.create(
             model="gpt-5.5",
-            instructions="""
-            You are Tyler's beginner-friendly AI assistant.
-            Be honest about uncertainty.
-            If the user asks for current, live, recent, or real-time information,
-            and you do not have a tool for it, say that you cannot verify it yet.
-            Keep explanations clear and concise.
-            """,
+            instructions=ASSISTANT_INSTRUCTIONS,
             input=conversation_history
         )
 
