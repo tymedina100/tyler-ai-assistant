@@ -519,7 +519,10 @@ def parse_company_command(text):
     if not stripped.startswith("/"):
         return None
     parts = stripped.split(maxsplit=1)
-    command = parts[0].lower()
+    # In a group with multiple bots, Telegram appends the bot's @username to a
+    # command (e.g. "/dailyreport@TyManagerBot"). Strip it so the command still
+    # matches - otherwise it falls through and gets misrouted to a specialist.
+    command = parts[0].lower().split("@", 1)[0]
     if command not in COMPANY_COMMANDS:
         return None
     arg = parts[1].strip() if len(parts) > 1 else ""
