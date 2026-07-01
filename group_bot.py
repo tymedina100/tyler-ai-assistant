@@ -30,7 +30,12 @@ Architecture:
 import asyncio
 import os
 import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
@@ -55,12 +60,13 @@ if not ALLOWED_USER_IDS:
         "Telegram user ID, which this file assumes is already configured."
     )
 
-main.WRITE_FILE_MODE = "requires_confirmation"
+main.CONFIRMATION_MODE = "requires_confirmation"
 
-# Build-order staging: start with just the Manager + Weather to prove the
-# mechanism (see the project plan), then expand as each stage is verified.
-# Full set once all stages pass: ["manager", "code", "research", "write",
-# "task", "tasks", "weather"].
+# Build-order staging: only the agents listed here get a live Telegram bot. Agents
+# NOT listed still work via Miles's delegation (their answers post under Miles) -
+# they just can't be @mentioned directly until you create their bot and add its key
+# here. Full set once every bot exists: ["manager", "code", "research", "write",
+# "task", "tasks", "weather", "calendar", "gmail"].
 BOT_KEYS = ["manager", "weather", "code", "research"]
 
 SPECIALIST_KEYS = [key for key in BOT_KEYS if key != "manager"]
@@ -78,9 +84,10 @@ AGENT_INFO = {
         "welcome": (
             "Hi, I'm Miles, the Chief of Staff. Message me (or just talk in the "
             "group) and I'll route your request to the right agent - or @mention "
-            "an agent directly to skip me entirely. If anyone stages a file write, "
-            "reply /confirm to me specifically to approve it, even if you were "
-            "talking to another agent directly."
+            "an agent directly to skip me entirely. If anyone stages a sensitive "
+            "action (a file write or sending an email), reply /confirm to me "
+            "specifically to approve it, even if you were talking to another agent "
+            "directly."
         ),
     },
     "code": {"env_var": "TELEGRAM_CODE_BOT_TOKEN", "tagline": "@mention me with a coding task."},
@@ -89,6 +96,8 @@ AGENT_INFO = {
     "task": {"env_var": "TELEGRAM_TASK_BOT_TOKEN", "tagline": "@mention me to remember something."},
     "tasks": {"env_var": "TELEGRAM_TASKS_BOT_TOKEN", "tagline": "@mention me to manage your real Todoist tasks."},
     "weather": {"env_var": "TELEGRAM_WEATHER_BOT_TOKEN", "tagline": "@mention me for the forecast."},
+    "calendar": {"env_var": "TELEGRAM_CALENDAR_BOT_TOKEN", "tagline": "@mention me about your calendar or to set a reminder."},
+    "gmail": {"env_var": "TELEGRAM_GMAIL_BOT_TOKEN", "tagline": "@mention me to check or send email."},
 }
 
 # Fill in each specialist's label + welcome from main.SPECIALISTS (the single
@@ -181,18 +190,21 @@ async def handle_manager_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(AGENT_INFO["manager"]["welcome"])
         return
 
-    if main.pending_write is not None:
+    if main.pending_action is not None:
         async with locks["manager"]:
-            pending = main.pending_write
-            main.pending_write = None  # resolved either way - confirm or cancel
+            pending = main.pending_action
+            main.pending_action = None  # resolved either way - confirm or cancel
+            description = main.describe_pending_action(pending)
 
             if text.strip() == "/confirm":
-                result = main.write_file(pending["filename"], pending["content"])
-                main.logger.info(f"Telegram user {update.effective_user.id} confirmed write to {pending['filename']}")
+                # confirm_pending_action can do blocking I/O (Gmail send) - run it
+                # off the event loop so polling isn't stalled.
+                result = await asyncio.to_thread(main.confirm_pending_action, pending)
+                main.logger.info(f"Telegram user {update.effective_user.id} confirmed {description}")
                 await update.message.reply_text(result)
             else:
-                main.logger.info(f"Telegram user {update.effective_user.id} cancelled pending write to {pending['filename']}")
-                await update.message.reply_text(f"Cancelled the write to files/{pending['filename']}.")
+                main.logger.info(f"Telegram user {update.effective_user.id} cancelled {description}")
+                await update.message.reply_text(f"Cancelled the {description}.")
         return
 
     try:
@@ -228,6 +240,154 @@ def on_delegation(specialist_key, request_text, answer_text):
     asyncio.run_coroutine_threadsafe(post(), main_loop)
 
 
+# --------------------------------------------------------------------------- #
+# Proactive scheduling: morning briefing, timed reminders, calendar event alerts.
+# The AsyncIOScheduler runs on the same event loop as the bots; job functions here
+# are coroutines, which APScheduler awaits directly.
+# --------------------------------------------------------------------------- #
+
+scheduler = None
+# Keys of event alerts already scheduled today, so re-syncing doesn't double-post.
+scheduled_event_alert_keys = set()
+
+
+def _app_timezone():
+    try:
+        return ZoneInfo(main.TIMEZONE)
+    except Exception:
+        return None
+
+
+def _now():
+    tz = _app_timezone()
+    return datetime.now(tz) if tz else datetime.now().astimezone()
+
+
+async def post_to_group(text, bot_key="manager"):
+    """Post a message to the group as the given agent's bot, falling back to Miles
+    if that agent doesn't have its own bot yet (e.g. Cadence before you create it)."""
+    bot = bots.get(bot_key, bots["manager"])
+    try:
+        await bot.send_message(GROUP_CHAT_ID, text if text.strip() else "(no response)")
+    except Exception as e:
+        main.logger.error(f"Failed to post scheduled message: {e}")
+
+
+async def post_morning_briefing():
+    # build_morning_briefing does blocking work (LLM + HTTP) - run it off the loop.
+    text = await asyncio.to_thread(main.build_morning_briefing)
+    await post_to_group(text, "manager")
+    # Fresh day - (re)schedule today's event alerts right after the briefing.
+    await schedule_todays_event_alerts()
+
+
+async def fire_reminder(reminder):
+    await post_to_group(f"Reminder: {reminder['text']}", "calendar")
+    main.mark_reminder_fired(reminder["id"])
+
+
+def schedule_reminder(reminder):
+    """Schedule one future reminder. Called live via main.on_reminder_set (from a
+    worker thread - APScheduler's add_job is thread-safe) and during startup reload."""
+    try:
+        due = datetime.fromisoformat(reminder["due_iso"])
+    except ValueError:
+        main.logger.error(f"Bad reminder due_iso: {reminder['due_iso']!r}")
+        return
+
+    scheduler.add_job(
+        fire_reminder,
+        trigger=DateTrigger(run_date=due),
+        args=[reminder],
+        id=f"reminder-{reminder['id']}",
+        replace_existing=True,
+    )
+
+
+async def reload_reminders():
+    """On startup, re-schedule future reminders and fire any that came due while the
+    bot was offline (so a redeploy doesn't silently swallow them)."""
+    now = _now()
+    for reminder in main.load_reminders():
+        if reminder["fired"]:
+            continue
+
+        try:
+            due = datetime.fromisoformat(reminder["due_iso"])
+        except ValueError:
+            continue
+
+        now_cmp = now.replace(tzinfo=None) if due.tzinfo is None else now
+        if due <= now_cmp:
+            await post_to_group(f"Reminder (missed while I was offline): {reminder['text']}", "calendar")
+            main.mark_reminder_fired(reminder["id"])
+        else:
+            schedule_reminder(reminder)
+
+
+async def post_event_alert(summary, start):
+    await post_to_group(
+        f"Heads up: '{summary}' starts at {start.strftime('%H:%M')} "
+        f"(in about {main.EVENT_ALERT_MINUTES} min).",
+        "calendar",
+    )
+
+
+async def schedule_todays_event_alerts():
+    """Schedule a heads-up EVENT_ALERT_MINUTES before each of today's timed events.
+    Degrades to a no-op if Google isn't connected (get_today_events_raw returns [])."""
+    events = await asyncio.to_thread(main.google_helpers.get_today_events_raw)
+    now = _now()
+
+    for event in events:
+        start = event["start"]
+        alert_time = start - timedelta(minutes=main.EVENT_ALERT_MINUTES)
+        key = f"{event['summary']}|{start.isoformat()}"
+
+        if key in scheduled_event_alert_keys or alert_time <= now:
+            continue
+
+        scheduled_event_alert_keys.add(key)
+        scheduler.add_job(
+            post_event_alert,
+            trigger=DateTrigger(run_date=alert_time),
+            args=[event["summary"], start],
+            id=f"eventalert-{key}",
+            replace_existing=True,
+        )
+
+
+def _parse_briefing_time(value):
+    try:
+        hour, minute = value.split(":")
+        return int(hour), int(minute)
+    except (ValueError, AttributeError):
+        main.logger.error(f"Bad BRIEFING_TIME {value!r}, defaulting to 08:00")
+        return 8, 0
+
+
+async def start_scheduler():
+    global scheduler
+    tz = _app_timezone()
+    scheduler = AsyncIOScheduler(timezone=tz) if tz else AsyncIOScheduler()
+
+    hour, minute = _parse_briefing_time(main.BRIEFING_TIME)
+    scheduler.add_job(
+        post_morning_briefing,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        id="morning-briefing",
+        replace_existing=True,
+    )
+    scheduler.start()
+
+    # Live reminder scheduling comes through this hook from execute_tool/set_reminder.
+    main.on_reminder_set = schedule_reminder
+
+    await reload_reminders()
+    await schedule_todays_event_alerts()
+    print(f"Scheduler running - morning briefing at {main.BRIEFING_TIME} ({main.TIMEZONE}).")
+
+
 async def run_all():
     global main_loop
     main_loop = asyncio.get_running_loop()
@@ -259,9 +419,13 @@ async def run_all():
 
     print(f"All {len(BOT_KEYS)} bots running (polling). Press Ctrl+C to stop.")
 
+    await start_scheduler()
+
     try:
         await asyncio.Event().wait()
     finally:
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
         for app in applications.values():
             await app.updater.stop()
             await app.stop()

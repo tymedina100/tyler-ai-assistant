@@ -15,7 +15,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py bot.py ./
+COPY main.py bot.py google_helpers.py ./
 COPY files/ ./files/
 
 # memory_db/ (long-term memory) and assistant.log are created here at

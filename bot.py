@@ -7,11 +7,12 @@ main.py (ask_manager, the specialists, every tool) without duplicating it:
   the result, exactly like the CLI. This file captures that printed output
   (via contextlib.redirect_stdout) and relays it back as a Telegram message,
   instead of rewriting every function to return text.
-- write_file's y/n confirmation uses input(), which has no real terminal to
-  read from here - so this interface uses main.WRITE_FILE_MODE = "requires_
-  confirmation" instead: a write gets staged (main.pending_write) rather than
-  performed immediately, and the user confirms it with a follow-up "/confirm"
-  message, intercepted below before normal command handling.
+- Sensitive actions (writing a file, sending an email) normally confirm via
+  input() y/n, which has no real terminal here - so this interface uses
+  main.CONFIRMATION_MODE = "requires_confirmation" instead: the action gets staged
+  (main.pending_action) rather than performed immediately, and the user confirms it
+  with a follow-up "/confirm" message, intercepted below before normal command
+  handling.
 - A single asyncio.Lock() serializes message handling, so two messages never
   redirect stdout at the same time. Fine for a personal, single-user bot.
 """
@@ -48,9 +49,9 @@ if not ALLOWED_USER_IDS:
         "only reply with the sender's Telegram user ID until you set it and restart."
     )
 
-# This interface has no real terminal, so the write_file y/n confirmation
-# (which uses input()) can't work here - see WRITE_FILE_MODE in main.py.
-main.WRITE_FILE_MODE = "requires_confirmation"
+# This interface has no real terminal, so the input()-based y/n confirmation for
+# sensitive actions can't work here - see CONFIRMATION_MODE in main.py.
+main.CONFIRMATION_MODE = "requires_confirmation"
 
 WELCOME_MESSAGE = (
     "Hi! I'm Tyler's personal AI assistant, running on Telegram.\n\n"
@@ -86,18 +87,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This bot runs continuously - there's no need to quit, I'm always here.")
         return
 
-    if main.pending_write is not None:
+    if main.pending_action is not None:
         async with processing_lock:
-            pending = main.pending_write
-            main.pending_write = None  # resolved either way - confirm or cancel
+            pending = main.pending_action
+            main.pending_action = None  # resolved either way - confirm or cancel
+            description = main.describe_pending_action(pending)
 
             if text.strip() == "/confirm":
-                result = main.write_file(pending["filename"], pending["content"])
-                main.logger.info(f"Telegram user {user_id} confirmed write to {pending['filename']}")
+                result = main.confirm_pending_action(pending)
+                main.logger.info(f"Telegram user {user_id} confirmed {description}")
                 await update.message.reply_text(result)
             else:
-                main.logger.info(f"Telegram user {user_id} cancelled pending write to {pending['filename']}")
-                await update.message.reply_text(f"Cancelled the write to files/{pending['filename']}.")
+                main.logger.info(f"Telegram user {user_id} cancelled {description}")
+                await update.message.reply_text(f"Cancelled the {description}.")
         return
 
     try:

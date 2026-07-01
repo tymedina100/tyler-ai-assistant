@@ -1,17 +1,23 @@
 import json
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import chromadb
 import requests
+from dateutil import parser as date_parser
 from dotenv import load_dotenv
 from openai import OpenAI
 from tavily import TavilyClient
+
+import google_helpers
 
 
 # Windows consoles default to a limited encoding (cp1252) that can't print
@@ -45,6 +51,13 @@ TODOIST_API_TOKEN = os.environ["TODOIST_API_TOKEN"]
 TODOIST_HEADERS = {"Authorization": f"Bearer {TODOIST_API_TOKEN}"}
 
 OPENWEATHER_API_KEY = os.environ["OPENWEATHER_API_KEY"]
+
+# Proactive/scheduling + briefing config (consumed by group_bot.py's scheduler).
+# All optional with sensible defaults so the CLI/single bot don't need them set.
+HOME_LOCATION = os.environ.get("HOME_LOCATION", "New York")
+BRIEFING_TIME = os.environ.get("BRIEFING_TIME", "08:00")  # HH:MM in TIMEZONE
+TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
+EVENT_ALERT_MINUTES = int(os.environ.get("EVENT_ALERT_MINUTES", "15"))
 
 conversation_history = []
 
@@ -105,6 +118,33 @@ TOOLS = [
     {"type": "function", "name": "get_weather", "strict": False,
      "description": "Get the current weather for a location.",
      "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}},
+    {"type": "function", "name": "run_python", "strict": False,
+     "description": "Execute a Python 3 snippet in a sandboxed subprocess and return its stdout, stderr, and exit code. Use this to actually run and verify code. There is a short timeout, and the code has no access to the app's secrets or files.",
+     "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}},
+    {"type": "function", "name": "list_calendar_events", "strict": False,
+     "description": "List Google Calendar events. With no arguments, lists today's events. Optionally pass ISO 8601 time_min and time_max to list a custom window.",
+     "parameters": {"type": "object", "properties": {"time_min": {"type": "string"}, "time_max": {"type": "string"}}, "required": []}},
+    {"type": "function", "name": "create_calendar_event", "strict": False,
+     "description": "Create a Google Calendar event. start and end are ISO 8601 datetimes (e.g. 2026-07-01T15:00:00).",
+     "parameters": {"type": "object", "properties": {"summary": {"type": "string"}, "start": {"type": "string"}, "end": {"type": "string"}, "description": {"type": "string"}}, "required": ["summary", "start", "end"]}},
+    {"type": "function", "name": "set_reminder", "strict": False,
+     "description": "Schedule a one-off reminder that pings the user in the Telegram group at a set time. 'when' is an ISO 8601 datetime - use the current date/time provided in the message to turn relative times like 'in 2 hours' into an absolute timestamp.",
+     "parameters": {"type": "object", "properties": {"when": {"type": "string"}, "text": {"type": "string"}}, "required": ["when", "text"]}},
+    {"type": "function", "name": "list_reminders", "strict": False,
+     "description": "List the user's upcoming (not-yet-fired) reminders.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "search_emails", "strict": False,
+     "description": "List or search recent Gmail messages. Optional Gmail search query (e.g. 'from:boss is:unread') and max_results. Returns message ids to use with read_email.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": []}},
+    {"type": "function", "name": "read_email", "strict": False,
+     "description": "Read the full content of one Gmail message by its id (get ids from search_emails).",
+     "parameters": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": ["message_id"]}},
+    {"type": "function", "name": "draft_email", "strict": False,
+     "description": "Create a Gmail draft. Does NOT send - the draft waits in the user's Gmail Drafts for review.",
+     "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, "required": ["to", "subject", "body"]}},
+    {"type": "function", "name": "send_email", "strict": False,
+     "description": "Send an email via Gmail. Sensitive action - the user is asked to confirm before it actually sends.",
+     "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, "required": ["to", "subject", "body"]}},
 ]
 
 DELEGATION_TOOLS = [
@@ -126,12 +166,29 @@ DELEGATION_TOOLS = [
     {"type": "function", "name": "delegate_to_weather_agent", "strict": False,
      "description": "Delegate a current weather lookup for a location to the Weather Agent.",
      "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}},
+    {"type": "function", "name": "delegate_to_calendar_agent", "strict": False,
+     "description": "Delegate anything about the user's Google Calendar (viewing or creating events) OR setting a time-based reminder/nudge to the Calendar & Scheduler Agent.",
+     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
+    {"type": "function", "name": "delegate_to_gmail_agent", "strict": False,
+     "description": "Delegate reading, searching, drafting, or sending email in the user's Gmail to the Gmail Agent.",
+     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
     {"type": "function", "name": "delegate_to_general_assistant", "strict": False,
      "description": "Delegate anything that doesn't clearly fit a specialist to the General Assistant.",
      "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
 ]
 
 FILES_DIR = BASE_DIR / "files"
+
+# Isolated working directory for run_python (Feature: code execution). Kept
+# separate from files/ so executed code can't clobber the user's read/write area.
+SANDBOX_DIR = BASE_DIR / "sandbox"
+CODE_EXEC_TIMEOUT_SECONDS = 10
+MAX_CODE_OUTPUT_CHARS = 4000
+CODE_EXEC_MEMORY_MB = 256
+
+# One-off reminders (Feature: proactive) persist here so they survive a restart/
+# redeploy; group_bot.py reloads and re-schedules them on startup.
+REMINDERS_FILE = BASE_DIR / "reminders.json"
 
 MEMORY_DIR = BASE_DIR / "memory_db"
 chroma_client = chromadb.PersistentClient(path=str(MEMORY_DIR))
@@ -162,6 +219,9 @@ agents using tool calls - never answer the user directly yourself:
   real Todoist account - not general reminders or preferences (that's
   delegate_to_personal_assistant)
 - delegate_to_weather_agent: current weather for a location
+- delegate_to_calendar_agent: viewing or creating Google Calendar events, and
+  setting time-based reminders/nudges
+- delegate_to_gmail_agent: reading, searching, drafting, or sending email
 - delegate_to_general_assistant: anything else, or simple questions that don't
   fit a specialist
 
@@ -182,8 +242,9 @@ as your final answer. Do not significantly rewrite a specialist's own answer -
 relay it, keeping their own voice and sign-off intact, with at most one short
 framing sentence in your own calm, organized Chief-of-Staff tone. Each specialist
 is a distinct character on the team (Patch codes, Scout researches, Quill writes,
-Sage assists, Roster runs the task list, Gale does weather) - let their
-personality come through rather than flattening everyone into one voice.
+Sage assists, Roster runs the task list, Gale does weather, Cadence handles
+calendar and reminders, Piper handles email) - let their personality come through
+rather than flattening everyone into one voice.
 """
 
 
@@ -203,12 +264,21 @@ def call_with_retries(func, max_attempts=3, delay_seconds=2, label="API call"):
             time.sleep(delay_seconds)
 
 
-def get_ai_response(input_messages, model=PREMIUM_MODEL):
+def _now_local():
+    """Current time as an aware datetime in the configured TIMEZONE, falling back
+    to the system local time if the zone can't be resolved (e.g. missing tz data)."""
+    try:
+        return datetime.now(ZoneInfo(TIMEZONE))
+    except Exception:
+        return datetime.now().astimezone()
+
+
+def get_ai_response(input_messages, model=PREMIUM_MODEL, instructions=ASSISTANT_INSTRUCTIONS):
     try:
         response = call_with_retries(
             lambda: client.responses.create(
                 model=model,
-                instructions=ASSISTANT_INSTRUCTIONS,
+                instructions=instructions,
                 input=input_messages
             ),
             label="OpenAI chat call"
@@ -234,6 +304,10 @@ def get_embedding(text):
 
 
 def build_augmented_prompt(prompt):
+    # Give every agent the current date/time so time-aware ones (weather "today",
+    # Cadence turning "in 2 hours" into an ISO timestamp) don't have to guess.
+    now_line = f"Current date and time: {_now_local().strftime('%Y-%m-%d %H:%M %Z')}"
+
     memories = recall_memories(prompt, n_results=3)
 
     # Only inject memories that are actually similar - Chroma returns its closest
@@ -242,10 +316,11 @@ def build_augmented_prompt(prompt):
     memories = [m for m in memories if m["distance"] <= MEMORY_DISTANCE_THRESHOLD]
 
     if len(memories) == 0:
-        return prompt
+        return f"{now_line}\n\n{prompt}"
 
     memory_text = "\n".join(f"- {memory['text']}" for memory in memories)
-    return f"""
+    return f"""{now_line}
+
 Relevant memories from earlier conversations:
 {memory_text}
 
@@ -415,6 +490,92 @@ def write_file(filename, content):
     return f"Saved to {filename}."
 
 
+def _code_exec_env():
+    """A minimal, secret-free environment for executed code. We whitelist only what
+    the interpreter needs to start (on Windows, SystemRoot/PATH are required for
+    Python to import its own standard library) - deliberately NOT the whole process
+    env, so secrets like OPENAI_API_KEY/TODOIST_API_TOKEN never reach run code."""
+    allowed = {}
+    for key in ("PATH", "SYSTEMROOT", "SystemRoot", "TEMP", "TMP", "LANG", "LC_ALL", "TZ"):
+        if key in os.environ:
+            allowed[key] = os.environ[key]
+    return allowed
+
+
+def _code_exec_limits():
+    """POSIX-only preexec_fn that caps CPU seconds, address space, and open files so
+    runaway code can't exhaust the host. Returns None on Windows (no resource module
+    - the subprocess timeout is the only guard there)."""
+    if os.name != "posix":
+        return None
+
+    import resource  # POSIX-only stdlib
+
+    def set_limits():
+        cpu = CODE_EXEC_TIMEOUT_SECONDS + 1
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+        mem = CODE_EXEC_MEMORY_MB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+
+    return set_limits
+
+
+def run_python(code):
+    """Execute a Python snippet in a sandboxed subprocess and return its output.
+
+    This is a pragmatic sandbox for a single-user assistant, NOT a hard security
+    jail: it strips secrets from the environment, runs in an isolated throwaway
+    working directory, enforces a wall-clock timeout, and (on Linux) caps CPU and
+    memory - but executed code can still read the local disk and reach the network.
+    Don't run untrusted third-party code with it.
+    """
+    SANDBOX_DIR.mkdir(exist_ok=True)
+
+    # Write the snippet to a temp file inside the sandbox dir and run it from there,
+    # so the script's own working directory is the throwaway sandbox, not the app.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", dir=SANDBOX_DIR, delete=False, encoding="utf-8"
+    ) as script_file:
+        script_file.write(code)
+        script_path = script_file.name
+
+    logger.info(f"run_python executing {len(code)} chars: {code[:200]!r}")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", script_path],
+            cwd=SANDBOX_DIR,
+            capture_output=True,
+            text=True,
+            timeout=CODE_EXEC_TIMEOUT_SECONDS,
+            env=_code_exec_env(),
+            preexec_fn=_code_exec_limits(),
+        )
+    except subprocess.TimeoutExpired:
+        logger.info("run_python timed out")
+        return f"Execution timed out after {CODE_EXEC_TIMEOUT_SECONDS} seconds (likely an infinite loop or something too slow)."
+    except Exception as e:
+        logger.error(f"run_python failed to launch: {e}")
+        return "Sorry, something went wrong while trying to run the code."
+    finally:
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
+
+    output = result.stdout or ""
+    if result.stderr:
+        output += ("\n[stderr]\n" if output else "[stderr]\n") + result.stderr
+
+    output = output.strip() or "(no output)"
+
+    if len(output) > MAX_CODE_OUTPUT_CHARS:
+        output = output[:MAX_CODE_OUTPUT_CHARS] + f"\n... [truncated at {MAX_CODE_OUTPUT_CHARS} characters]"
+
+    return f"Exit code {result.returncode}.\n{output}"
+
+
 def ask_file(filename, question):
     file_path = get_safe_file_path(filename)
 
@@ -544,6 +705,104 @@ def get_weather(location):
         return f"Sorry, something went wrong while getting the weather for {location}."
 
 
+# Reminders (Feature: proactive). Stored as a flat JSON list so they survive a
+# restart; the actual firing is done by group_bot.py via the on_reminder_set hook.
+# Set by group_bot.py to a function (reminder_dict) -> None that schedules the
+# reminder to fire. None (CLI/single bot) means reminders are stored but won't fire.
+on_reminder_set = None
+
+
+def load_reminders():
+    if not REMINDERS_FILE.exists():
+        return []
+    try:
+        return json.loads(REMINDERS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error(f"Failed to read reminders.json: {e}")
+        return []
+
+
+def _save_reminders(reminders):
+    REMINDERS_FILE.write_text(json.dumps(reminders, indent=2), encoding="utf-8")
+
+
+def add_reminder(due_iso, text):
+    reminders = load_reminders()
+    reminder = {"id": str(uuid.uuid4()), "due_iso": due_iso, "text": text, "fired": False}
+    reminders.append(reminder)
+    _save_reminders(reminders)
+    return reminder
+
+
+def mark_reminder_fired(reminder_id):
+    reminders = load_reminders()
+    for reminder in reminders:
+        if reminder["id"] == reminder_id:
+            reminder["fired"] = True
+    _save_reminders(reminders)
+
+
+def set_reminder(when, text):
+    try:
+        due = date_parser.parse(when)
+    except (ValueError, OverflowError, TypeError):
+        return f"I couldn't understand the time '{when}'. Give me an absolute time like 2026-07-01T15:00."
+
+    now = _now_local()
+
+    # Make both sides comparable: if the parsed time is naive, assume it's in the
+    # app timezone (matching the current time we hand the model).
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=now.tzinfo)
+
+    if due <= now:
+        return f"That time ({due.strftime('%Y-%m-%d %H:%M %Z')}) is in the past - give me a future time."
+
+    reminder = add_reminder(due.isoformat(), text)
+
+    if on_reminder_set:
+        on_reminder_set(reminder)
+        note = ""
+    else:
+        note = " (Heads up: reminders only actually fire when the Telegram group bot is running.)"
+
+    return f"Reminder set for {due.strftime('%Y-%m-%d %H:%M %Z')}: {text}.{note}"
+
+
+def list_reminders():
+    reminders = [r for r in load_reminders() if not r["fired"]]
+
+    if not reminders:
+        return "No upcoming reminders."
+
+    reminders.sort(key=lambda r: r["due_iso"])
+    return "\n".join(f"- {r['due_iso']}: {r['text']}" for r in reminders)
+
+
+def build_morning_briefing():
+    """Assemble raw facts (weather, open tasks, today's calendar) and have Miles
+    write a short, warm briefing. Interface-agnostic - group_bot.py posts it to the
+    Telegram group on a schedule."""
+    weather = get_weather(HOME_LOCATION)
+    tasks = list_tasks()
+    events = google_helpers.list_today_events()
+
+    facts = f"Weather ({HOME_LOCATION}): {weather}\n\nOpen tasks:\n{tasks}\n\nToday's calendar:\n{events}"
+
+    prompt = f"""Write Tyler a short, friendly morning briefing from the facts below.
+Open with a one-line greeting, then cover the weather, today's calendar, and open
+tasks in a few tight, skimmable lines. Warm but not wordy. Sign off as "- Miles".
+
+Facts:
+{facts}
+"""
+    return get_ai_response(
+        [{"role": "user", "content": prompt}],
+        model=FAST_MODEL,
+        instructions="You are Miles, Tyler's calm, organized Chief of Staff writing his morning briefing.",
+    )
+
+
 def search_web(query):
     try:
         response = call_with_retries(
@@ -664,19 +923,20 @@ def show_recall(query):
         print(f"\n[distance {memory['distance']:.4f}] {memory['text']}")
 
 
-# Controls how the write_file tool gets approved, since different interfaces have
-# different ways (or no way) to ask for confirmation. One of:
-#   "enabled"               - ask via input() and write immediately (CLI default)
-#   "disabled"               - refuse all writes outright
+# Controls how *sensitive* actions (writing a file, sending an email) get approved,
+# since different interfaces have different ways (or no way) to ask. One of:
+#   "enabled"               - ask via input() and act immediately (CLI default)
+#   "disabled"               - refuse the sensitive action outright
 #   "requires_confirmation"  - no real terminal to read input() from (e.g. the
-#                              Telegram bot) - stage the write in `pending_write`
+#                              Telegram bot) - stage the action in `pending_action`
 #                              instead and tell the caller how to confirm it later
-WRITE_FILE_MODE = "enabled"
+CONFIRMATION_MODE = "enabled"
 
-# Holds {"filename": ..., "content": ...} for at most one write awaiting
-# out-of-band confirmation (used by WRITE_FILE_MODE == "requires_confirmation"),
-# else None. A single global is fine here - this is a personal, single-user app.
-pending_write = None
+# Holds at most one sensitive action awaiting out-of-band confirmation, as a dict
+# tagged with "type" ("write_file" or "send_email") plus that action's payload, else
+# None. A single global is fine here - this is a personal, single-user app. The
+# Telegram interfaces resolve it when the user replies /confirm.
+pending_action = None
 
 # Set by group_bot.py to a function (specialist_key, request_text, answer_text) -> None.
 # Called only from execute_tool's delegate_to_* branches (genuine Manager-mediated
@@ -686,9 +946,30 @@ pending_write = None
 on_delegation = None
 
 
+def confirm_pending_action(pending):
+    """Execute a staged sensitive action after the user replies /confirm. Shared by
+    both Telegram interfaces so the confirm/cancel dispatch lives in one place."""
+    if pending["type"] == "write_file":
+        return write_file(pending["filename"], pending["content"])
+    if pending["type"] == "send_email":
+        return google_helpers.send_email(pending["to"], pending["subject"], pending["body"])
+    return "Nothing to confirm."
+
+
+def describe_pending_action(pending):
+    """Short human description of a staged action, for confirm/cancel messages."""
+    if pending["type"] == "write_file":
+        return f"write to files/{pending['filename']}"
+    if pending["type"] == "send_email":
+        return f"email to {pending['to']}"
+    return "the staged action"
+
+
 def execute_tool(name, arguments):
     print(f"\n[tool] {name}({arguments})")
     logger.info(f"Tool call: {name}({arguments})")
+
+    global pending_action
 
     try:
         if name == "read_file":
@@ -731,17 +1012,78 @@ def execute_tool(name, arguments):
         if name == "get_weather":
             return get_weather(arguments["location"])
 
+        if name == "run_python":
+            return run_python(arguments["code"])
+
+        if name == "list_calendar_events":
+            time_min = arguments.get("time_min")
+            time_max = arguments.get("time_max")
+            if time_min and time_max:
+                return google_helpers.list_events(time_min, time_max)
+            return google_helpers.list_today_events()
+
+        if name == "create_calendar_event":
+            return google_helpers.create_event(
+                arguments["summary"], arguments["start"], arguments["end"], arguments.get("description", "")
+            )
+
+        if name == "set_reminder":
+            return set_reminder(arguments["when"], arguments["text"])
+
+        if name == "list_reminders":
+            return list_reminders()
+
+        if name == "search_emails":
+            return google_helpers.list_recent_emails(arguments.get("query", ""), arguments.get("max_results", 10))
+
+        if name == "read_email":
+            return google_helpers.get_email(arguments["message_id"])
+
+        if name == "draft_email":
+            return google_helpers.create_draft(arguments["to"], arguments["subject"], arguments["body"])
+
+        if name == "send_email":
+            if CONFIRMATION_MODE == "disabled":
+                return "Sending email is disabled in this interface."
+
+            if CONFIRMATION_MODE == "requires_confirmation":
+                pending_action = {
+                    "type": "send_email",
+                    "to": arguments["to"],
+                    "subject": arguments["subject"],
+                    "body": arguments["body"],
+                }
+                logger.info(f"Staged email to {arguments['to']}, awaiting out-of-band confirmation")
+                return (
+                    f"Email to {arguments['to']} (subject: '{arguments['subject']}') is staged and "
+                    f"waiting for your confirmation. Reply /confirm to send it, or anything else to "
+                    f"cancel it."
+                )
+
+            # CONFIRMATION_MODE == "enabled" - CLI path
+            answer = input(f"The AI wants to send an email to {arguments['to']} (subject: {arguments['subject']}). Allow? (y/n): ")
+
+            if answer.strip().lower() != "y":
+                logger.info(f"User denied email send to {arguments['to']}")
+                return "The user declined to send this email."
+
+            logger.info(f"User approved email send to {arguments['to']}")
+            return google_helpers.send_email(arguments["to"], arguments["subject"], arguments["body"])
+
         if name == "write_file":
-            if WRITE_FILE_MODE == "disabled":
+            if CONFIRMATION_MODE == "disabled":
                 return "File writing is disabled in this interface."
 
             file_path = get_safe_file_path(arguments["filename"])
             file_exists = file_path is not None and file_path.exists()
             overwrite_note = f" This will OVERWRITE the existing files/{arguments['filename']}." if file_exists else ""
 
-            if WRITE_FILE_MODE == "requires_confirmation":
-                global pending_write
-                pending_write = {"filename": arguments["filename"], "content": arguments["content"]}
+            if CONFIRMATION_MODE == "requires_confirmation":
+                pending_action = {
+                    "type": "write_file",
+                    "filename": arguments["filename"],
+                    "content": arguments["content"],
+                }
                 logger.info(f"Staged write to {arguments['filename']}, awaiting out-of-band confirmation")
                 return (
                     f"Write to files/{arguments['filename']} is staged and waiting for your "
@@ -749,7 +1091,7 @@ def execute_tool(name, arguments):
                     f"else to cancel it."
                 )
 
-            # WRITE_FILE_MODE == "enabled" - CLI path, unchanged from before
+            # CONFIRMATION_MODE == "enabled" - CLI path, unchanged from before
             if file_exists:
                 print(f"\nWARNING: files/{arguments['filename']} already exists and will be OVERWRITTEN.")
 
@@ -798,6 +1140,18 @@ def execute_tool(name, arguments):
                 on_delegation("weather", arguments["location"], answer)
             return answer
 
+        if name == "delegate_to_calendar_agent":
+            answer = ask_specialist("calendar", arguments["request"], record_history=False)
+            if on_delegation:
+                on_delegation("calendar", arguments["request"], answer)
+            return answer
+
+        if name == "delegate_to_gmail_agent":
+            answer = ask_specialist("gmail", arguments["request"], record_history=False)
+            if on_delegation:
+                on_delegation("gmail", arguments["request"], answer)
+            return answer
+
         if name == "delegate_to_general_assistant":
             answer = ask_ai(arguments["prompt"], record_history=False)
             if on_delegation:
@@ -828,13 +1182,15 @@ SPECIALISTS = {
         "name": "Patch",
         "label": "Patch (Coding Agent)",
         "model": PREMIUM_MODEL,
-        "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories"],
+        "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories", "run_python"],
         "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
-check existing files before editing them. Use search_the_web if you need to look
-up an error or current documentation. Explain your reasoning briefly and prefer
-simple, correct solutions over clever ones.
+check existing files before editing them. Use run_python to actually execute and
+verify Python before handing it over - it runs in a sandbox with a short timeout
+and no access to the app's secrets or files, so test your work instead of guessing.
+Use search_the_web if you need to look up an error or current documentation.
+Explain your reasoning briefly and prefer simple, correct solutions over clever ones.
 """,
         "persona": """
 You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior
@@ -928,6 +1284,41 @@ share a name), ask which one or state your assumption.
 You are Gale, the team's weather specialist. Voice: cheery weather nerd. Give the
 conditions clearly, add one emoji and a short wry aside about the weather. Sign off
 with "- Gale".
+"""
+    },
+    "calendar": {
+        "name": "Cadence",
+        "label": "Cadence (Calendar & Scheduler Agent)",
+        "model": FAST_MODEL,
+        "tool_names": ["list_calendar_events", "create_calendar_event", "set_reminder", "list_reminders"],
+        "role": """
+You manage the user's Google Calendar and their reminders. Use list_calendar_events
+to see what's scheduled, create_calendar_event to add events, set_reminder to
+schedule a one-off nudge at a specific time, and list_reminders to review pending
+ones. The current date and time is given at the top of each message - use it to turn
+relative times ("tomorrow at 3", "in two hours") into exact ISO 8601 timestamps.
+Confirm what you scheduled, clearly and briefly.
+""",
+        "persona": """
+You are Cadence, the team's calendar and scheduling specialist. Voice: unflappable
+and precise; you keep everyone on time without nagging. Sign off with "- Cadence".
+"""
+    },
+    "gmail": {
+        "name": "Piper",
+        "label": "Piper (Gmail Agent)",
+        "model": FAST_MODEL,
+        "tool_names": ["search_emails", "read_email", "draft_email", "send_email"],
+        "role": """
+You manage the user's Gmail. Use search_emails to find messages, read_email to read
+one in full, draft_email to prepare a reply or new message (it just waits in Drafts),
+and send_email to send. Sending is sensitive: prefer drafting unless the user clearly
+asks to send, and note that sending will ask them to confirm first. Summarize emails
+crisply and never invent contents you haven't actually read.
+""",
+        "persona": """
+You are Piper, the team's email specialist. Voice: brisk, discreet, and organized -
+you triage a busy inbox without drama. Sign off with "- Piper".
 """
     },
 }

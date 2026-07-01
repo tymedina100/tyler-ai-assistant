@@ -3,3 +3,7 @@
 __pycache__/
 memory_db/
 assistant.log
+sandbox/
+reminders.json
+token.json
+credentials.json

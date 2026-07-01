@@ -69,6 +69,12 @@ TELEGRAM_BOT_TOKEN=your-telegram-bot-token-here
 TELEGRAM_ALLOWED_USER_IDS=your-telegram-user-id-here
 OPENWEATHER_API_KEY=your-openweathermap-key-here
 TODOIST_API_TOKEN=your-todoist-api-token-here
+
+# Optional — proactive scheduling (group bot only), with sensible defaults:
+HOME_LOCATION=New York
+BRIEFING_TIME=08:00
+TIMEZONE=America/New_York
+EVENT_ALERT_MINUTES=15
 ```
 
 - Get an OpenAI key from https://platform.openai.com
@@ -81,6 +87,10 @@ TODOIST_API_TOKEN=your-todoist-api-token-here
   error isn't necessarily wrong, just not active yet.
 - Get your Todoist API token (used by the Tasks Agent) from the Todoist app:
   Settings → Integrations → Developer. Works with any Todoist account, free or paid.
+- Google Calendar/Gmail (used by Cadence and Piper) use OAuth, not an `.env` key —
+  run `python google_auth.py` once to connect them. See "Google setup" below.
+- The optional scheduling vars only affect the multi-bot group's proactive features
+  (morning briefing, reminders, event alerts) — see "Proactive & scheduling" below.
 
 ## Usage
 
@@ -182,6 +192,12 @@ character with its own personality** (see "Meet the team" below):
 | `/task <request>` | **Sage** (Personal Assistant Agent) | remember a fact, recall memory, write file, read file |
 | (Manager-only — no direct slash command) | **Roster** (Tasks Agent) | create/list real Todoist tasks |
 | (Manager-only — no direct slash command) | **Gale** (Weather Agent) | current weather lookup |
+| (Manager-only — no direct slash command) | **Cadence** (Calendar & Scheduler Agent) | Google Calendar events + timed reminders |
+| (Manager-only — no direct slash command) | **Piper** (Gmail Agent) | search/read/draft/send email |
+
+**Patch can also run code.** The Coding Agent has a `run_python` tool that actually
+executes Python in a sandbox (see "Code execution" below), so it can test and verify
+what it writes instead of guessing.
 
 This is deliberate: for example, the Researcher Agent *cannot* call `write_file` even
 if asked to — it genuinely doesn't have access to that tool, so it'll tell you it can't
@@ -226,8 +242,15 @@ Telegram bot, and the multi-bot group all show the same characters:
 - **Sage** — Personal Assistant Agent. Calm and organized; remembers your preferences.
 - **Roster** — Tasks Agent. Crisp operator for your real Todoist list.
 - **Gale** — Weather Agent. Cheery weather nerd.
+- **Cadence** — Calendar & Scheduler Agent. Unflappable and precise; runs your Google
+  Calendar and your reminders.
+- **Piper** — Gmail Agent. Brisk and discreet; triages, drafts, and sends email.
 - **Robin** — the general assistant (the all-rounder for anything that doesn't fit a
   specialist).
+
+Cadence and Piper are the newest hires: they work today via Miles's delegation (their
+answers post under Miles in the group), and get their own Telegram bots once you create
+them and add `"calendar"` / `"gmail"` to `BOT_KEYS`.
 
 Personalities are just prompt text, so they're easy to retune: edit the `persona`
 field on each `SPECIALISTS` entry (or `MANAGER_INSTRUCTIONS` / `ASSISTANT_INSTRUCTIONS`
@@ -263,6 +286,68 @@ Two related token-cost guards also live in `main.py`:
 - **Memory relevance cutoff (`MEMORY_DISTANCE_THRESHOLD`).** See "How long-term memory
   works" below — recalled memories that aren't actually similar are no longer injected
   into prompts.
+
+## Code execution (Patch)
+
+Patch (the Coding Agent) has a `run_python` tool that actually executes Python and
+returns its stdout, stderr, and exit code — so it can test what it writes rather than
+guessing. Execution is **sandboxed, but pragmatically, not as a hard security jail:**
+
+- Runs in a **child process** with a wall-clock timeout (`CODE_EXEC_TIMEOUT_SECONDS`,
+  default 10s), so an infinite loop is killed rather than hanging the bot.
+- Runs in an isolated throwaway working directory (`sandbox/`, gitignored), separate
+  from the `files/` folder, so it can't clobber your read/write area.
+- The child process gets a **secret-free environment** — `OPENAI_API_KEY`,
+  `TODOIST_API_TOKEN`, etc. are stripped, so executed code can't read your keys.
+- On Linux it also caps CPU, memory (`CODE_EXEC_MEMORY_MB`), and open files via
+  `resource` limits. (Windows relies on the timeout — its process model has no
+  equivalent.)
+
+What it does **not** do: it can still read the local disk and reach the network. Don't
+point it at untrusted third-party code. For a single-user personal assistant running
+your own requests, that trade-off is deliberate.
+
+## Proactive & scheduling (Telegram group)
+
+When the multi-bot group (`group_bot.py`) is running, an `APScheduler` loop lets the
+team message you unprompted:
+
+- **Daily morning briefing.** At `BRIEFING_TIME` (in your `TIMEZONE`), Miles posts a
+  short briefing pulling today's weather (`HOME_LOCATION`), your open Todoist tasks, and
+  today's calendar. It's written in Miles's voice from the raw facts.
+- **Timed reminders.** Ask Cadence (via Miles or, once she has a bot, `@mention`)
+  "remind me at 3pm to call mom". Reminders are stored in `reminders.json` (gitignored)
+  so they **survive a restart/redeploy** — on startup the bot re-schedules future ones
+  and fires any that came due while it was offline (flagged as "missed").
+- **Calendar event alerts.** A heads-up posts `EVENT_ALERT_MINUTES` before each of
+  today's timed calendar events. Today's alerts are (re)scheduled at startup and again
+  after each morning briefing.
+
+These only run in the group interface (that's where a persistent process lives); the CLI
+and single bot store reminders but don't fire them. Configure via `.env`:
+`HOME_LOCATION`, `BRIEFING_TIME` (e.g. `08:00`), `TIMEZONE` (e.g. `America/New_York`),
+`EVENT_ALERT_MINUTES` (e.g. `15`).
+
+## Google setup (Calendar & Gmail)
+
+Cadence (Calendar) and Piper (Gmail) talk to your real Google account. Auth is a
+**one-time local consent** that mints a `token.json` the headless bot then refreshes on
+its own — no browser needed after setup:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create a project,
+   **enable the Google Calendar API and the Gmail API**, and create an **OAuth client ID
+   of type "Desktop app"**.
+2. Download that client secret and save it in the project root as `credentials.json`.
+3. Run `python google_auth.py` once. A browser opens; approve the scopes (calendar
+   events, read email, compose, send). On success it writes `token.json`.
+4. `credentials.json` and `token.json` are gitignored. To deploy, upload `token.json`
+   as a secret / persistent-volume file so the worker can keep refreshing it.
+
+**Sending email is gated.** Piper can search, read, and draft freely (drafts just wait
+in your Gmail Drafts), but **`send_email` always asks you to confirm** — over Telegram
+it stages the send and you reply `/confirm` (the same mechanism as a file write);
+creating calendar events, like adding a Todoist task, is not gated since it's easily
+undone.
 
 ## Reliability features
 
@@ -411,9 +496,10 @@ python group_bot.py
   real messages from the right bot identities — not just a debug log line.
 - `@mention` any agent directly (e.g. `@YourResearchBot what's...`) to skip the
   Manager entirely and talk to that agent one-on-one, right in the group.
-- `write_file` confirmations always go through the **Manager**, regardless of which
-  agent staged the write (a direct `@mention` conversation or a Manager delegation) —
-  reply `/confirm` as a plain message, not addressed to anyone specifically.
+- Confirmations for sensitive actions (a `write_file` **or** a Gmail `send_email`)
+  always go through the **Manager**, regardless of which agent staged it (a direct
+  `@mention` conversation or a Manager delegation) — reply `/confirm` as a plain
+  message, not addressed to anyone specifically.
 - Every bot ignores messages from other bots (prevents reply loops — with privacy
   mode off, every bot technically sees every message, including ones other bots
   post) and ignores anything outside the configured group, including private DMs.
@@ -431,12 +517,14 @@ docker run --env-file .env ai-assistant-group-bot
 
 Not build-tested in this environment (no Docker available here) — verify it builds
 and runs for you first. Same deployment shape as `bot.py`: a **background worker**
-(not a web service, since it doesn't listen on a port), and the same
-`/app/memory_db` persistent-volume requirement applies if you want long-term memory
-to survive redeploys. Set every token you're using (`TELEGRAM_MANAGER_BOT_TOKEN`,
-`TELEGRAM_GROUP_CHAT_ID`, etc., plus `OPENAI_API_KEY`/`TAVILY_API_KEY`/
-`OPENWEATHER_API_KEY`/`TODOIST_API_TOKEN`) as environment variables/secrets on
-whatever platform you deploy to.
+(not a web service, since it doesn't listen on a port). Mount a **persistent volume**
+so state survives redeploys — this now covers not just `/app/memory_db` (long-term
+memory) but also `/app/reminders.json` (pending reminders) and `/app/token.json`
+(your Google login); without persistence those reset on every deploy. Set every token
+you're using (`TELEGRAM_MANAGER_BOT_TOKEN`, `TELEGRAM_GROUP_CHAT_ID`, etc., plus
+`OPENAI_API_KEY`/`TAVILY_API_KEY`/`OPENWEATHER_API_KEY`/`TODOIST_API_TOKEN`, and the
+optional `HOME_LOCATION`/`BRIEFING_TIME`/`TIMEZONE`/`EVENT_ALERT_MINUTES`) as
+environment variables/secrets on whatever platform you deploy to.
 
 **One thing to remember:** `BOT_KEYS` in `group_bot.py` controls which agents are
 active. Whenever you create a new bot and want to add it to a *deployed* instance,
