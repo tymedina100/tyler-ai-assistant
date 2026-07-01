@@ -189,10 +189,10 @@ so your original wording is never lost or paraphrased in the permanent record.
 
 ## Specialist agents
 
-Beyond the general assistant, six specialist commands each use the same tool-calling
-machinery as plain chat, but with a different system prompt and a **curated subset**
-of tools — not every specialist can do everything. Each one is also a **named
-character with its own personality** (see "Meet the team" below):
+Beyond the general assistant, specialist commands and Manager-only agents use the
+same tool-calling machinery as plain chat, but with a different system prompt and a
+**curated subset** of tools — not every specialist can do everything. Each one is
+also a **named character with its own personality** (see "Meet the team" below):
 
 | Command | Specialist | Tools it has |
 |---|---|---|
