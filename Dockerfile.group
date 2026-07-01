@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py group_bot.py google_helpers.py ./
+COPY main.py group_bot.py google_helpers.py github_helpers.py ./
 COPY files/ ./files/
 
 # memory_db/ (long-term memory), reminders.json (pending reminders), and

@@ -75,6 +75,11 @@ HOME_LOCATION=New York
 BRIEFING_TIME=08:00
 TIMEZONE=America/New_York
 EVENT_ALERT_MINUTES=15
+
+# Optional — mirror every saved file to a GitHub repo (see "Saving files to GitHub"):
+GITHUB_TOKEN=your-github-personal-access-token
+GITHUB_REPO=your-username/your-files-repo
+GITHUB_BRANCH=main
 ```
 
 - Get an OpenAI key from https://platform.openai.com
@@ -306,6 +311,32 @@ guessing. Execution is **sandboxed, but pragmatically, not as a hard security ja
 What it does **not** do: it can still read the local disk and reach the network. Don't
 point it at untrusted third-party code. For a single-user personal assistant running
 your own requests, that trade-off is deliberate.
+
+## Saving files to GitHub
+
+Files that agents write with `write_file` normally land in the `files/` folder — which
+is fine locally, but on a cloud deploy that folder is **inside the container**, wiped on
+every redeploy and unreachable from your PC. Set two env vars and every saved file is
+also committed to a GitHub repo, so it persists across redeploys and you can grab it
+from anywhere (`git pull`, or just github.com):
+
+- `GITHUB_TOKEN` — a GitHub Personal Access Token with write access to the repo.
+- `GITHUB_REPO` — `owner/repo` of a repo you created for this (e.g. a dedicated
+  `patch-files` repo, so your app's code repo stays clean).
+- `GITHUB_BRANCH` — optional, defaults to `main`.
+
+**Setup:**
+1. Create an empty GitHub repo (e.g. `patch-files`) — add a README so it has a `main`
+   branch.
+2. Create a token: GitHub → Settings → Developer settings → **Fine-grained tokens** →
+   scope it to just that repo with **Contents: Read and write**. Copy it.
+3. Put both values in `.env` locally, and set them as env vars on your deploy platform.
+
+When configured, `write_file` commits via the GitHub contents API (one HTTPS request —
+no git binary needed in the container) and the tool result includes the file's GitHub
+URL, so the agent can hand you the link right in chat. If the vars aren't set, it's a
+silent no-op and files just save locally as before. This is how a cloud-run bot gets
+code onto your PC without touching your machine directly.
 
 ## Proactive & scheduling (Telegram group)
 

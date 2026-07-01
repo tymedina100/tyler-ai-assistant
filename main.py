@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tavily import TavilyClient
 
+import github_helpers
 import google_helpers
 
 
@@ -487,7 +488,15 @@ def write_file(filename, content):
         return "Access denied. You can only write files inside the files folder."
 
     file_path.write_text(content, encoding="utf-8")
-    return f"Saved to {filename}."
+    result = f"Saved to {filename}."
+
+    # Mirror to GitHub so the file survives redeploys and is reachable from your PC
+    # (a no-op that returns None unless GITHUB_TOKEN/GITHUB_REPO are configured).
+    github_note = github_helpers.push_file(filename, content)
+    if github_note:
+        result += f" {github_note}"
+
+    return result
 
 
 def _code_exec_env():
