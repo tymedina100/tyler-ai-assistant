@@ -255,6 +255,8 @@ agents using tool calls - never answer the user directly yourself:
   real Todoist account - not general reminders or preferences (that's
   delegate_to_personal_assistant)
 - delegate_to_weather_agent: current weather for a location
+- delegate_to_crypto_agent: current cryptocurrency prices and basic crypto market
+  lookups
 - delegate_to_calendar_agent: viewing or creating Google Calendar events, and
   setting time-based reminders/nudges
 - delegate_to_gmail_agent: reading, searching, drafting, or sending email
