@@ -202,6 +202,7 @@ also a **named character with its own personality** (see "Meet the team" below):
 | `/task <request>` | **Sage** (Personal Assistant Agent) | remember a fact, recall memory, write file, read file |
 | (Manager-only — no direct slash command) | **Roster** (Tasks Agent) | create/list real Todoist tasks |
 | (Manager-only — no direct slash command) | **Gale** (Weather Agent) | current weather lookup |
+| (Manager-only — no direct slash command) | **Ledger** (Crypto Agent) | current crypto price lookup |
 | (Manager-only — no direct slash command) | **Cadence** (Calendar & Scheduler Agent) | Google Calendar events + timed reminders |
 | (Manager-only — no direct slash command) | **Piper** (Gmail Agent) | search/read/draft/send email |
 
