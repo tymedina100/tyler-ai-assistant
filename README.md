@@ -670,6 +670,37 @@ duplication — this file is purely the "who's listening, who replies as whom" l
    bots created before anything works. Start small (e.g. just Manager + one
    specialist) and expand as you create more bots.
 
+**Optional: give every bot its own profile picture.**
+
+The generated Telegram profile portraits live in `assets/telegram_profiles/`, with a
+manifest that maps each agent key to the matching token env var. Telegram's Bot API
+supports changing a bot's profile photo via `setMyProfilePhoto`; this project keeps
+that as an explicit setup step so deploys do not unexpectedly touch bot profiles.
+
+Preview the setup without making any Telegram API calls:
+
+```powershell
+python scripts\set_telegram_profile_photos.py --all --dry-run
+```
+
+Apply every available portrait once the matching `TELEGRAM_*_BOT_TOKEN` values are in
+your `.env`:
+
+```powershell
+python scripts\set_telegram_profile_photos.py --all
+```
+
+Or update one bot at a time:
+
+```powershell
+python scripts\set_telegram_profile_photos.py --agent manager
+python scripts\set_telegram_profile_photos.py --agent code
+```
+
+The script only updates the bots you select. Agents that are not yet in `BOT_KEYS` can
+still have portraits ready now; they just will not speak in the group until you add
+their token and enable their key.
+
 **Run it locally:**
 ```powershell
 python group_bot.py
