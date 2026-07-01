@@ -10,9 +10,9 @@ main.py (ask_manager, the specialists, every tool) without duplicating it:
 - Sensitive actions (writing a file, sending an email) normally confirm via
   input() y/n, which has no real terminal here - so this interface uses
   main.CONFIRMATION_MODE = "requires_confirmation" instead: the action gets staged
-  (main.pending_action) rather than performed immediately, and the user confirms it
-  with a follow-up "/confirm" message, intercepted below before normal command
-  handling.
+  (per-chat via main.get_pending_action()) rather than performed immediately, and the
+  user confirms it with a follow-up "/confirm" message, intercepted below before
+  normal command handling.
 - A single asyncio.Lock() serializes message handling, so two messages never
   redirect stdout at the same time. Fine for a personal, single-user bot.
 """
@@ -87,10 +87,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This bot runs continuously - there's no need to quit, I'm always here.")
         return
 
-    if main.pending_action is not None:
+    if main.get_pending_action() is not None:
         async with processing_lock:
-            pending = main.pending_action
-            main.pending_action = None  # resolved either way - confirm or cancel
+            pending = main.get_pending_action()
+            main.clear_pending_action()  # resolved either way - confirm or cancel
             description = main.describe_pending_action(pending)
 
             if text.strip() == "/confirm":
