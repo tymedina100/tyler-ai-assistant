@@ -146,6 +146,18 @@ TOOLS = [
     {"type": "function", "name": "send_email", "strict": False,
      "description": "Send an email via Gmail. Sensitive action - the user is asked to confirm before it actually sends.",
      "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, "required": ["to", "subject", "body"]}},
+    {"type": "function", "name": "github_list_files", "strict": False,
+     "description": "List files/folders in the connected GitHub repo. Pass a folder path to list inside it, or omit path for the repo root.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": []}},
+    {"type": "function", "name": "github_read_file", "strict": False,
+     "description": "Read a file's contents from the connected GitHub repo by its path (e.g. 'src/app.py').",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"type": "function", "name": "github_save_file", "strict": False,
+     "description": "Create or update a file directly in the connected GitHub repo at the given path. Commits immediately.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"type": "function", "name": "github_delete_file", "strict": False,
+     "description": "Delete a file from the connected GitHub repo. Sensitive action - the user is asked to confirm first (still recoverable from git history).",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
 ]
 
 DELEGATION_TOOLS = [
@@ -962,6 +974,8 @@ def confirm_pending_action(pending):
         return write_file(pending["filename"], pending["content"])
     if pending["type"] == "send_email":
         return google_helpers.send_email(pending["to"], pending["subject"], pending["body"])
+    if pending["type"] == "github_delete":
+        return github_helpers.delete_file(pending["path"])
     return "Nothing to confirm."
 
 
@@ -971,6 +985,8 @@ def describe_pending_action(pending):
         return f"write to files/{pending['filename']}"
     if pending["type"] == "send_email":
         return f"email to {pending['to']}"
+    if pending["type"] == "github_delete":
+        return f"deletion of {pending['path']} from GitHub"
     return "the staged action"
 
 
@@ -1078,6 +1094,38 @@ def execute_tool(name, arguments):
 
             logger.info(f"User approved email send to {arguments['to']}")
             return google_helpers.send_email(arguments["to"], arguments["subject"], arguments["body"])
+
+        if name == "github_list_files":
+            return github_helpers.list_files(arguments.get("path", ""))
+
+        if name == "github_read_file":
+            return github_helpers.read_file(arguments["path"])
+
+        if name == "github_save_file":
+            return github_helpers.save_file(arguments["path"], arguments["content"])
+
+        if name == "github_delete_file":
+            if CONFIRMATION_MODE == "disabled":
+                return "Deleting files is disabled in this interface."
+
+            if CONFIRMATION_MODE == "requires_confirmation":
+                pending_action = {"type": "github_delete", "path": arguments["path"]}
+                logger.info(f"Staged GitHub delete of {arguments['path']}, awaiting confirmation")
+                return (
+                    f"Deleting {arguments['path']} from GitHub is staged and waiting for your "
+                    f"confirmation. Reply /confirm to delete it (still recoverable from git "
+                    f"history), or anything else to cancel it."
+                )
+
+            # CONFIRMATION_MODE == "enabled" - CLI path
+            answer = input(f"The AI wants to delete {arguments['path']} from the GitHub repo. Allow? (y/n): ")
+
+            if answer.strip().lower() != "y":
+                logger.info(f"User denied GitHub delete of {arguments['path']}")
+                return "The user declined to delete the file."
+
+            logger.info(f"User approved GitHub delete of {arguments['path']}")
+            return github_helpers.delete_file(arguments["path"])
 
         if name == "write_file":
             if CONFIRMATION_MODE == "disabled":
@@ -1191,7 +1239,8 @@ SPECIALISTS = {
         "name": "Patch",
         "label": "Patch (Coding Agent)",
         "model": PREMIUM_MODEL,
-        "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories", "run_python"],
+        "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories", "run_python",
+                       "github_list_files", "github_read_file", "github_save_file", "github_delete_file"],
         "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
@@ -1199,7 +1248,13 @@ check existing files before editing them. Use run_python to actually execute and
 verify Python before handing it over - it runs in a sandbox with a short timeout
 and no access to the app's secrets or files, so test your work instead of guessing.
 Use search_the_web if you need to look up an error or current documentation.
-Explain your reasoning briefly and prefer simple, correct solutions over clever ones.
+
+You also have full access to a connected GitHub repo: github_list_files and
+github_read_file to browse and read what's there, github_save_file to commit new or
+changed files directly to the repo, and github_delete_file to remove one (the user
+is asked to confirm deletes). Read existing repo files before changing them, and
+share the GitHub URL you get back so the user can grab the result. Explain your
+reasoning briefly and prefer simple, correct solutions over clever ones.
 """,
         "persona": """
 You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior

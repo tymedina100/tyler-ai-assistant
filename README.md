@@ -338,6 +338,20 @@ URL, so the agent can hand you the link right in chat. If the vars aren't set, i
 silent no-op and files just save locally as before. This is how a cloud-run bot gets
 code onto your PC without touching your machine directly.
 
+**Patch has full repo access.** Beyond the automatic `write_file` mirror, the Coding
+Agent gets first-class tools to work on the repo like a developer:
+
+- `github_list_files` — browse the repo (a folder path, or the root).
+- `github_read_file` — read an existing file's contents.
+- `github_save_file` — create or update a file directly at any repo path (commits
+  immediately).
+- `github_delete_file` — remove a file; **gated behind `/confirm`** like other
+  sensitive actions. Deletes stay recoverable from git history.
+
+All four use the same `GITHUB_TOKEN`/`GITHUB_REPO` config and need no extra GitHub
+scopes beyond **Contents: Read and write**. So you can ask Patch to "read `app.py` from
+the repo and fix the bug," and it'll pull it, edit it, and commit the fix back.
+
 ## Proactive & scheduling (Telegram group)
 
 When the multi-bot group (`group_bot.py`) is running, an `APScheduler` loop lets the
