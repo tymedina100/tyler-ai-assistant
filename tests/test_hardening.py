@@ -137,14 +137,14 @@ class HardeningTests(unittest.TestCase):
 
     def test_usage_to_usd_responses_shape(self):
         usage = FakeUsage(input_tokens=1000, output_tokens=1000)
-        # PREMIUM_MODEL priced (0.01, 0.03) per 1k → 0.01 + 0.03 = 0.04
-        self.assertAlmostEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.04, places=6)
+        # PREMIUM_MODEL gpt-5.5 priced (0.005, 0.030) per 1k → 0.005 + 0.030 = 0.035
+        self.assertAlmostEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.035, places=6)
 
     def test_usage_to_usd_embedding_shape(self):
         usage = FakeUsage(prompt_tokens=1000, total_tokens=1000)
-        # EMBEDDING priced (0.0001, 0.0); output = total - input = 0
+        # EMBEDDING priced (0.00002, 0.0); output = total - input = 0
         self.assertAlmostEqual(
-            self.main.usage_to_usd(self.main.EMBEDDING_MODEL_NAME, usage), 0.0001, places=6
+            self.main.usage_to_usd(self.main.EMBEDDING_MODEL_NAME, usage), 0.00002, places=6
         )
 
     def test_usage_to_usd_unknown_model_uses_default(self):

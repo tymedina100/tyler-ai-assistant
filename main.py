@@ -185,17 +185,23 @@ FAST_MODEL = "gpt-5.4-mini"
 GENERAL_MODEL = PREMIUM_MODEL  # the general assistant fields arbitrary questions
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 
-# Rough USD price per 1,000 tokens as (input_rate, output_rate) per model. Company
-# Mode meters real token usage against these so the daily budget reflects actual
-# spend, not a flat estimate. This is the ONE place to update when prices or model
-# ids change - confirm the real numbers for your account before trusting the ledger.
-# An unknown model falls back to DEFAULT_MODEL_PRICE and logs a warning, so a model
-# swap can never silently meter $0 and hide runaway cost.
+# USD price per 1,000 tokens as (input_rate, output_rate) per model. Company Mode
+# meters real token usage against these so the daily budget reflects actual spend,
+# not a flat estimate. This is the ONE place to update when prices or model ids
+# change. Values below are OpenAI list pricing divided by 1,000 (list is per 1M
+# tokens). An unknown model falls back to DEFAULT_MODEL_PRICE and logs a warning, so
+# a model swap can never silently meter $0 and hide runaway cost - the fallback is
+# deliberately on the high side so an unpriced model over-counts rather than under.
 DEFAULT_MODEL_PRICE = (0.01, 0.03)
 MODEL_PRICING = {
-    PREMIUM_MODEL: (0.01, 0.03),
-    FAST_MODEL: (0.002, 0.006),
-    EMBEDDING_MODEL_NAME: (0.0001, 0.0),
+    PREMIUM_MODEL: (0.005, 0.030),         # gpt-5.5:      $5.00 / $30.00 per 1M
+    FAST_MODEL: (0.00075, 0.0045),         # gpt-5.4-mini: $0.75 / $4.50 per 1M
+    EMBEDDING_MODEL_NAME: (0.00002, 0.0),  # text-embedding-3-small: ~$0.02 per 1M
+    # Other current OpenAI models, priced ahead of time for easy model swaps:
+    "gpt-5.5-pro": (0.030, 0.180),         # $30.00 / $180.00 per 1M
+    "gpt-5.4": (0.0025, 0.015),            # $2.50 / $15.00 per 1M
+    "gpt-5.4-nano": (0.0002, 0.00125),     # $0.20 / $1.25 per 1M
+    "o4-mini": (0.00055, 0.0022),          # $0.55 / $2.20 per 1M
 }
 
 
