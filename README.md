@@ -457,6 +457,7 @@ Commands in the group:
 - `/assign <goal>` — plan + reserve budget for a goal (creates a *proposed* project).
 - `/approve` — start working the proposed plan.
 - `/cancel` — drop the active project and release its reserved budget.
+- `/publish` — package the finished project for sale (assisted; see below).
 - `/dailyreport` — shipped/open/blocked work, artifacts, and the next recommendation.
 - `/pausecompany` / `/resumecompany` — halt/resume the engine (checked between tasks).
 
@@ -480,6 +481,18 @@ The engine enforces the cap **between tasks**: if the day's budget is exhausted 
 and defers the rest. Because the check is at task boundaries, a single task can overshoot
 the remaining budget by at most its own cost (itself bounded by the tool-call cap) — keep
 per-day budgets modest and raise them as a product proves out.
+
+### Publishing a product (`/publish`, assisted)
+
+Gumroad (and Lemon Squeezy) **have no API to create a product or upload its file** —
+it's dashboard-only. So `/publish` does everything up to the final upload: it splits
+the project's finished deliverable into a clean **buyer-download file** and a
+**paste-ready Gumroad listing** (name, price, description, tags, cover idea), then
+**stages a gated approval**. Reply `/confirm` to mark the project published and get the
+exact Gumroad go-live steps. The one thing that stays yours is the final upload click —
+which is the right control for an irreversible, money-adjacent action anyway. (True
+end-to-end auto-publishing would require browser automation or a platform like Stripe
+whose API can create products; revenue tracking is planned for v3.)
 
 ### What stays supervised
 

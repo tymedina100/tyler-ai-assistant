@@ -231,6 +231,17 @@ class CompanyModeTests(unittest.TestCase):
         first = company_mode.project_tasks(state, project["id"])[0]
         self.assertEqual(company_mode.prior_work_summary(state, project["id"], first["id"]), "")
 
+    def test_mark_project_published_sets_status(self):
+        self._assign()
+        company_mode.approve_project(self.state_path)
+        msg = company_mode.mark_project_published(self.state_path)
+        self.assertIn("published", msg.lower())
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(company_mode.active_project(state)["status"], "published")
+
+    def test_publish_command_is_recognized(self):
+        self.assertEqual(company_mode.parse_company_command("/publish"), ("/publish", ""))
+
     def test_record_delegation_can_meter_spend(self):
         self._assign(configured=("manager", "research"))
         company_mode.record_delegation(
