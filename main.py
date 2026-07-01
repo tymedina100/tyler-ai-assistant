@@ -48,8 +48,32 @@ OPENWEATHER_API_KEY = os.environ["OPENWEATHER_API_KEY"]
 
 conversation_history = []
 
-MODEL_NAME = "gpt-5.5"
+# Two model tiers instead of one model for everything. The premium model does
+# the work that needs real reasoning (coding, research, writing, the catch-all
+# general assistant); the fast/cheap model handles work that's mostly routing or
+# a thin wrapper over an API result (the Manager's delegation decision, weather,
+# tasks, personal-assistant memory ops). Every call defaults to PREMIUM_MODEL, so
+# nothing silently downgrades - a call is only cheap where we deliberately say so.
+# Confirm the exact cheaper sibling id available on the account before deploying.
+PREMIUM_MODEL = "gpt-5.5"
+FAST_MODEL = "gpt-5.4-mini"
+GENERAL_MODEL = PREMIUM_MODEL  # the general assistant fields arbitrary questions
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+
+# Cap how many past messages ask_ai resends to the model each turn. conversation_
+# history itself still grows unbounded (so /history shows everything), but the
+# model only ever sees the most recent slice - long-term memory recall already
+# carries older context, so this trims token cost without much real loss.
+MAX_HISTORY_MESSAGES = 20
+
+# recall_memories/Chroma always returns its closest matches even when none are
+# actually relevant (no built-in relevance floor). When we *inject* memories into
+# a prompt we drop anything less similar than this (higher distance = less
+# similar). Chroma's default metric here is squared L2, so tune this against real
+# /recall distances - it's a starting point, not a magic number. show_recall
+# stays unfiltered on purpose (it's the tool for seeing raw distances).
+MEMORY_DISTANCE_THRESHOLD = 1.2
+
 MAX_TOOL_ITERATIONS = 5
 # The Manager is the only caller expected to make several substantive tool
 # calls in one turn by design now (one delegation per agent in a chain) -
@@ -114,17 +138,21 @@ chroma_client = chromadb.PersistentClient(path=str(MEMORY_DIR))
 memory_collection = chroma_client.get_or_create_collection(name="long_term_memory")
 
 ASSISTANT_INSTRUCTIONS = """
-You are Tyler's beginner-friendly AI assistant.
+You are Robin, the friendly all-rounder on Tyler's AI team - you handle whatever
+doesn't clearly belong to a specialist.
 Be honest about uncertainty.
 If the user asks for current, live, recent, or real-time information,
 and you do not have a tool for it, say that you cannot verify it yet.
 Keep explanations clear and concise.
+
+Voice: warm, upbeat, and genuinely helpful without being wordy. Sign off with
+"- Robin".
 """
 
 MANAGER_INSTRUCTIONS = """
-You are a manager agent. Your job is to read the user's request and get it done
-by delegating to one or more of the following agents using tool calls - never
-answer the user directly yourself:
+You are Miles, the Chief of Staff for Tyler's AI team. Your job is to read the
+user's request and get it done by delegating to one or more of the following
+agents using tool calls - never answer the user directly yourself:
 - delegate_to_coding_agent: programming, code-writing, code-reading, or debugging
 - delegate_to_research_agent: looking up information, facts, or current events
 - delegate_to_writer_agent: drafting, editing, or improving written content
@@ -151,7 +179,11 @@ request needs more than one step:
 
 Once all needed delegations are done, present the final result back to the user
 as your final answer. Do not significantly rewrite a specialist's own answer -
-relay it, with at most one short framing sentence.
+relay it, keeping their own voice and sign-off intact, with at most one short
+framing sentence in your own calm, organized Chief-of-Staff tone. Each specialist
+is a distinct character on the team (Patch codes, Scout researches, Quill writes,
+Sage assists, Roster runs the task list, Gale does weather) - let their
+personality come through rather than flattening everyone into one voice.
 """
 
 
@@ -171,11 +203,11 @@ def call_with_retries(func, max_attempts=3, delay_seconds=2, label="API call"):
             time.sleep(delay_seconds)
 
 
-def get_ai_response(input_messages):
+def get_ai_response(input_messages, model=PREMIUM_MODEL):
     try:
         response = call_with_retries(
             lambda: client.responses.create(
-                model=MODEL_NAME,
+                model=model,
                 instructions=ASSISTANT_INSTRUCTIONS,
                 input=input_messages
             ),
@@ -204,6 +236,11 @@ def get_embedding(text):
 def build_augmented_prompt(prompt):
     memories = recall_memories(prompt, n_results=3)
 
+    # Only inject memories that are actually similar - Chroma returns its closest
+    # matches even when nothing is relevant, so without this floor a sparse store
+    # pastes unrelated facts into every prompt (wasted tokens, worse answers).
+    memories = [m for m in memories if m["distance"] <= MEMORY_DISTANCE_THRESHOLD]
+
     if len(memories) == 0:
         return prompt
 
@@ -217,14 +254,14 @@ Current message:
 """
 
 
-def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITERATIONS):
+def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITERATIONS, model=PREMIUM_MODEL):
     assistant_response = "Sorry, I tried too many tool calls without finishing. Please try rephrasing."
 
     try:
         for _ in range(max_iterations):
             response = call_with_retries(
                 lambda: client.responses.create(
-                    model=MODEL_NAME,
+                    model=model,
                     instructions=instructions,
                     input=input_items,
                     tools=tools
@@ -265,7 +302,13 @@ def ask_ai(prompt, record_history=True):
             "content": prompt
         })
 
-        input_items = conversation_history[:-1] + [{
+        # Window the history sent to the model to the most recent messages so
+        # token cost doesn't climb unbounded every turn. conversation_history
+        # itself is untouched (so /history still shows the full record); only the
+        # model input is trimmed. Slice off the just-appended message first, then
+        # keep the last MAX_HISTORY_MESSAGES, then re-add the augmented version.
+        recent_history = conversation_history[:-1][-MAX_HISTORY_MESSAGES:]
+        input_items = recent_history + [{
             "role": "user",
             "content": augmented_prompt
         }]
@@ -274,7 +317,7 @@ def ask_ai(prompt, record_history=True):
         # conversation_history entry itself, using the user's verbatim message.
         input_items = [{"role": "user", "content": augmented_prompt}]
 
-    assistant_response = run_with_tools(ASSISTANT_INSTRUCTIONS, input_items, TOOLS)
+    assistant_response = run_with_tools(ASSISTANT_INSTRUCTIONS, input_items, TOOLS, model=GENERAL_MODEL)
 
     if record_history:
         conversation_history.append({
@@ -774,71 +817,126 @@ def execute_tool(name, arguments):
         return error_message
 
 
+# Each specialist is a member of the team with a real name and personality. Its
+# prompt is built as role + persona (see build_persona_instructions): `role` is the
+# functional, load-bearing guidance (what tools to use, safety rules like the
+# Personal-Assistant-vs-Tasks distinction) and comes first so it dominates behavior;
+# `persona` layers on the character's voice. `model` picks the cost tier - work that
+# needs real reasoning gets PREMIUM_MODEL, thin API-wrapping work gets FAST_MODEL.
 SPECIALISTS = {
     "code": {
-        "label": "Coding Agent",
+        "name": "Patch",
+        "label": "Patch (Coding Agent)",
+        "model": PREMIUM_MODEL,
         "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories"],
-        "instructions": """
+        "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
 check existing files before editing them. Use search_the_web if you need to look
 up an error or current documentation. Explain your reasoning briefly and prefer
 simple, correct solutions over clever ones.
+""",
+        "persona": """
+You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior
+engineer. Short sentences. Dry humor. You distrust clever code and push for the
+simplest correct solution. Skip the pleasantries, get to the point, and sign off
+with "- Patch".
 """
     },
     "research": {
-        "label": "Researcher Agent",
+        "name": "Scout",
+        "label": "Scout (Researcher Agent)",
+        "model": PREMIUM_MODEL,
         "tool_names": ["search_the_web", "recall_memories", "remember_fact"],
-        "instructions": """
+        "role": """
 You are a thorough research assistant. Use search_the_web to find current,
 accurate information and cite your sources. Use remember_fact to save important
 findings for later, and recall_memories to check what's already been researched
 before searching again. Be clear about what is verified fact versus speculation.
+""",
+        "persona": """
+You are Scout, the team's researcher. Voice: curious, energetic fact-hound who
+loves a good source and always says where a claim came from. You clearly label
+what's "verified" versus "unconfirmed". Sign off with "- Scout".
 """
     },
     "write": {
-        "label": "Writer Agent",
+        "name": "Quill",
+        "label": "Quill (Writer Agent)",
+        "model": PREMIUM_MODEL,
         "tool_names": ["read_file", "write_file", "recall_memories"],
-        "instructions": """
+        "role": """
 You are a skilled writing assistant. Help the user draft, edit, and improve
 written content. Use read_file to review an existing draft before editing it,
 and write_file to save a finished draft when asked. Match the tone the user
 requests and keep writing clear.
+""",
+        "persona": """
+You are Quill, the team's writer. Voice: warm, thoughtful wordsmith who cares about
+tone and rhythm. When it genuinely helps, offer a lighter option and a tighter
+option so the user can choose. Sign off with "- Quill".
 """
     },
     "task": {
-        "label": "Personal Assistant Agent",
+        "name": "Sage",
+        "label": "Sage (Personal Assistant Agent)",
+        "model": FAST_MODEL,
         "tool_names": ["remember_fact", "recall_memories", "write_file", "read_file"],
-        "instructions": """
+        "role": """
 You are an organized personal assistant. Use remember_fact to save important
 personal information, reminders, and preferences, and recall_memories to recall
 them later. Use write_file to maintain simple notes when asked. You are NOT a
 real task-tracking app - for actual to-do items, that's the Tasks Agent's job,
 not yours. Be concise and proactive.
+""",
+        "persona": """
+You are Sage, the team's personal assistant. Voice: calm, organized, quietly
+proactive - you remember what matters to the user and gently keep things tidy.
+Sign off with "- Sage".
 """
     },
     "tasks": {
-        "label": "Tasks Agent",
+        "name": "Roster",
+        "label": "Roster (Tasks Agent)",
+        "model": FAST_MODEL,
         "tool_names": ["create_task", "list_tasks"],
-        "instructions": """
+        "role": """
 You are a task management assistant connected to the user's real Todoist
 account. Use create_task to add new tasks and list_tasks to see what's
 currently open before adding duplicates or when asked what's on the list.
 You manage a real external to-do list - this is different from the Personal
 Assistant Agent, which only saves general facts/reminders to memory. Be concise.
+""",
+        "persona": """
+You are Roster, the team's operations specialist for the real to-do list. Voice:
+crisp and reliable. You confirm exactly what landed on the list and what's still
+open - no fluff. Sign off with "- Roster".
 """
     },
     "weather": {
-        "label": "Weather Agent",
+        "name": "Gale",
+        "label": "Gale (Weather Agent)",
+        "model": FAST_MODEL,
         "tool_names": ["get_weather"],
-        "instructions": """
+        "role": """
 You are a weather assistant. Use get_weather to look up current conditions
 for a location the user asks about. Report temperature and conditions
 briefly and clearly. If the location is ambiguous (e.g. multiple cities
 share a name), ask which one or state your assumption.
+""",
+        "persona": """
+You are Gale, the team's weather specialist. Voice: cheery weather nerd. Give the
+conditions clearly, add one emoji and a short wry aside about the weather. Sign off
+with "- Gale".
 """
     },
 }
+
+
+def build_persona_instructions(profile):
+    """Combine a specialist's functional role with its personality. Role comes
+    first so behavior/safety guidance dominates; persona layers voice on top."""
+    return profile["role"] + "\n" + profile["persona"]
 
 
 def ask_specialist(specialist_key, prompt, record_history=True):
@@ -848,7 +946,9 @@ def ask_specialist(specialist_key, prompt, record_history=True):
     augmented_prompt = build_augmented_prompt(prompt)
     input_items = [{"role": "user", "content": augmented_prompt}]
 
-    answer = run_with_tools(profile["instructions"], input_items, specialist_tools)
+    answer = run_with_tools(
+        build_persona_instructions(profile), input_items, specialist_tools, model=profile["model"]
+    )
 
     if record_history:
         conversation_history.append({
@@ -864,7 +964,7 @@ def ask_specialist(specialist_key, prompt, record_history=True):
         store_memory(f"Asked {profile['label']}: {prompt}\n{profile['label']} replied: {answer[:200]}", source="chat")
 
     print()
-    print(f"{profile['label']} response:")
+    print(f"{profile['name']}:")
     print(answer)
 
     return answer
@@ -872,7 +972,10 @@ def ask_specialist(specialist_key, prompt, record_history=True):
 
 def ask_manager(prompt):
     input_items = [{"role": "user", "content": prompt}]
-    answer = run_with_tools(MANAGER_INSTRUCTIONS, input_items, DELEGATION_TOOLS, max_iterations=MAX_MANAGER_TOOL_ITERATIONS)
+    answer = run_with_tools(
+        MANAGER_INSTRUCTIONS, input_items, DELEGATION_TOOLS,
+        max_iterations=MAX_MANAGER_TOOL_ITERATIONS, model=FAST_MODEL
+    )
 
     # The Manager owns the conversation_history record (using the user's literal
     # message), not the delegated specialist/general assistant, so /history always
@@ -883,7 +986,7 @@ def ask_manager(prompt):
     store_memory(f"User said: {prompt}\nAssistant replied: {answer[:200]}", source="chat")
 
     print()
-    print("Manager response:")
+    print("Miles (Manager):")
     print(answer)
 
     return answer

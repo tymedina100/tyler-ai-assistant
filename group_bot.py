@@ -65,49 +65,44 @@ BOT_KEYS = ["manager", "weather", "code", "research"]
 
 SPECIALIST_KEYS = [key for key in BOT_KEYS if key != "manager"]
 
+# The Manager isn't a main.SPECIALISTS entry (it's the router persona defined by
+# MANAGER_INSTRUCTIONS), so it carries its own label/welcome here. Every other
+# agent's display name and role come from main.SPECIALISTS below, so the persona
+# names live in exactly one place (main.py) and can't drift between the CLI and
+# the group. Each entry here only adds Telegram-specific bits: the token env var
+# and a one-line "@mention me for X" tagline.
 AGENT_INFO = {
     "manager": {
         "env_var": "TELEGRAM_MANAGER_BOT_TOKEN",
-        "label": "Manager",
+        "label": "Miles (Manager)",
         "welcome": (
-            "Hi, I'm the Manager. Message me (or just talk in the group) and "
-            "I'll route your request to the right agent - or @mention an agent "
-            "directly to skip me entirely. If anyone stages a file write, reply "
-            "/confirm to me specifically to approve it, even if you were talking "
-            "to another agent directly."
+            "Hi, I'm Miles, the Chief of Staff. Message me (or just talk in the "
+            "group) and I'll route your request to the right agent - or @mention "
+            "an agent directly to skip me entirely. If anyone stages a file write, "
+            "reply /confirm to me specifically to approve it, even if you were "
+            "talking to another agent directly."
         ),
     },
-    "code": {
-        "env_var": "TELEGRAM_CODE_BOT_TOKEN",
-        "label": "Patch (Coding Agent)",
-        "welcome": "Patch here - the Coding Agent. @mention me with a coding task.",
-    },
-    "research": {
-        "env_var": "TELEGRAM_RESEARCH_BOT_TOKEN",
-        "label": "Scout (Researcher Agent)",
-        "welcome": "Scout here - the Researcher Agent. @mention me with something to look up.",
-    },
-    "write": {
-        "env_var": "TELEGRAM_WRITE_BOT_TOKEN",
-        "label": "Quill (Writer Agent)",
-        "welcome": "Quill here - the Writer Agent. @mention me with something to draft.",
-    },
-    "task": {
-        "env_var": "TELEGRAM_TASK_BOT_TOKEN",
-        "label": "Sage (Personal Assistant Agent)",
-        "welcome": "Sage here - the Personal Assistant Agent. @mention me to remember something.",
-    },
-    "tasks": {
-        "env_var": "TELEGRAM_TASKS_BOT_TOKEN",
-        "label": "Roster (Tasks Agent)",
-        "welcome": "Roster here - the Tasks Agent. @mention me to manage your real Todoist tasks.",
-    },
-    "weather": {
-        "env_var": "TELEGRAM_WEATHER_BOT_TOKEN",
-        "label": "Gale (Weather Agent)",
-        "welcome": "Gale here - the Weather Agent. @mention me for the forecast.",
-    },
+    "code": {"env_var": "TELEGRAM_CODE_BOT_TOKEN", "tagline": "@mention me with a coding task."},
+    "research": {"env_var": "TELEGRAM_RESEARCH_BOT_TOKEN", "tagline": "@mention me with something to look up."},
+    "write": {"env_var": "TELEGRAM_WRITE_BOT_TOKEN", "tagline": "@mention me with something to draft."},
+    "task": {"env_var": "TELEGRAM_TASK_BOT_TOKEN", "tagline": "@mention me to remember something."},
+    "tasks": {"env_var": "TELEGRAM_TASKS_BOT_TOKEN", "tagline": "@mention me to manage your real Todoist tasks."},
+    "weather": {"env_var": "TELEGRAM_WEATHER_BOT_TOKEN", "tagline": "@mention me for the forecast."},
 }
+
+# Fill in each specialist's label + welcome from main.SPECIALISTS (the single
+# source of truth for persona names). A label looks like "Scout (Researcher
+# Agent)"; the part in parentheses is the human-readable role, which we reuse to
+# build a greeting like "Scout here - the Researcher Agent. <tagline>".
+for _key, _info in AGENT_INFO.items():
+    if _key == "manager":
+        continue
+
+    _profile = main.SPECIALISTS[_key]
+    _info["label"] = _profile["label"]
+    _role_label = _profile["label"].split("(", 1)[1].rstrip(")") if "(" in _profile["label"] else _profile["label"]
+    _info["welcome"] = f"{_profile['name']} here - the {_role_label}. {_info['tagline']}"
 
 applications = {}
 bots = {}

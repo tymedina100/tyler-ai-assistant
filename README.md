@@ -21,8 +21,12 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
 - `/search <query>` command to search the web and get a summarized answer
 - `/remember <fact>` command to explicitly save something to long-term memory
 - `/recall <query>` command to see what long-term memory has stored about a topic
-- Six specialist agents, each with its own role and curated tool access, including
-  real external connectors (Todoist, OpenWeatherMap) — see "Specialist agents" below
+- Six specialist agents, each a named character with its own personality, role, and
+  curated tool access, including real external connectors (Todoist, OpenWeatherMap) —
+  see "Specialist agents" and "Meet the team" below
+- Cost-aware model tiering: a cheaper/faster model handles routing and simple lookups
+  while the premium model does the reasoning-heavy work, plus a capped history window
+  and a memory-relevance cutoff to keep token cost down — see "Cost: two model tiers"
 - The Manager can delegate to multiple agents in sequence for one request, passing
   one agent's findings into the next — see "Manager agent" below
 - `/quit` command to exit
@@ -101,12 +105,16 @@ database in the `memory_db/` folder. It survives across separate runs of the pro
   `OPENAI_API_KEY`) and stored.
 - Before answering a plain chat message, the assistant automatically searches
   long-term memory for related past memories and includes them as context — so it can
-  recall facts from previous sessions without you asking explicitly.
+  recall facts from previous sessions without you asking explicitly. Only memories that
+  are actually similar are injected: matches farther than `MEMORY_DISTANCE_THRESHOLD`
+  (in `main.py`) are dropped, so a sparse store no longer pastes unrelated facts into
+  every prompt (Chroma always returns *some* closest match, relevant or not). Tune the
+  threshold against the real distances you see via `/recall`.
 - `/recall <query>` lets you inspect this directly: it shows the raw memories Chroma
   thinks are most similar to your query, along with a "distance" score (lower = more
-  similar). There's no relevance cutoff, so even an unrelated memory can show up if
-  the store doesn't have anything better — `/recall` exists so you can see that
-  happening instead of it being a black box.
+  similar). `/recall` is deliberately **unfiltered** — it ignores the injection cutoff
+  above and shows the raw closest matches, so you can see exactly what the store holds
+  (including weak matches) instead of it being a black box.
 - `memory_db/` is gitignored (it's local generated data, like `.venv/`).
 
 ## How automation works
@@ -163,16 +171,17 @@ so your original wording is never lost or paraphrased in the permanent record.
 
 Beyond the general assistant, six specialist commands each use the same tool-calling
 machinery as plain chat, but with a different system prompt and a **curated subset**
-of tools — not every specialist can do everything:
+of tools — not every specialist can do everything. Each one is also a **named
+character with its own personality** (see "Meet the team" below):
 
 | Command | Specialist | Tools it has |
 |---|---|---|
-| `/code <task>` | Coding Agent | read file, write file, search the web, recall memory |
-| `/research <topic>` | Researcher Agent | search the web, recall memory, remember a fact |
-| `/write <prompt>` | Writer Agent | read file, write file, recall memory |
-| `/task <request>` | Personal Assistant Agent | remember a fact, recall memory, write file, read file |
-| (Manager-only — no direct slash command) | Tasks Agent | create/list real Todoist tasks |
-| (Manager-only — no direct slash command) | Weather Agent | current weather lookup |
+| `/code <task>` | **Patch** (Coding Agent) | read file, write file, search the web, recall memory |
+| `/research <topic>` | **Scout** (Researcher Agent) | search the web, recall memory, remember a fact |
+| `/write <prompt>` | **Quill** (Writer Agent) | read file, write file, recall memory |
+| `/task <request>` | **Sage** (Personal Assistant Agent) | remember a fact, recall memory, write file, read file |
+| (Manager-only — no direct slash command) | **Roster** (Tasks Agent) | create/list real Todoist tasks |
+| (Manager-only — no direct slash command) | **Gale** (Weather Agent) | current weather lookup |
 
 This is deliberate: for example, the Researcher Agent *cannot* call `write_file` even
 if asked to — it genuinely doesn't have access to that tool, so it'll tell you it can't
@@ -202,6 +211,58 @@ a fact with several searches before answering — can exhaust that budget and fa
 to a generic "I tried too many tool calls" message instead of a real answer. This is
 flaky (re-asking the same thing usually succeeds) and is the existing Week 8 safety
 net working as designed (a graceful message, not a crash), not a bug introduced here.
+
+## Meet the team
+
+Each agent has a real name and personality, defined once in `main.py` (as a `persona`
+layered on top of its functional `role`) and used everywhere — the CLI, the single
+Telegram bot, and the multi-bot group all show the same characters:
+
+- **Miles** — the Manager / Chief of Staff. Reads your request and routes it; relays
+  each specialist's answer while keeping their voice intact.
+- **Patch** — Coding Agent. Blunt, pragmatic senior engineer.
+- **Scout** — Researcher Agent. Curious fact-hound who cites sources.
+- **Quill** — Writer Agent. Warm wordsmith who cares about tone.
+- **Sage** — Personal Assistant Agent. Calm and organized; remembers your preferences.
+- **Roster** — Tasks Agent. Crisp operator for your real Todoist list.
+- **Gale** — Weather Agent. Cheery weather nerd.
+- **Robin** — the general assistant (the all-rounder for anything that doesn't fit a
+  specialist).
+
+Personalities are just prompt text, so they're easy to retune: edit the `persona`
+field on each `SPECIALISTS` entry (or `MANAGER_INSTRUCTIONS` / `ASSISTANT_INSTRUCTIONS`
+for Miles / Robin) in `main.py`. The character names live in `main.py` only; the
+Telegram group (`group_bot.py`) derives its labels and welcome messages from there, so
+a name never drifts between interfaces.
+
+## Cost: two model tiers
+
+Not every request needs the most powerful (most expensive) model, so agents run on one
+of two tiers instead of one model for everything:
+
+- **`PREMIUM_MODEL`** — used where real reasoning matters: **Patch** (coding),
+  **Scout** (research), **Quill** (writing), and **Robin** (the catch-all general
+  assistant).
+- **`FAST_MODEL`** — a cheaper, faster model for work that's mostly routing or a thin
+  wrapper over an API result: **Miles** (the Manager's delegation decision is a
+  classification task), **Gale** (weather), **Roster** (Todoist), and **Sage**
+  (personal-assistant memory ops).
+
+Both are constants at the top of `main.py`, and every call defaults to `PREMIUM_MODEL`,
+so nothing silently downgrades — a call is only cheap where the code deliberately passes
+`FAST_MODEL`. To retune, change which tier an agent uses via the `"model"` key on its
+`SPECIALISTS` entry (or the `model=` argument in `ask_manager` / `ask_ai`). **Confirm
+the exact cheaper model id available on your OpenAI account** before deploying — it's a
+single constant (`FAST_MODEL`) to update.
+
+Two related token-cost guards also live in `main.py`:
+- **History window (`MAX_HISTORY_MESSAGES`).** Plain chat resends recent conversation
+  to the model each turn; this caps how many past messages are sent so cost doesn't grow
+  unbounded over a long session. `/history` still shows the full record — only the
+  model input is windowed, since long-term memory recall already carries older context.
+- **Memory relevance cutoff (`MEMORY_DISTANCE_THRESHOLD`).** See "How long-term memory
+  works" below — recalled memories that aren't actually similar are no longer injected
+  into prompts.
 
 ## Reliability features
 
