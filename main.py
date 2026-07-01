@@ -1271,7 +1271,11 @@ SPECIALISTS = {
         "name": "Patch",
         "label": "Patch (Coding Agent)",
         "model": PREMIUM_MODEL,
-        "max_iterations": 8,
+        # Scaffolding a whole new agent means reading a few files and then making many
+        # small, precise code_edit_file changes (delegation tool, manager bullet,
+        # execute_tool branch, SPECIALISTS entry, group_bot wiring, README...), so give
+        # the coding agent a generous tool-call budget - 8 runs out mid-mission.
+        "max_iterations": 25,
         "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories", "run_python",
                        "github_list_files", "github_read_file", "github_save_file", "github_delete_file",
                        "code_list_files", "code_read_file", "code_propose_change", "code_edit_file"],
