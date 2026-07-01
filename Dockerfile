@@ -2,6 +2,12 @@
 # container has no terminal for main.py's input() prompts to read from.
 FROM python:3.10-slim
 
+# Python buffers stdout by default when it's not attached to a real terminal
+# (true of every container) - without this, `docker logs` shows nothing until
+# the buffer fills or the process exits, making the running bot look silent
+# even when it's working fine.
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 # Install dependencies first so Docker can cache this layer across rebuilds
