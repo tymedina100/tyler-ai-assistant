@@ -173,6 +173,31 @@ class CompanyModeTests(unittest.TestCase):
         state = company_mode.load_state(self.state_path)
         self.assertEqual(len(state["tasks"]), len(company_mode.DEFAULT_ASSIGN_TASKS))
 
+    def test_build_task_prompt_injects_deliverable_content(self):
+        project = {"id": "proj_1", "goal": "Ship a guide"}
+        task = {"owner": "write", "title": "Refine the copy"}
+
+        prompt = company_mode.build_task_prompt(
+            project, task,
+            prior_work="- code (Build): done",
+            deliverable_name="guide.md",
+            deliverable_content="ACTUAL FILE BODY that the writer must extend.",
+        )
+
+        # The real file content and name are in the prompt so the agent extends it.
+        self.assertIn("ACTUAL FILE BODY", prompt)
+        self.assertIn("guide.md", prompt)
+        self.assertIn("same file", prompt.lower())
+        self.assertIn("code (Build)", prompt)  # prior-work summary still included
+
+    def test_build_task_prompt_truncates_long_content(self):
+        project = {"id": "p", "goal": "g"}
+        task = {"owner": "write", "title": "t"}
+        big = "x" * (company_mode.DELIVERABLE_INJECT_CHARS + 500)
+        prompt = company_mode.build_task_prompt(project, task, deliverable_name="f.md", deliverable_content=big)
+        self.assertIn("[truncated]", prompt)
+        self.assertEqual(prompt.count("x"), company_mode.DELIVERABLE_INJECT_CHARS)
+
     def test_assigned_project_starts_proposed(self):
         self._assign()
         state = company_mode.load_state(self.state_path)
