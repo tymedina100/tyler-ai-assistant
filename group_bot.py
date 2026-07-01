@@ -90,7 +90,7 @@ main.CONFIRMATION_MODE = "requires_confirmation"
 # they just can't be @mentioned directly until you create their bot and add its key
 # here. Full set once every bot exists: ["manager", "code", "research", "news",
 # "write", "task", "tasks", "weather", "calendar", "gmail"].
-BOT_KEYS = ["manager", "weather", "code", "research"]
+BOT_KEYS = ["manager", "weather", "code", "research", "write", "tasks", "task", "news"]
 
 SPECIALIST_KEYS = [key for key in BOT_KEYS if key != "manager"]
 
