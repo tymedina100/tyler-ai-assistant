@@ -21,9 +21,9 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
 - `/search <query>` command to search the web and get a summarized answer
 - `/remember <fact>` command to explicitly save something to long-term memory
 - `/recall <query>` command to see what long-term memory has stored about a topic
-- Six specialist agents, each a named character with its own personality, role, and
-  curated tool access, including real external connectors (Todoist, OpenWeatherMap) —
-  see "Specialist agents" and "Meet the team" below
+- Ten specialist agents, each a named character with its own personality, role, and
+  curated tool access, including real external connectors (Todoist, OpenWeatherMap,
+  CoinGecko, Google, Gmail) — see "Specialist agents" and "Meet the team" below
 - Cost-aware model tiering: a cheaper/faster model handles routing and simple lookups
   while the premium model does the reasoning-heavy work, plus a capped history window
   and a memory-relevance cutoff to keep token cost down — see "Cost: two model tiers"
