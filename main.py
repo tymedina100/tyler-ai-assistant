@@ -1310,6 +1310,12 @@ def execute_tool(name, arguments):
                 on_delegation("weather", arguments["location"], answer)
             return answer
 
+        if name == "delegate_to_crypto_agent":
+            answer = ask_specialist("crypto", arguments["asset"], record_history=False)
+            if on_delegation:
+                on_delegation("crypto", arguments["asset"], answer)
+            return answer
+
         if name == "delegate_to_calendar_agent":
             answer = ask_specialist("calendar", arguments["request"], record_history=False)
             if on_delegation:
