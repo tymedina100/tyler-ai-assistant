@@ -61,7 +61,7 @@ main.WRITE_FILE_MODE = "requires_confirmation"
 # mechanism (see the project plan), then expand as each stage is verified.
 # Full set once all stages pass: ["manager", "code", "research", "write",
 # "task", "tasks", "weather"].
-BOT_KEYS = ["manager", "weather", "code"]
+BOT_KEYS = ["manager", "weather", "code", "research"]
 
 SPECIALIST_KEYS = [key for key in BOT_KEYS if key != "manager"]
 
