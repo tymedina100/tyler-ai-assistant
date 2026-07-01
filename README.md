@@ -224,7 +224,7 @@ this distinction out explicitly, since without it the Manager would have no reli
 way to choose between them (e.g. "remind me to call mom" routes to the Personal
 Assistant; "add buy groceries to my Todoist" routes to the Tasks Agent).
 
-All specialists share the same `conversation_history` and long-term memory as plain
+All agents share the same `conversation_history` and long-term memory as plain
 chat and each other — there's one memory store for the whole assistant, not one per
 agent. A fact saved via `/task` (Personal Assistant) can be recalled later in plain
 chat or by any other specialist.
