@@ -5,5 +5,6 @@ memory_db/
 assistant.log
 sandbox/
 reminders.json
+company_state.json
 token.json
 credentials.json

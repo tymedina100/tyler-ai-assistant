@@ -1132,12 +1132,16 @@ def confirm_pending_action(pending):
 
 def describe_pending_action(pending):
     """Short human description of a staged action, for confirm/cancel messages."""
+    context = pending.get("company_context", "")
     if pending["type"] == "write_file":
-        return f"write to files/{pending['filename']}"
+        description = f"write to files/{pending['filename']}"
+        return f"{description} ({context})" if context else description
     if pending["type"] == "send_email":
-        return f"email to {pending['to']}"
+        description = f"email to {pending['to']}"
+        return f"{description} ({context})" if context else description
     if pending["type"] == "github_delete":
-        return f"deletion of {pending['path']} from GitHub"
+        description = f"deletion of {pending['path']} from GitHub"
+        return f"{description} ({context})" if context else description
     return "the staged action"
 
 

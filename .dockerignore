@@ -4,6 +4,7 @@ __pycache__/
 token.json
 credentials.json
 reminders.json
+company_state.json
 memory_db/
 assistant.log
 sandbox/
