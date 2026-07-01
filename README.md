@@ -260,9 +260,10 @@ Telegram bot, and the multi-bot group all show the same characters:
 - **Robin** — the general assistant (the all-rounder for anything that doesn't fit a
   specialist).
 
-Cadence and Piper are the newest hires: they work today via Miles's delegation (their
-answers post under Miles in the group), and get their own Telegram bots once you create
-them and add `"calendar"` / `"gmail"` to `BOT_KEYS`.
+Cadence, Piper, and Ledger are the newest hires: they work today via Miles's
+delegation (their answers post under Miles in the group until they have their own
+bots), and get their own Telegram bots once you create them and add `"calendar"` /
+`"gmail"` / `"crypto"` to `BOT_KEYS`.
 
 Personalities are just prompt text, so they're easy to retune: edit the `persona`
 field on each `SPECIALISTS` entry (or `MANAGER_INSTRUCTIONS` / `ASSISTANT_INSTRUCTIONS`
