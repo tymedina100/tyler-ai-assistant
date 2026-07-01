@@ -752,6 +752,64 @@ def get_weather(location):
         return f"Sorry, something went wrong while getting the weather for {location}."
 
 
+def get_crypto_price(asset, vs_currency="usd"):
+    asset = asset.strip()
+    currency = (vs_currency or "usd").strip().lower()
+
+    if not asset:
+        return "Please provide a cryptocurrency to look up."
+
+    try:
+        search_response = call_with_retries(
+            lambda: requests.get(
+                "https://api.coingecko.com/api/v3/search",
+                params={"query": asset},
+                timeout=10
+            ),
+            label="CoinGecko search call"
+        )
+        search_data = search_response.json()
+
+        if search_response.status_code != 200:
+            return f"Could not look up {asset}: CoinGecko returned {search_response.status_code}."
+
+        matches = search_data.get("coins", [])
+        if not matches:
+            return f"Could not find a cryptocurrency matching '{asset}'."
+
+        coin = matches[0]
+        coin_id = coin["id"]
+        name = coin.get("name", asset)
+        symbol = coin.get("symbol", "").upper()
+
+        price_response = call_with_retries(
+            lambda: requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": coin_id, "vs_currencies": currency, "include_24hr_change": "true"},
+                timeout=10
+            ),
+            label="CoinGecko price call"
+        )
+        price_data = price_response.json()
+
+        if price_response.status_code != 200:
+            return f"Could not get the crypto price for {asset}: CoinGecko returned {price_response.status_code}."
+
+        quote = price_data.get(coin_id)
+        if not quote or currency not in quote:
+            return f"Could not get a {currency.upper()} price for {name}."
+
+        price = quote[currency]
+        change = quote.get(f"{currency}_24h_change")
+        change_text = f", 24h change {change:.2f}%" if change is not None else ""
+        symbol_text = f" ({symbol})" if symbol else ""
+        return f"{name}{symbol_text}: {price:,.6g} {currency.upper()}{change_text}"
+
+    except Exception as e:
+        logger.error(f"CoinGecko call failed: {e}")
+        return f"Sorry, something went wrong while getting the crypto price for {asset}."
+
+
 # Reminders (Feature: proactive). Stored as a flat JSON list so they survive a
 # restart; the actual firing is done by group_bot.py via the on_reminder_set hook.
 # Set by group_bot.py to a function (reminder_dict) -> None that schedules the
