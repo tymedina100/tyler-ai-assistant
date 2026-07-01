@@ -253,6 +253,7 @@ Telegram bot, and the multi-bot group all show the same characters:
 - **Sage** — Personal Assistant Agent. Calm and organized; remembers your preferences.
 - **Roster** — Tasks Agent. Crisp operator for your real Todoist list.
 - **Gale** — Weather Agent. Cheery weather nerd.
+- **Ledger** — Crypto Agent. Numbers-first market watcher without the hype.
 - **Cadence** — Calendar & Scheduler Agent. Unflappable and precise; runs your Google
   Calendar and your reminders.
 - **Piper** — Gmail Agent. Brisk and discreet; triages, drafts, and sends email.
