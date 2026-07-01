@@ -136,6 +136,28 @@ def is_real_human_message(update):
     return True
 
 
+# Telegram hard-caps a single message at 4096 characters and rejects an empty one.
+# A specialist's answer (especially Patch summarizing a multi-file change) can easily
+# blow past that, so every place we post an agent's answer splits it into chunks -
+# otherwise the send throws and the whole reply is lost silently.
+TELEGRAM_LIMIT = 4000
+
+
+def _chunks(text):
+    text = text if text and text.strip() else "(no response)"
+    return [text[i:i + TELEGRAM_LIMIT] for i in range(0, len(text), TELEGRAM_LIMIT)]
+
+
+async def reply_chunks(message, text):
+    for chunk in _chunks(text):
+        await message.reply_text(chunk)
+
+
+async def send_chunks(bot, chat_id, text):
+    for chunk in _chunks(text):
+        await bot.send_message(chat_id, chunk)
+
+
 def build_specialist_handler(key):
     async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_real_human_message(update):
@@ -167,10 +189,9 @@ def build_specialist_handler(key):
             await update.message.reply_text("Sorry, something went wrong processing that.")
             return
 
-        # The Responses API can occasionally return an empty output_text (e.g.
-        # if a turn ends with no text after its last tool call) - Telegram's
-        # API rejects an empty message outright, so guard against sending one.
-        await update.message.reply_text(answer if answer.strip() else "(no response)")
+        # Split into <=4096-char chunks (and guard against an empty answer, which
+        # Telegram also rejects) - see reply_chunks / TELEGRAM_LIMIT above.
+        await reply_chunks(update.message, answer)
 
     return handle
 
@@ -215,9 +236,9 @@ async def handle_manager_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Sorry, something went wrong processing that.")
         return
 
-    # See the matching comment in build_specialist_handler - guard against
-    # Telegram rejecting an empty message.
-    await update.message.reply_text(answer if answer.strip() else "(no response)")
+    # See the matching comment in build_specialist_handler - chunk long answers so
+    # a big relay (e.g. Patch's multi-file change) isn't silently dropped.
+    await reply_chunks(update.message, answer)
 
 
 def on_delegation(specialist_key, request_text, answer_text):
@@ -232,8 +253,8 @@ def on_delegation(specialist_key, request_text, answer_text):
     async def post():
         try:
             if specialist_key != "general":
-                await bots["manager"].send_message(GROUP_CHAT_ID, f"Delegating to the {label}: {request_text}")
-            await target_bot.send_message(GROUP_CHAT_ID, answer_text)
+                await send_chunks(bots["manager"], GROUP_CHAT_ID, f"Delegating to the {label}: {request_text}")
+            await send_chunks(target_bot, GROUP_CHAT_ID, answer_text)
         except Exception as e:
             main.logger.error(f"Failed to post delegation visibility message: {e}")
 
@@ -268,7 +289,7 @@ async def post_to_group(text, bot_key="manager"):
     if that agent doesn't have its own bot yet (e.g. Cadence before you create it)."""
     bot = bots.get(bot_key, bots["manager"])
     try:
-        await bot.send_message(GROUP_CHAT_ID, text if text.strip() else "(no response)")
+        await send_chunks(bot, GROUP_CHAT_ID, text)
     except Exception as e:
         main.logger.error(f"Failed to post scheduled message: {e}")
 
