@@ -104,52 +104,58 @@ def save_file(path, content):
     return f"Couldn't save {path}: {err}"
 
 
+def _list(repo, ref, token, path):
+    """List contents of `path` in `repo` at `ref`. Returns a formatted string."""
+    resp = requests.get(_content_url(repo, path), headers=_headers(token),
+                        params={"ref": ref}, timeout=10)
+    if resp.status_code == 404:
+        return f"Path not found in {repo}: {path or '(root)'}"
+    if resp.status_code != 200:
+        return f"Couldn't list {path or '(root)'}: {resp.status_code} {resp.text[:200]}"
+
+    items = resp.json()
+    if isinstance(items, dict):  # path pointed at a file, not a directory
+        return f"{items['path']} (file, {items.get('size', '?')} bytes)"
+    if not items:
+        return "(empty)"
+
+    return "\n".join(f"- {it['name']}{'/' if it['type'] == 'dir' else ''}" for it in items)
+
+
+def _read(repo, ref, token, path):
+    """Read `path` from `repo` at `ref`. Returns the text (truncated) or a message."""
+    resp = requests.get(_content_url(repo, path), headers=_headers(token),
+                        params={"ref": ref}, timeout=10)
+    if resp.status_code == 404:
+        return f"File not found in {repo}: {path}"
+    if resp.status_code != 200:
+        return f"Couldn't read {path}: {resp.status_code} {resp.text[:200]}"
+
+    data = resp.json()
+    if data.get("type") != "file" or "content" not in data:
+        return f"{path} isn't a readable file (maybe a directory - list it first)."
+
+    return base64.b64decode(data["content"]).decode("utf-8", errors="replace")[:8000]
+
+
 def list_files(path=""):
-    """List the repo contents at `path` (or the repo root if empty)."""
+    """List the workspace repo's contents at `path` (or root)."""
     token, repo, branch = _config()
     if not (token and repo):
         return NOT_CONFIGURED
-
     try:
-        resp = requests.get(_content_url(repo, path), headers=_headers(token),
-                            params={"ref": branch}, timeout=10)
-        if resp.status_code == 404:
-            return f"Path not found in {repo}: {path or '(root)'}"
-        if resp.status_code != 200:
-            return f"Couldn't list {path or '(root)'}: {resp.status_code} {resp.text[:200]}"
-
-        items = resp.json()
-        if isinstance(items, dict):  # path pointed at a file, not a directory
-            return f"{items['path']} (file, {items.get('size', '?')} bytes)"
-        if not items:
-            return "(empty)"
-
-        return "\n".join(f"- {it['name']}{'/' if it['type'] == 'dir' else ''}" for it in items)
-
+        return _list(repo, branch, token, path)
     except Exception as e:
         return f"Sorry, couldn't list the repo ({e})."
 
 
 def read_file(path):
-    """Read a file's contents from the repo."""
+    """Read a file's contents from the workspace repo."""
     token, repo, branch = _config()
     if not (token and repo):
         return NOT_CONFIGURED
-
     try:
-        resp = requests.get(_content_url(repo, path), headers=_headers(token),
-                            params={"ref": branch}, timeout=10)
-        if resp.status_code == 404:
-            return f"File not found in {repo}: {path}"
-        if resp.status_code != 200:
-            return f"Couldn't read {path}: {resp.status_code} {resp.text[:200]}"
-
-        data = resp.json()
-        if data.get("type") != "file" or "content" not in data:
-            return f"{path} isn't a readable file (maybe a directory - try github_list_files)."
-
-        return base64.b64decode(data["content"]).decode("utf-8", errors="replace")[:8000]
-
+        return _read(repo, branch, token, path)
     except Exception as e:
         return f"Sorry, couldn't read {path} ({e})."
 
@@ -180,3 +186,107 @@ def delete_file(path):
 
     except Exception as e:
         return f"Sorry, couldn't delete {path} ({e})."
+
+
+# --------------------------------------------------------------------------- #
+# Code-repo workflow: let Patch propose changes to the assistant's OWN codebase
+# (or any project repo) as pull requests the user reviews - never straight to the
+# base branch. Operates on GITHUB_CODE_REPO (falls back to GITHUB_REPO) against
+# GITHUB_CODE_BASE (default "main"). Needs a token with, on that repo, Contents +
+# Pull requests: Read and write.
+# --------------------------------------------------------------------------- #
+
+def _code_config():
+    token, repo, _ = _config()
+    code_repo = os.environ.get("GITHUB_CODE_REPO", "") or repo
+    base = os.environ.get("GITHUB_CODE_BASE", "main")
+    return token, code_repo, base
+
+
+def code_list_files(path=""):
+    """List files/folders in the code repo."""
+    token, repo, base = _code_config()
+    if not (token and repo):
+        return NOT_CONFIGURED
+    try:
+        return _list(repo, base, token, path)
+    except Exception as e:
+        return f"Sorry, couldn't list the code repo ({e})."
+
+
+def code_read_file(path):
+    """Read a file from the code repo."""
+    token, repo, base = _code_config()
+    if not (token and repo):
+        return NOT_CONFIGURED
+    try:
+        return _read(repo, base, token, path)
+    except Exception as e:
+        return f"Sorry, couldn't read {path} from the code repo ({e})."
+
+
+def _branch_sha(repo, branch, token):
+    resp = requests.get(f"{API_ROOT}/repos/{repo}/git/ref/heads/{branch}",
+                        headers=_headers(token), timeout=10)
+    return resp.json()["object"]["sha"] if resp.status_code == 200 else None
+
+
+def _ensure_branch(repo, branch, base, token):
+    """Create `branch` off `base` if it doesn't exist. Returns None on success or an
+    error string."""
+    if _branch_sha(repo, branch, token):
+        return None  # already exists - reuse it (multi-file PRs land on one branch)
+
+    base_sha = _branch_sha(repo, base, token)
+    if not base_sha:
+        return f"Base branch '{base}' not found in {repo}."
+
+    resp = requests.post(f"{API_ROOT}/repos/{repo}/git/refs", headers=_headers(token),
+                        json={"ref": f"refs/heads/{branch}", "sha": base_sha}, timeout=10)
+    if resp.status_code not in (200, 201):
+        return f"Couldn't create branch {branch}: {resp.status_code} {resp.text[:200]}"
+    return None
+
+
+def _existing_pr_url(repo, branch, token):
+    owner = repo.split("/")[0]
+    resp = requests.get(f"{API_ROOT}/repos/{repo}/pulls", headers=_headers(token),
+                        params={"head": f"{owner}:{branch}", "state": "open"}, timeout=10)
+    if resp.status_code == 200 and resp.json():
+        return resp.json()[0]["html_url"]
+    return None
+
+
+def code_propose_change(branch, path, content, title, body=""):
+    """Commit `content` to `path` on `branch` in the code repo and ensure an open PR
+    exists for that branch. Call once per file (reuse the same branch name for a
+    multi-file change); the PR is created on the first call and reused after. Nothing
+    ships until the user merges the PR."""
+    token, repo, base = _code_config()
+    if not (token and repo):
+        return NOT_CONFIGURED
+
+    try:
+        err = _ensure_branch(repo, branch, base, token)
+        if err:
+            return err
+
+        html_url, commit_err = _commit(path, content, token, repo, branch)
+        if commit_err:
+            return f"Couldn't commit {path} to {branch}: {commit_err}"
+
+        pr_url = _existing_pr_url(repo, branch, token)
+        if not pr_url:
+            pr_resp = requests.post(
+                f"{API_ROOT}/repos/{repo}/pulls", headers=_headers(token),
+                json={"title": title, "head": branch, "base": base, "body": body}, timeout=10)
+            if pr_resp.status_code in (200, 201):
+                pr_url = pr_resp.json()["html_url"]
+            else:
+                return (f"Committed {path} to '{branch}', but couldn't open the PR: "
+                        f"{pr_resp.status_code} {pr_resp.text[:200]}")
+
+        return f"Committed {path} to branch '{branch}'. Pull request (review + merge to ship): {pr_url}"
+
+    except Exception as e:
+        return f"Sorry, the change proposal failed ({e})."

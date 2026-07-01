@@ -80,6 +80,10 @@ EVENT_ALERT_MINUTES=15
 GITHUB_TOKEN=your-github-personal-access-token
 GITHUB_REPO=your-username/your-files-repo
 GITHUB_BRANCH=main
+
+# Optional — let Patch propose PRs to a code repo (see "Self-extending: PRs"):
+GITHUB_CODE_REPO=your-username/your-project-repo
+GITHUB_CODE_BASE=main
 ```
 
 - Get an OpenAI key from https://platform.openai.com
@@ -351,6 +355,30 @@ Agent gets first-class tools to work on the repo like a developer:
 All four use the same `GITHUB_TOKEN`/`GITHUB_REPO` config and need no extra GitHub
 scopes beyond **Contents: Read and write**. So you can ask Patch to "read `app.py` from
 the repo and fix the bug," and it'll pull it, edit it, and commit the fix back.
+
+### Self-extending: Patch proposes code changes as pull requests
+
+Point Patch at a *code* repo (e.g. this assistant's own repo) and it can improve the
+project itself — but safely, via **pull requests you review**, never straight to the
+live branch. Configure a separate code repo:
+
+- `GITHUB_CODE_REPO` — `owner/repo` of the project Patch may propose changes to (falls
+  back to `GITHUB_REPO` if unset). Keep this distinct from your file-mirror repo.
+- `GITHUB_CODE_BASE` — the branch PRs target, default `main`.
+- The token needs, **on that repo**, both **Contents: Read and write** *and* **Pull
+  requests: Read and write** (a fine-grained token can list multiple repos).
+
+Patch's tools for it:
+- `code_list_files` / `code_read_file` — study the codebase.
+- `code_propose_change(branch, path, content, title, body)` — commit the file to a
+  branch and open a PR. Call it once per file, reusing the branch name for a multi-file
+  change; the PR is created once and reused.
+
+**Nothing ships until you merge.** The PR is the review gate — Patch can only *propose*.
+After you merge, redeploy for it to take effect. This is the "self-extending assistant"
+loop: ask in Telegram ("add a Spotify agent"), Patch opens a PR, you review and merge.
+Because Patch is the Coding Agent, its internal tool-call budget is also a bit higher
+(`max_iterations: 8`) to fit a browse → read → propose flow in one turn.
 
 ## Proactive & scheduling (Telegram group)
 

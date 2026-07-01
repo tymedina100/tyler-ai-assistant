@@ -158,6 +158,15 @@ TOOLS = [
     {"type": "function", "name": "github_delete_file", "strict": False,
      "description": "Delete a file from the connected GitHub repo. Sensitive action - the user is asked to confirm first (still recoverable from git history).",
      "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"type": "function", "name": "code_list_files", "strict": False,
+     "description": "List files/folders in the assistant's OWN code repository (the project you can propose changes to). Optional path; omit for the repo root.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": []}},
+    {"type": "function", "name": "code_read_file", "strict": False,
+     "description": "Read a file from the assistant's own code repository. Always read a file before proposing a change to it.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"type": "function", "name": "code_propose_change", "strict": False,
+     "description": "Propose a change to the assistant's own code repository: commits the file to a branch and opens a pull request for the user to review and merge. Nothing goes live until the user merges. Call once per file, reusing the same branch name for a multi-file change (the PR is created once and reused).",
+     "parameters": {"type": "object", "properties": {"branch": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["branch", "path", "content", "title"]}},
 ]
 
 DELEGATION_TOOLS = [
@@ -1127,6 +1136,20 @@ def execute_tool(name, arguments):
             logger.info(f"User approved GitHub delete of {arguments['path']}")
             return github_helpers.delete_file(arguments["path"])
 
+        if name == "code_list_files":
+            return github_helpers.code_list_files(arguments.get("path", ""))
+
+        if name == "code_read_file":
+            return github_helpers.code_read_file(arguments["path"])
+
+        if name == "code_propose_change":
+            # No /confirm gate here: the pull request IS the review step - nothing
+            # merges to the base branch (or ships) until the user approves it.
+            return github_helpers.code_propose_change(
+                arguments["branch"], arguments["path"], arguments["content"],
+                arguments["title"], arguments.get("body", "")
+            )
+
         if name == "write_file":
             if CONFIRMATION_MODE == "disabled":
                 return "File writing is disabled in this interface."
@@ -1239,8 +1262,10 @@ SPECIALISTS = {
         "name": "Patch",
         "label": "Patch (Coding Agent)",
         "model": PREMIUM_MODEL,
+        "max_iterations": 8,
         "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories", "run_python",
-                       "github_list_files", "github_read_file", "github_save_file", "github_delete_file"],
+                       "github_list_files", "github_read_file", "github_save_file", "github_delete_file",
+                       "code_list_files", "code_read_file", "code_propose_change"],
         "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
@@ -1249,12 +1274,19 @@ verify Python before handing it over - it runs in a sandbox with a short timeout
 and no access to the app's secrets or files, so test your work instead of guessing.
 Use search_the_web if you need to look up an error or current documentation.
 
-You also have full access to a connected GitHub repo: github_list_files and
-github_read_file to browse and read what's there, github_save_file to commit new or
-changed files directly to the repo, and github_delete_file to remove one (the user
-is asked to confirm deletes). Read existing repo files before changing them, and
-share the GitHub URL you get back so the user can grab the result. Explain your
-reasoning briefly and prefer simple, correct solutions over clever ones.
+You have full access to a connected workspace GitHub repo: github_list_files and
+github_read_file to browse it, github_save_file to commit files directly, and
+github_delete_file to remove one (the user confirms deletes). Use this for standalone
+files and code output; share the GitHub URL you get back.
+
+You can also improve the assistant's OWN codebase. Use code_list_files and
+code_read_file to study the project, then code_propose_change to commit your edit to
+a branch and open a pull request the user reviews - this NEVER changes the live code
+directly, it only proposes. Always read a file before you change it, keep each pull
+request small and focused, use a clear branch name (e.g. "add-spotify-agent"), and
+reuse the same branch across multiple files in one change. Remind the user a change
+only ships after they merge the PR and redeploy. Explain your reasoning briefly and
+prefer simple, correct solutions over clever ones.
 """,
         "persona": """
 You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior
@@ -1402,7 +1434,8 @@ def ask_specialist(specialist_key, prompt, record_history=True):
     input_items = [{"role": "user", "content": augmented_prompt}]
 
     answer = run_with_tools(
-        build_persona_instructions(profile), input_items, specialist_tools, model=profile["model"]
+        build_persona_instructions(profile), input_items, specialist_tools,
+        max_iterations=profile.get("max_iterations", MAX_TOOL_ITERATIONS), model=profile["model"]
     )
 
     if record_history:
