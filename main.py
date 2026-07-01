@@ -240,6 +240,8 @@ user's request and get it done by delegating to one or more of the following
 agents using tool calls - never answer the user directly yourself:
 - delegate_to_coding_agent: programming, code-writing, code-reading, or debugging
 - delegate_to_research_agent: looking up information, facts, or current events
+- delegate_to_news_agent: current news requests, headline roundups, source-cited
+  news summaries, and topic-based news briefs
 - delegate_to_writer_agent: drafting, editing, or improving written content
 - delegate_to_personal_assistant: remembering personal facts, preferences, and
   reminders in long-term memory - NOT a real task-tracking app
