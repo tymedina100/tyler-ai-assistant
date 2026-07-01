@@ -46,13 +46,48 @@ logger.addHandler(log_handler)
 
 load_dotenv()
 
-client = OpenAI()
-tavily_client = TavilyClient()
+_openai_client = None
+_tavily_client = None
 
-TODOIST_API_TOKEN = os.environ["TODOIST_API_TOKEN"]
-TODOIST_HEADERS = {"Authorization": f"Bearer {TODOIST_API_TOKEN}"}
 
-OPENWEATHER_API_KEY = os.environ["OPENWEATHER_API_KEY"]
+def get_openai_client():
+    """Create the OpenAI client only when a feature actually needs it.
+
+    This keeps importing the app from crashing in minimal setup or tests where
+    optional integrations are intentionally absent.
+    """
+    global _openai_client
+    if _openai_client is None:
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise RuntimeError("OPENAI_API_KEY is not set.")
+        _openai_client = OpenAI()
+    return _openai_client
+
+
+def get_tavily_client():
+    global _tavily_client
+    if _tavily_client is None:
+        if not os.environ.get("TAVILY_API_KEY"):
+            raise RuntimeError("TAVILY_API_KEY is not set.")
+        _tavily_client = TavilyClient()
+    return _tavily_client
+
+
+def get_todoist_headers(extra_headers=None):
+    token = os.environ.get("TODOIST_API_TOKEN")
+    if not token:
+        raise RuntimeError("TODOIST_API_TOKEN is not set.")
+    headers = {"Authorization": f"Bearer {token}"}
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+
+
+def get_openweather_api_key():
+    key = os.environ.get("OPENWEATHER_API_KEY")
+    if not key:
+        raise RuntimeError("OPENWEATHER_API_KEY is not set.")
+    return key
 
 # Proactive/scheduling + briefing config (consumed by group_bot.py's scheduler).
 # All optional with sensible defaults so the CLI/single bot don't need them set.
@@ -353,8 +388,9 @@ def _now_local():
 
 def get_ai_response(input_messages, model=PREMIUM_MODEL, instructions=ASSISTANT_INSTRUCTIONS):
     try:
+        openai_client = get_openai_client()
         response = call_with_retries(
-            lambda: client.responses.create(
+            lambda: openai_client.responses.create(
                 model=model,
                 instructions=instructions,
                 input=input_messages
@@ -370,8 +406,9 @@ def get_ai_response(input_messages, model=PREMIUM_MODEL, instructions=ASSISTANT_
 
 def get_embedding(text):
     try:
+        openai_client = get_openai_client()
         response = call_with_retries(
-            lambda: client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=text),
+            lambda: openai_client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=text),
             label="OpenAI embedding call"
         )
         return response.data[0].embedding
@@ -411,9 +448,10 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
     assistant_response = "Sorry, I tried too many tool calls without finishing. Please try rephrasing."
 
     try:
+        openai_client = get_openai_client()
         for _ in range(max_iterations):
             response = call_with_retries(
-                lambda: client.responses.create(
+                lambda: openai_client.responses.create(
                     model=model,
                     instructions=instructions,
                     input=input_items,
@@ -533,6 +571,20 @@ def get_safe_file_path(filename):
     return file_path
 
 
+MAX_READ_FILE_CHARS = 50_000
+TRUNCATION_NOTICE = f"\n\n[File truncated after {MAX_READ_FILE_CHARS} characters.]"
+
+
+def read_limited_text(file_path):
+    with file_path.open("r", encoding="utf-8") as f:
+        content = f.read(MAX_READ_FILE_CHARS + 1)
+
+    if len(content) <= MAX_READ_FILE_CHARS:
+        return content
+
+    return content[:MAX_READ_FILE_CHARS] + TRUNCATION_NOTICE
+
+
 def read_file(filename):
     file_path = get_safe_file_path(filename)
 
@@ -548,7 +600,7 @@ def read_file(filename):
         print(f"That is not a file: {filename}")
         return
 
-    content = file_path.read_text(encoding="utf-8")
+    content = read_limited_text(file_path)
 
     print(f"\nContents of {filename}:")
     print(content)
@@ -628,7 +680,7 @@ def run_python(code):
         script_file.write(code)
         script_path = script_file.name
 
-    logger.info(f"run_python executing {len(code)} chars: {code[:200]!r}")
+    logger.info(f"run_python executing {len(code)} chars")
 
     try:
         result = subprocess.run(
@@ -679,7 +731,7 @@ def ask_file(filename, question):
         print(f"That is not a file: {filename}")
         return
 
-    content = file_path.read_text(encoding="utf-8")
+    content = read_limited_text(file_path)
 
     prompt = f"""
 Use the file content below to answer the user's question.
@@ -718,13 +770,15 @@ User question:
 
 def create_task(content):
     try:
+        request_id = str(uuid.uuid4())
+        headers = get_todoist_headers({"X-Request-Id": request_id})
         # Todoist's REST API v2 (/rest/v2/...) is deprecated as of this writing -
         # confirmed directly against the real API, not assumed from documentation,
         # since it returned a 410 Gone pointing to the newer /api/v1/ endpoints.
         response = call_with_retries(
             lambda: requests.post(
                 "https://api.todoist.com/api/v1/tasks",
-                headers=TODOIST_HEADERS,
+                headers=headers,
                 json={"content": content},
                 timeout=10
             ),
@@ -738,15 +792,18 @@ def create_task(content):
 
     except Exception as e:
         logger.error(f"Todoist create_task call failed: {e}")
+        if isinstance(e, RuntimeError):
+            return "Todoist isn't configured yet - set TODOIST_API_TOKEN to create tasks."
         return "Sorry, something went wrong while creating the task."
 
 
 def list_tasks():
     try:
+        headers = get_todoist_headers()
         response = call_with_retries(
             lambda: requests.get(
                 "https://api.todoist.com/api/v1/tasks",
-                headers=TODOIST_HEADERS,
+                headers=headers,
                 timeout=10
             ),
             label="Todoist list tasks call"
@@ -766,15 +823,18 @@ def list_tasks():
 
     except Exception as e:
         logger.error(f"Todoist list_tasks call failed: {e}")
+        if isinstance(e, RuntimeError):
+            return "Todoist isn't configured yet - set TODOIST_API_TOKEN to list tasks."
         return "Sorry, something went wrong while listing tasks."
 
 
 def get_weather(location):
     try:
+        api_key = get_openweather_api_key()
         response = call_with_retries(
             lambda: requests.get(
                 "https://api.openweathermap.org/data/2.5/weather",
-                params={"q": location, "appid": OPENWEATHER_API_KEY, "units": "imperial"},
+                params={"q": location, "appid": api_key, "units": "imperial"},
                 timeout=10
             ),
             label="OpenWeatherMap call"
@@ -791,6 +851,8 @@ def get_weather(location):
 
     except Exception as e:
         logger.error(f"OpenWeatherMap call failed: {e}")
+        if isinstance(e, RuntimeError):
+            return "OpenWeatherMap isn't configured yet - set OPENWEATHER_API_KEY to get weather."
         return f"Sorry, something went wrong while getting the weather for {location}."
 
 
@@ -894,14 +956,19 @@ Facts:
 
 def search_web(query):
     try:
+        tavily_client = get_tavily_client()
         response = call_with_retries(
             lambda: tavily_client.search(query, max_results=5),
             label="Tavily search call"
         )
         return response["results"]
 
-    except Exception:
-        print("Sorry, something went wrong while searching the web. Check your Tavily API key or internet connection.")
+    except Exception as e:
+        logger.error(f"Tavily search failed: {e}")
+        if isinstance(e, RuntimeError):
+            print("Tavily isn't configured yet - set TAVILY_API_KEY to search the web.")
+        else:
+            print("Sorry, something went wrong while searching the web. Check your Tavily API key or internet connection.")
         return None
 
 
@@ -1074,9 +1141,30 @@ def describe_pending_action(pending):
     return "the staged action"
 
 
+SENSITIVE_TOOL_ARGUMENT_KEYS = {
+    "body",
+    "code",
+    "content",
+    "new_snippet",
+    "old_snippet",
+    "subject",
+}
+
+
+def redact_tool_arguments(arguments):
+    """Return a log-safe copy of tool arguments without private payload text."""
+    redacted = {}
+    for key, value in arguments.items():
+        if key in SENSITIVE_TOOL_ARGUMENT_KEYS:
+            redacted[key] = f"[redacted {type(value).__name__}, {len(str(value))} chars]"
+        else:
+            redacted[key] = value
+    return redacted
+
+
 def execute_tool(name, arguments):
     print(f"\n[tool] {name}({arguments})")
-    logger.info(f"Tool call: {name}({arguments})")
+    logger.info(f"Tool call: {name}({redact_tool_arguments(arguments)})")
 
     try:
         if name == "read_file":
@@ -1088,7 +1176,7 @@ def execute_tool(name, arguments):
             if not file_path.exists() or not file_path.is_file():
                 return f"File not found: {arguments['filename']}"
 
-            return file_path.read_text(encoding="utf-8")
+            return read_limited_text(file_path)
 
         if name == "search_the_web":
             results = search_web(arguments["query"])
@@ -1617,8 +1705,9 @@ def select_group_responders(text):
     keys from GROUP_RESPONDER_KEYS. Falls back to ["manager"] (today's behavior) on
     any model or parse error, so a routing glitch never drops the message."""
     try:
+        openai_client = get_openai_client()
         response = call_with_retries(
-            lambda: client.responses.create(
+            lambda: openai_client.responses.create(
                 model=FAST_MODEL,
                 instructions=_GROUP_ROUTER_INSTRUCTIONS,
                 input=[{"role": "user", "content": text}],

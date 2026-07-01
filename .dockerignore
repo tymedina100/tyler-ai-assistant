@@ -1,6 +1,10 @@
 .venv/
 __pycache__/
 .env
+token.json
+credentials.json
+reminders.json
 memory_db/
 assistant.log
+sandbox/
 .git/
