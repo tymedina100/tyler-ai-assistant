@@ -1273,6 +1273,9 @@ def describe_pending_action(pending):
     if pending["type"] == "github_delete":
         description = f"deletion of {pending['path']} from GitHub"
         return f"{description} ({context})" if context else description
+    if pending["type"] == "publish":
+        description = f"publishing of {pending.get('title', 'the product')}"
+        return f"{description} ({context})" if context else description
     return "the staged action"
 
 

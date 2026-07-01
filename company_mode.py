@@ -28,6 +28,7 @@ COMPANY_COMMANDS = {
     "/assign",
     "/approve",
     "/cancel",
+    "/publish",
     "/status",
     "/dailyreport",
     "/pausecompany",
@@ -367,6 +368,20 @@ def record_delegation(owner, request_text, answer_text, path=COMPANY_STATE_FILE,
               project_id=project["id"], task_id=task_id, amount_usd=spend or None)
     save_state(state, path)
     return task_id
+
+
+def mark_project_published(path=COMPANY_STATE_FILE):
+    """Mark the active project as published after the user approves the publish
+    package. This is the supervised gate - the actual upload to Gumroad is done by
+    the user (no upload API exists)."""
+    state = load_state(path)
+    project = active_project(state)
+    if not project:
+        return "No active project to publish."
+    project["status"] = "published"
+    add_event(state, "project_published", f"Approved publishing: {project['title']}", project_id=project["id"])
+    save_state(state, path)
+    return f"Marked '{project['title']}' as published. Nice work shipping it."
 
 
 def record_adhoc_spend(spent_usd, artifacts=None, path=COMPANY_STATE_FILE):

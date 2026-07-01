@@ -196,6 +196,19 @@ async def _handle_pending_confirmation(update, text):
     main.clear_pending_action()  # resolved either way - confirm or cancel
     description = main.describe_pending_action(pending)
 
+    # A "publish" approval is resolved here (in group_bot) rather than via
+    # main.confirm_pending_action, since publishing is a Company Mode concept and
+    # main.py stays independent of company_mode.
+    if pending.get("type") == "publish":
+        if text.strip() == "/confirm":
+            msg = await asyncio.to_thread(company_mode.mark_project_published)
+            main.logger.info(f"Telegram user {update.effective_user.id} confirmed {description}")
+            await reply_chunks(update.message, f"{msg}\n\n{GUMROAD_GO_LIVE_STEPS}")
+        else:
+            main.logger.info(f"Telegram user {update.effective_user.id} cancelled {description}")
+            await update.message.reply_text(f"Cancelled the {description}. Nothing was marked published.")
+        return True
+
     if text.strip() == "/confirm":
         # confirm_pending_action can do blocking I/O (Gmail send) - keep it off the loop.
         result = await asyncio.to_thread(main.confirm_pending_action, pending)
@@ -336,6 +349,9 @@ async def handle_group_message(update: Update):
             _cancel_running_plan()
             await reply_chunks(update.message, await asyncio.to_thread(company_mode.cancel_project))
             return
+        if parsed_company and parsed_company[0] == "/publish":
+            await start_publish(update)
+            return
 
         company_response = company_mode.handle_company_command(
             text,
@@ -402,7 +418,7 @@ async def handle_manager_dm(update: Update):
 
         company_command = company_mode.parse_company_command(text)
         if company_command is not None:
-            if company_command[0] in {"/setbudget", "/assign", "/approve", "/cancel", "/pausecompany", "/resumecompany"}:
+            if company_command[0] in {"/setbudget", "/assign", "/approve", "/cancel", "/publish", "/pausecompany", "/resumecompany"}:
                 await update.message.reply_text(
                     "Company Mode changes happen in the group operating room. "
                     "Use /company, /status, or /dailyreport here for read-only context."
@@ -676,6 +692,146 @@ async def run_company_plan(project_id):
     except Exception as e:
         main.logger.error(f"Company plan runner crashed: {e}")
         await post_to_group("The work plan hit an unexpected error and stopped. Check the logs.", "manager")
+
+
+# --------------------------------------------------------------------------- #
+# Assisted publish (/publish): prep a finished project for sale on Gumroad. Gumroad
+# has no product-creation/upload API (dashboard-only), so the AI does everything up
+# to the final upload - it splits the deliverable into a clean buyer-download file
+# plus a paste-ready listing, then stages a gated "publish" approval. On /confirm it
+# marks the project published and hands over the exact go-live steps (the upload
+# click is the one thing that stays yours).
+# --------------------------------------------------------------------------- #
+
+GUMROAD_GO_LIVE_STEPS = (
+    "Go-live steps (this last part is yours - Gumroad has no upload API):\n"
+    "1. Open https://app.gumroad.com/products/new and choose 'Digital product'.\n"
+    "2. Copy the Product name, description, price, and tags from the *-gumroad-listing.md file.\n"
+    "3. Upload the *-product.md file as the content (export it to PDF first for a nicer buyer experience).\n"
+    "4. Add a cover image (use the cover idea in the listing file).\n"
+    "5. Set the permalink and hit Publish.\n"
+    "6. Paste the product link back here so we can track it (revenue tracking lands in v3)."
+)
+
+
+def _load_project_deliverable(state, project_id):
+    """Find the finished deliverable for a project and return (name, content), or
+    (None, None). Prefers the GitHub copy (persists across redeploys) and falls back
+    to the local files/ copy."""
+    github_path = None
+    local_name = None
+    for task in company_mode.project_tasks(state, project_id):
+        for art in task.get("artifacts", []):
+            if art.startswith("github: "):
+                github_path = art[len("github: "):].strip()
+            elif art.startswith("file: files/"):
+                local_name = art[len("file: files/"):].strip()
+
+    if github_path:
+        content = main.github_helpers.read_file(github_path)
+        bad = ("GitHub isn't configured", "Sorry, couldn't", "File not found", "not a readable")
+        if content and not any(content.startswith(b) for b in bad):
+            return github_path.rsplit("/", 1)[-1], content
+
+    if local_name:
+        path = main.get_safe_file_path(local_name)
+        if path and path.exists():
+            return local_name, main.read_limited_text(path)
+
+    return None, None
+
+
+def _publish_prompt(slug, src_name, content):
+    return (
+        "You are packaging a finished digital product for sale on Gumroad. Below is the "
+        "current working file, which mixes the product content with sales/marketing copy.\n\n"
+        "Produce TWO files using write_file, with EXACTLY these names:\n"
+        f"1. \"{slug}-product.md\" - ONLY what the buyer downloads: the actual usable "
+        "product content (templates, scripts, how-to steps). Strip out the landing-page / "
+        "sales copy. Keep it complete - this is what the customer pays for.\n"
+        f"2. \"{slug}-gumroad-listing.md\" - the listing to paste into Gumroad: Product "
+        "name, Price ($19 launch), a compelling listing description, a one-line tagline, "
+        "3-5 suggested tags, and a one-line cover-image idea.\n\n"
+        "Create no other files, and do not ask questions - produce both files now.\n\n"
+        f"Current working file ({src_name}):\n---\n{content}\n---"
+    )
+
+
+async def start_publish(update):
+    """Handle /publish: prep the active project's deliverable for sale, then stage a
+    gated publish approval."""
+    global company_runner_task
+    if company_runner_task and not company_runner_task.done():
+        await update.message.reply_text("Something's already running. Let it finish (or /cancel) before /publish.")
+        return
+
+    state = await asyncio.to_thread(company_mode.load_state)
+    project = company_mode.active_project(state)
+    if not project:
+        await update.message.reply_text("No active project to publish. /assign and /approve a goal first.")
+        return
+
+    src_name, content = await asyncio.to_thread(_load_project_deliverable, state, project["id"])
+    if not content:
+        await update.message.reply_text(
+            "I couldn't find a finished file to publish. Run /approve so the team produces a deliverable first."
+        )
+        return
+
+    company_runner_task = asyncio.create_task(run_publish(project, src_name, content))
+
+
+async def run_publish(project, src_name, content):
+    """Split the deliverable into a buyer-download file + a paste-ready Gumroad
+    listing, then stage the gated publish approval."""
+    slug = src_name.rsplit(".", 1)[0]
+    sink = {"cost_usd": 0.0, "artifacts": [], "context": f"Publish prep for {project['id']}"}
+    prompt = _publish_prompt(slug, src_name, content)
+
+    await post_to_group(f"Prepping the publish package for '{project['title']}'...", "manager")
+
+    def work():
+        main.set_conversation("group")
+        main.set_reply_context({"kind": "group"})
+        main.set_execution_sink(sink)
+        main.set_company_execution(True)
+        try:
+            return main.ask_specialist("write", prompt, record_history=False)
+        finally:
+            main.set_company_execution(False)
+            main.set_execution_sink(None)
+
+    async with locks["manager"]:
+        try:
+            answer = await asyncio.to_thread(work)
+        except Exception as e:
+            main.logger.error(f"Publish prep failed: {e}")
+            await post_to_group("Publish prep hit an error - check the logs.", "manager")
+            return
+
+    await post_agent_answer_to_group("write", answer)
+    try:
+        await asyncio.to_thread(company_mode.record_adhoc_spend, sink["cost_usd"], sink["artifacts"])
+    except Exception as e:
+        main.logger.error(f"Failed to record publish spend: {e}")
+
+    # Stage the gated publish approval in the group conversation.
+    main.set_conversation("group")
+    main.set_pending_action({
+        "type": "publish",
+        "project_id": project["id"],
+        "title": project["title"],
+        "company_context": f"Project {project['id']}",
+    })
+    files = ", ".join(sink["artifacts"]) or "(no new files detected - check the message above)"
+    await post_to_group(
+        f"Publish package ready for '{project['title']}'.\nFiles: {files}\n\n"
+        "Review them, then reply /confirm to approve publishing - I'll mark it published "
+        "and hand you the exact Gumroad go-live steps. Anything else cancels.\n"
+        "Heads up: Gumroad has no upload API, so the final upload click is yours; I prep "
+        "everything up to it.",
+        "manager",
+    )
 
 
 # --------------------------------------------------------------------------- #
