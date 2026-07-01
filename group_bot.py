@@ -65,8 +65,8 @@ main.CONFIRMATION_MODE = "requires_confirmation"
 # Build-order staging: only the agents listed here get a live Telegram bot. Agents
 # NOT listed still work via Miles's delegation (their answers post under Miles) -
 # they just can't be @mentioned directly until you create their bot and add its key
-# here. Full set once every bot exists: ["manager", "code", "research", "write",
-# "task", "tasks", "weather", "calendar", "gmail"].
+# here. Full set once every bot exists: ["manager", "code", "research", "news",
+# "write", "task", "tasks", "weather", "calendar", "gmail"].
 BOT_KEYS = ["manager", "weather", "code", "research"]
 
 SPECIALIST_KEYS = [key for key in BOT_KEYS if key != "manager"]
