@@ -171,6 +171,40 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, None), 0.0)
         self.assertEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, FakeUsage()), 0.0)
 
+    def test_plan_company_goal_parses_and_falls_back(self):
+        main = self.main
+
+        class Resp:
+            def __init__(self, text):
+                self.output_text = text
+                self.usage = None
+
+        class Responses:
+            def __init__(self, text):
+                self.text = text
+
+            def create(self, **kwargs):
+                return Resp(self.text)
+
+        class Client:
+            def __init__(self, text):
+                self.responses = Responses(text)
+
+        good = '{"tasks": [{"owner": "research", "title": "Validate"}, {"owner": "write", "title": "Draft"}]}'
+        with patch.object(main, "get_openai_client", lambda: Client(good)):
+            plan = main.plan_company_goal("goal", ["research", "write", "code"])
+        self.assertEqual(plan, [("research", "Validate"), ("write", "Draft")])
+
+        # An owner not in the available set is dropped.
+        mixed = '{"tasks": [{"owner": "gmail", "title": "Email"}, {"owner": "code", "title": "Build"}]}'
+        with patch.object(main, "get_openai_client", lambda: Client(mixed)):
+            plan = main.plan_company_goal("goal", ["code"])
+        self.assertEqual(plan, [("code", "Build")])
+
+        # Garbage output -> None so company_mode uses its default plan.
+        with patch.object(main, "get_openai_client", lambda: Client("not json at all")):
+            self.assertIsNone(main.plan_company_goal("goal", ["research"]))
+
     def test_run_with_tools_synthesizes_when_budget_exhausted(self):
         """When the tool loop runs out of iterations, it should make a final no-tools
         call and return that synthesized answer, not the canned failure message."""

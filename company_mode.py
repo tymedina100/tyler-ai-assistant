@@ -169,7 +169,10 @@ def _owner_for(preferred_owner, configured_agent_keys):
     return preferred_owner, "via_miles"
 
 
-def assign_goal(goal, configured_agent_keys, specialist_keys=None, path=COMPANY_STATE_FILE):
+def assign_goal(goal, configured_agent_keys, specialist_keys=None, path=COMPANY_STATE_FILE, tasks=None):
+    # `tasks` is an optional dynamic work plan: a list of (owner, title) tuples chosen
+    # for THIS goal (see main.plan_company_goal). When None, fall back to the fixed
+    # DEFAULT_ASSIGN_TASKS so behavior is unchanged.
     goal = goal.strip()
     if not goal:
         return "Usage: /assign <goal>"
@@ -180,7 +183,7 @@ def assign_goal(goal, configured_agent_keys, specialist_keys=None, path=COMPANY_
 
     tasks_to_create = []
     total_estimate = 0.0
-    for preferred_owner, title in DEFAULT_ASSIGN_TASKS:
+    for preferred_owner, title in (tasks or DEFAULT_ASSIGN_TASKS):
         owner, delivery = _owner_for(preferred_owner, configured_agent_keys)
         estimate = DEFAULT_TASK_ESTIMATE_USD
         tasks_to_create.append((owner, delivery, title, estimate))

@@ -1907,6 +1907,66 @@ def select_group_responders(text):
         return ["manager"]
 
 
+def plan_company_goal(goal, available_keys):
+    """Turn a Company Mode goal into a tailored work plan instead of the same fixed
+    4 tasks every time. Miles reads the goal and returns a list of (owner, title)
+    tuples using only the available specialist agents - picking the right ones, in a
+    sensible order, however many the goal actually needs. Returns None on any error
+    or empty result, so company_mode.assign_goal falls back to its default plan and
+    /assign never breaks."""
+    menu = "\n".join(
+        f"- {key}: {SPECIALISTS[key]['label']}" for key in available_keys if key in SPECIALISTS
+    )
+    instructions = f"""You are Miles, a startup COO planning the work for a goal the founder
+just handed you. Break the goal into a short, tailored work plan and assign each task to the
+best-fit teammate. Use ONLY these agents:
+{menu}
+
+Rules:
+- Pick only the agents the goal actually needs. A simple goal may need just 1-2 tasks; a full
+  new product may need 4-5. Do NOT force every agent in.
+- Order tasks so earlier results feed later ones (e.g. research -> build -> copy -> checklist).
+- Each task is ONE specific, concrete instruction written for that agent.
+- Prefer 'code' (Patch) for building the actual downloadable asset/file, 'write' (Quill) for
+  copy/positioning, 'research' (Scout) for validation, 'news' (Herald) for current-events
+  angles, 'tasks' (Roster) for a real to-do checklist.
+
+Reply with ONLY a JSON object: {{"tasks": [{{"owner": "<agent key>", "title": "<task>"}}, ...]}}."""
+
+    try:
+        openai_client = get_openai_client()
+        response = call_with_retries(
+            lambda: openai_client.responses.create(
+                model=FAST_MODEL,
+                instructions=instructions,
+                input=[{"role": "user", "content": goal}],
+            ),
+            label="Company planner call",
+        )
+        _accrue_cost(FAST_MODEL, getattr(response, "usage", None))
+        raw = response.output_text.strip()
+
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError(f"no JSON object in planner output: {raw!r}")
+
+        parsed = json.loads(raw[start:end + 1])
+        plan = []
+        for item in parsed.get("tasks", []):
+            owner = item.get("owner")
+            title = (item.get("title") or "").strip()
+            if owner in available_keys and title:
+                plan.append((owner, title))
+
+        if plan:
+            return plan
+        raise ValueError(f"planner produced no valid tasks: {parsed!r}")
+
+    except Exception as e:
+        logger.error(f"Company planner failed, using default plan: {e}")
+        return None
+
+
 def handle_command(user_prompt):
     """Process one line of user input exactly like the CLI does: parse it as a
     command, print the result. Returns False on /quit, True otherwise - shared

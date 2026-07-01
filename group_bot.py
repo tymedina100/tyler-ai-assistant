@@ -352,6 +352,9 @@ async def handle_group_message(update: Update):
         if parsed_company and parsed_company[0] == "/publish":
             await start_publish(update)
             return
+        if parsed_company and parsed_company[0] == "/assign":
+            await assign_with_dynamic_plan(update, parsed_company[1])
+            return
 
         company_response = company_mode.handle_company_command(
             text,
@@ -537,6 +540,25 @@ async def start_company_plan(update):
     await update.message.reply_text(message)
     if project_id:
         company_runner_task = asyncio.create_task(run_company_plan(project_id))
+
+
+async def assign_with_dynamic_plan(update, goal):
+    """Handle /assign: have Miles plan a tailored work plan for THIS goal (which
+    agents, in what order) instead of the fixed 4-task default, then reserve budget
+    and propose it. Falls back to the default plan if planning fails."""
+    goal = (goal or "").strip()
+    if not goal:
+        await update.message.reply_text("Usage: /assign <goal>")
+        return
+
+    await post_to_group("Planning the work for that goal...", "manager")
+    # SPECIALIST_KEYS are the agents with live bots, so a planned owner can speak as itself.
+    plan = await _run_metered(main.plan_company_goal, goal, SPECIALIST_KEYS)
+    result = await asyncio.to_thread(
+        company_mode.assign_goal,
+        goal, BOT_KEYS, list(main.SPECIALISTS.keys()), company_mode.COMPANY_STATE_FILE, plan,
+    )
+    await reply_chunks(update.message, result)
 
 
 def _task_prompt(project, task, prior_work=""):

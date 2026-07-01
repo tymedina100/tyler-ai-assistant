@@ -454,7 +454,9 @@ Commands in the group:
 
 - `/company` or `/status` — operating mode, budget ledger, active project, open tasks.
 - `/setbudget 20` — set today's company budget.
-- `/assign <goal>` — plan + reserve budget for a goal (creates a *proposed* project).
+- `/assign <goal>` — Miles reads the goal and **plans a tailored work plan** (which
+  agents, in what order, however many the goal needs — not a fixed 4 every time),
+  reserves budget, and proposes it. Falls back to a default plan if planning fails.
 - `/approve` — start working the proposed plan.
 - `/cancel` — drop the active project and release its reserved budget.
 - `/publish` — package the finished project for sale (assisted; see below).
