@@ -281,8 +281,8 @@ of two tiers instead of one model for everything:
   assistant).
 - **`FAST_MODEL`** — a cheaper, faster model for work that's mostly routing or a thin
   wrapper over an API result: **Miles** (the Manager's delegation decision is a
-  classification task), **Gale** (weather), **Roster** (Todoist), and **Sage**
-  (personal-assistant memory ops).
+  classification task), **Gale** (weather), **Ledger** (crypto prices), **Roster**
+  (Todoist), and **Sage** (personal-assistant memory ops).
 
 Both are constants at the top of `main.py`, and every call defaults to `PREMIUM_MODEL`,
 so nothing silently downgrades — a call is only cheap where the code deliberately passes
