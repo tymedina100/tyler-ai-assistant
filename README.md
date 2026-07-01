@@ -50,6 +50,9 @@ Create a virtual environment:
 python -m venv .venv
 ```
 
+This project is developed against Python 3.10, which is also what the Dockerfiles
+use. Newer Python 3.x versions may work, but 3.10 is the safest match.
+
 Activate it:
 
 ```powershell
@@ -62,7 +65,11 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root with your API keys:
+Create a `.env` file in the project root with your API keys. For a minimal CLI
+setup, `OPENAI_API_KEY` is the only required key. The other keys are optional until
+you use the feature that needs them:
+
+You can use `.env.example` as a checklist for the available keys.
 
 ```
 OPENAI_API_KEY=your-openai-key-here
@@ -171,8 +178,9 @@ weather result included in that next delegation's prompt. Every handoff still go
 through the Manager — agents never call each other directly, and architecturally
 can't (a specialist's own tool-calling loop only has access to its own curated tools,
 never the delegation tools). The Manager has a higher tool-call budget than other
-agents (`MAX_MANAGER_TOOL_ITERATIONS = 8` vs. `MAX_TOOL_ITERATIONS = 5`) specifically
-to leave room for chains like this.
+agents (`MAX_MANAGER_TOOL_ITERATIONS = 8` vs. `MAX_TOOL_ITERATIONS = 10`) because
+the Manager is expected to spend its budget on delegation chains while specialists
+may spend theirs on search, memory recall, and verification before answering.
 
 You'll see one response block per agent involved (e.g. `Weather Agent response: ...`,
 then `Writer Agent response: ...`), then the Manager's final answer (`Manager
@@ -231,13 +239,13 @@ chat and each other — there's one memory store for the whole assistant, not on
 agent. A fact saved via `/task` (Personal Assistant) can be recalled later in plain
 chat or by any other specialist.
 
-**Known limitation:** specialists share a `MAX_TOOL_ITERATIONS = 5` cap on their own
-internal tool calls (separate from the Manager's higher budget for delegation chains).
+Specialists share a `MAX_TOOL_ITERATIONS = 10` cap on their own
+internal tool calls (separate from the Manager's delegation budget).
 Occasionally an agent — the Researcher in particular, since it sometimes re-verifies
 a fact with several searches before answering — can exhaust that budget and fall back
-to a generic "I tried too many tool calls" message instead of a real answer. This is
-flaky (re-asking the same thing usually succeeds) and is the existing Week 8 safety
-net working as designed (a graceful message, not a crash), not a bug introduced here.
+to a generic "I tried too many tool calls" message only if the higher budget is still
+exhausted. The larger default is meant to keep search-heavy Scout requests from
+hitting that fallback during normal use.
 
 ## Meet the team
 
@@ -442,7 +450,8 @@ undone.
   exception behind any failure (the console only ever shows a friendly, generic
   message). Gitignored, since it can contain personal request details. It deliberately
   does **not** log full tool results (e.g. file contents) to avoid duplicating
-  potentially sensitive data into yet another file.
+  potentially sensitive data into yet another file. Sensitive tool arguments such as
+  file contents, email bodies, subjects, and code snippets are redacted before logging.
 - **Specific tool errors instead of crashes.** If a tool call has a missing or
   malformed argument, `execute_tool()` catches it and returns a specific message
   (e.g. "missing required argument 'filename'") instead of crashing the whole turn
@@ -454,6 +463,8 @@ undone.
   you're not approving a destructive overwrite by accident.
 - **Write size limit.** `write_file` refuses content over 50,000 characters, a basic
   guard against an accidental or runaway oversized write.
+- **Read size limit.** File reads are capped at 50,000 characters before they are
+  printed or sent to the model, with a clear truncation note when a file is larger.
 
 ## Running 24/7 (Telegram bot)
 
@@ -515,9 +526,10 @@ listen on a port, it polls Telegram). Railway, Render, and Fly.io all support th
 exact steps and current free-tier terms change over time, so check each platform's own
 docs rather than trusting specifics here. Whichever you pick, you'll need to:
 
-1. Set `OPENAI_API_KEY`, `TAVILY_API_KEY`, `TELEGRAM_BOT_TOKEN`,
-   `TELEGRAM_ALLOWED_USER_IDS`, `OPENWEATHER_API_KEY`, and `TODOIST_API_TOKEN` as
-   environment variables/secrets on the platform (never commit `.env`).
+1. Set `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_ALLOWED_USER_IDS` as
+   environment variables/secrets on the platform (never commit `.env`). Add
+   `TAVILY_API_KEY`, `OPENWEATHER_API_KEY`, and `TODOIST_API_TOKEN` only if you want
+   web search, weather, or Todoist tasks in that deployment.
 2. **Mount a persistent volume at `/app/memory_db`** if you want long-term memory to
    survive restarts and redeploys. A plain container's filesystem is wiped every time
    it restarts — without a volume, the assistant's memory resets on every deploy,
@@ -611,11 +623,12 @@ and runs for you first. Same deployment shape as `bot.py`: a **background worker
 (not a web service, since it doesn't listen on a port). Mount a **persistent volume**
 so state survives redeploys — this now covers not just `/app/memory_db` (long-term
 memory) but also `/app/reminders.json` (pending reminders) and `/app/token.json`
-(your Google login); without persistence those reset on every deploy. Set every token
-you're using (`TELEGRAM_MANAGER_BOT_TOKEN`, `TELEGRAM_GROUP_CHAT_ID`, etc., plus
-`OPENAI_API_KEY`/`TAVILY_API_KEY`/`OPENWEATHER_API_KEY`/`TODOIST_API_TOKEN`, and the
-optional `HOME_LOCATION`/`BRIEFING_TIME`/`TIMEZONE`/`EVENT_ALERT_MINUTES`) as
-environment variables/secrets on whatever platform you deploy to.
+(your Google login); without persistence those reset on every deploy. Set the
+required group tokens you're using (`TELEGRAM_MANAGER_BOT_TOKEN`,
+`TELEGRAM_GROUP_CHAT_ID`, etc.) plus `OPENAI_API_KEY`. Add
+`TAVILY_API_KEY`/`OPENWEATHER_API_KEY`/`TODOIST_API_TOKEN` only for web search,
+weather, or Todoist, and keep `HOME_LOCATION`/`BRIEFING_TIME`/`TIMEZONE`/
+`EVENT_ALERT_MINUTES` as optional scheduling configuration.
 
 **One thing to remember:** `BOT_KEYS` in `group_bot.py` controls which agents are
 active. Whenever you create a new bot and want to add it to a *deployed* instance,

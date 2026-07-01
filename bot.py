@@ -69,6 +69,7 @@ processing_lock = asyncio.Lock()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     text = update.message.text
 
     if user_id not in ALLOWED_USER_IDS:
@@ -78,6 +79,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ask the owner to add it to TELEGRAM_ALLOWED_USER_IDS if this should be allowed."
         )
         return
+
+    main.set_conversation(f"telegram:{chat_id}:{user_id}")
 
     if text.strip() == "/start":
         await update.message.reply_text(WELCOME_MESSAGE)
