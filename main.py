@@ -572,6 +572,28 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
                     "call_id": call.call_id,
                     "output": result
                 })
+        else:
+            # The for loop ran out of iterations without ever producing a plain text
+            # answer (the model kept asking for tools). Rather than discard everything
+            # it gathered and return a canned "too many tool calls" failure, make one
+            # final call with NO tools so the model is forced to synthesize an answer
+            # from what it already has. This turns a wasted, answer-less run (e.g. a
+            # research agent that kept searching) into a usable, if partial, reply.
+            final_response = call_with_retries(
+                lambda: openai_client.responses.create(
+                    model=model,
+                    instructions=instructions + (
+                        "\n\nYou have used all of your tool calls for this turn. Do not "
+                        "request any more tools - answer now using what you have already "
+                        "gathered, and clearly note anything you could not fully verify."
+                    ),
+                    input=input_items,
+                ),
+                label="OpenAI final synthesis call",
+            )
+            _accrue_cost(model, getattr(final_response, "usage", None))
+            if final_response.output_text:
+                assistant_response = final_response.output_text
 
     except Exception:
         assistant_response = "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
@@ -1601,12 +1623,21 @@ with "- Patch".
         "name": "Scout",
         "label": "Scout (Researcher Agent)",
         "model": PREMIUM_MODEL,
+        # Research is search-heavy, so give Scout more headroom than the default 10 -
+        # but the role below tells it to converge, and run_with_tools now forces a
+        # final synthesis if it still runs out, so it can't return an empty failure.
+        "max_iterations": 15,
         "tool_names": ["search_the_web", "recall_memories", "remember_fact"],
         "role": """
 You are a thorough research assistant. Use search_the_web to find current,
 accurate information and cite your sources. Use remember_fact to save important
 findings for later, and recall_memories to check what's already been researched
 before searching again. Be clear about what is verified fact versus speculation.
+
+Be decisive: run at most 3-4 web searches, then STOP searching and write your
+answer from what you found. Do not keep re-searching slight variations of the same
+query - if a couple of searches don't fully answer it, say what you found and flag
+what's still uncertain rather than searching again.
 """,
         "persona": """
 You are Scout, the team's researcher. Voice: curious, energetic fact-hound who

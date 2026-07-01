@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -155,6 +156,47 @@ class HardeningTests(unittest.TestCase):
     def test_usage_to_usd_none_and_bad_shape_are_zero_safe(self):
         self.assertEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, None), 0.0)
         self.assertEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, FakeUsage()), 0.0)
+
+    def test_run_with_tools_synthesizes_when_budget_exhausted(self):
+        """When the tool loop runs out of iterations, it should make a final no-tools
+        call and return that synthesized answer, not the canned failure message."""
+        main = self.main
+        calls = []
+
+        class Item:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        class Resp:
+            def __init__(self, output, output_text=""):
+                self.output = output
+                self.output_text = output_text
+                self.usage = None
+
+        class Responses:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs.get("tools"):
+                    # Keep demanding a tool so the loop never breaks on its own.
+                    return Resp([Item(
+                        type="function_call", name="recall_memories",
+                        arguments=json.dumps({"query": "x"}), call_id="c1",
+                    )])
+                # The final synthesis call omits tools -> return a real answer.
+                return Resp([], output_text="Final synthesized answer.")
+
+        class Client:
+            responses = Responses()
+
+        with patch.object(main, "get_openai_client", lambda: Client()):
+            result = main.run_with_tools(
+                "inst", [{"role": "user", "content": "hi"}],
+                main.TOOLS, max_iterations=2, model=main.FAST_MODEL,
+            )
+
+        self.assertEqual(result, "Final synthesized answer.")
+        self.assertEqual(len(calls), 3)          # 2 tool iterations + 1 synthesis
+        self.assertNotIn("tools", calls[-1])     # synthesis call carried no tools
 
     def test_company_execution_writes_file_directly_and_records_artifact(self):
         self.main.set_conversation("test:companywrite")
