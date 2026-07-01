@@ -40,6 +40,21 @@ def _tz():
         return None
 
 
+def _ensure_token_file():
+    """On a fresh cloud deploy the gitignored token.json isn't baked into the image.
+    If it's not on disk but its contents are supplied via the GOOGLE_TOKEN_JSON env
+    var (a platform secret), materialize the file so credentials load normally. A
+    mounted volume file also just works - this only fills the gap when there's no
+    volume. The refresh token inside stays valid across restarts, so re-materializing
+    from the env var on each boot is fine."""
+    if TOKEN_FILE.exists():
+        return
+
+    token_json = os.environ.get("GOOGLE_TOKEN_JSON")
+    if token_json:
+        TOKEN_FILE.write_text(token_json, encoding="utf-8")
+
+
 def _get_credentials():
     """Load stored credentials and refresh if needed. Raises RuntimeError with a
     user-facing message if token.json is missing or unusable - callers turn that
@@ -47,9 +62,13 @@ def _get_credentials():
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
+    _ensure_token_file()
+
     if not TOKEN_FILE.exists():
         raise RuntimeError(
-            "Google isn't connected yet - run 'python google_auth.py' once to sign in."
+            "Google isn't connected yet - run 'python google_auth.py' locally to sign "
+            "in, then set the token.json contents as the GOOGLE_TOKEN_JSON secret on "
+            "your deploy."
         )
 
     creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
