@@ -21,6 +21,10 @@ API_ROOT = "https://api.github.com"
 
 NOT_CONFIGURED = "GitHub isn't configured (set GITHUB_TOKEN and GITHUB_REPO)."
 
+# How much of a file read returns. Generous so the coding agent can see whole
+# source files (main.py etc.) when it needs full context, not just the first page.
+MAX_READ_CHARS = 100_000
+
 
 def _config():
     return (
@@ -135,7 +139,7 @@ def _read(repo, ref, token, path):
     if data.get("type") != "file" or "content" not in data:
         return f"{path} isn't a readable file (maybe a directory - list it first)."
 
-    return base64.b64decode(data["content"]).decode("utf-8", errors="replace")[:8000]
+    return base64.b64decode(data["content"]).decode("utf-8", errors="replace")[:MAX_READ_CHARS]
 
 
 def list_files(path=""):
@@ -257,11 +261,63 @@ def _existing_pr_url(repo, branch, token):
     return None
 
 
+def _get_content(repo, ref, token, path):
+    """Return a file's raw text at `ref`, or None if it isn't a readable file there."""
+    resp = requests.get(_content_url(repo, path), headers=_headers(token),
+                        params={"ref": ref}, timeout=10)
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    if data.get("type") != "file" or "content" not in data:
+        return None
+    return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+
+
+def _commit_and_pr(repo, base, branch, path, content, title, body, token):
+    """Commit `content` to `branch` and make sure an open PR exists for it. Assumes
+    the branch already exists. Returns a status string."""
+    _, commit_err = _commit(path, content, token, repo, branch)
+    if commit_err:
+        return f"Couldn't commit {path} to {branch}: {commit_err}"
+
+    pr_url = _existing_pr_url(repo, branch, token)
+    if not pr_url:
+        pr_resp = requests.post(
+            f"{API_ROOT}/repos/{repo}/pulls", headers=_headers(token),
+            json={"title": title, "head": branch, "base": base, "body": body}, timeout=10)
+        if pr_resp.status_code in (200, 201):
+            pr_url = pr_resp.json()["html_url"]
+        else:
+            return (f"Committed {path} to '{branch}', but couldn't open the PR: "
+                    f"{pr_resp.status_code} {pr_resp.text[:200]}")
+
+    return f"Committed {path} to branch '{branch}'. Pull request (review + merge to ship): {pr_url}"
+
+
 def code_propose_change(branch, path, content, title, body=""):
-    """Commit `content` to `path` on `branch` in the code repo and ensure an open PR
-    exists for that branch. Call once per file (reuse the same branch name for a
-    multi-file change); the PR is created on the first call and reused after. Nothing
-    ships until the user merges the PR."""
+    """Commit whole-file `content` to `path` on `branch` and ensure a PR exists. Best
+    for NEW files; to change an existing file prefer code_edit_file (you don't have to
+    reproduce the whole file). Reuse the same branch name across a multi-file change;
+    the PR is created once and reused. Nothing ships until the user merges."""
+    token, repo, base = _code_config()
+    if not (token and repo):
+        return NOT_CONFIGURED
+
+    try:
+        err = _ensure_branch(repo, branch, base, token)
+        if err:
+            return err
+        return _commit_and_pr(repo, base, branch, path, content, title, body, token)
+    except Exception as e:
+        return f"Sorry, the change proposal failed ({e})."
+
+
+def code_edit_file(branch, path, old_snippet, new_snippet, title, body=""):
+    """Make a targeted edit to an existing file in the code repo: replace `old_snippet`
+    with `new_snippet` (the snippet must appear exactly once), then commit to `branch`
+    and ensure a PR. You only supply the small changed snippet, not the whole file - so
+    this is the reliable way to edit large files. Edits stack on the branch, so call it
+    repeatedly (same branch) for several changes in one PR. Nothing ships until merge."""
     token, repo, base = _code_config()
     if not (token and repo):
         return NOT_CONFIGURED
@@ -271,22 +327,21 @@ def code_propose_change(branch, path, content, title, body=""):
         if err:
             return err
 
-        html_url, commit_err = _commit(path, content, token, repo, branch)
-        if commit_err:
-            return f"Couldn't commit {path} to {branch}: {commit_err}"
+        # Edit relative to the branch's current state so repeated edits accumulate.
+        current = _get_content(repo, branch, token, path)
+        if current is None:
+            return f"Couldn't read {path} from {repo}@{branch} to edit it (does it exist?)."
 
-        pr_url = _existing_pr_url(repo, branch, token)
-        if not pr_url:
-            pr_resp = requests.post(
-                f"{API_ROOT}/repos/{repo}/pulls", headers=_headers(token),
-                json={"title": title, "head": branch, "base": base, "body": body}, timeout=10)
-            if pr_resp.status_code in (200, 201):
-                pr_url = pr_resp.json()["html_url"]
-            else:
-                return (f"Committed {path} to '{branch}', but couldn't open the PR: "
-                        f"{pr_resp.status_code} {pr_resp.text[:200]}")
+        occurrences = current.count(old_snippet)
+        if occurrences == 0:
+            return (f"The snippet to replace wasn't found in {path}. Read the file "
+                    f"(code_read_file) and copy an exact, unique snippet to replace.")
+        if occurrences > 1:
+            return (f"That snippet appears {occurrences} times in {path} - include more "
+                    f"surrounding context so it matches exactly once.")
 
-        return f"Committed {path} to branch '{branch}'. Pull request (review + merge to ship): {pr_url}"
+        updated = current.replace(old_snippet, new_snippet, 1)
+        return _commit_and_pr(repo, base, branch, path, updated, title, body, token)
 
     except Exception as e:
-        return f"Sorry, the change proposal failed ({e})."
+        return f"Sorry, the edit failed ({e})."

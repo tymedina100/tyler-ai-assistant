@@ -165,8 +165,11 @@ TOOLS = [
      "description": "Read a file from the assistant's own code repository. Always read a file before proposing a change to it.",
      "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"type": "function", "name": "code_propose_change", "strict": False,
-     "description": "Propose a change to the assistant's own code repository: commits the file to a branch and opens a pull request for the user to review and merge. Nothing goes live until the user merges. Call once per file, reusing the same branch name for a multi-file change (the PR is created once and reused).",
+     "description": "Propose a NEW file (or a full-file rewrite) in the assistant's own code repository: commits the whole file to a branch and opens a pull request. To change an existing file, prefer code_edit_file. Reuse the same branch name for a multi-file change (the PR is created once and reused). Nothing goes live until the user merges.",
      "parameters": {"type": "object", "properties": {"branch": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["branch", "path", "content", "title"]}},
+    {"type": "function", "name": "code_edit_file", "strict": False,
+     "description": "Make a targeted edit to an EXISTING file in the assistant's own code repository: replaces old_snippet with new_snippet (old_snippet must appear exactly once in the file), commits to a branch, and opens/updates a pull request. Preferred for editing existing files - you supply only the small snippet that changes, not the whole file. Read the file first to copy an exact snippet. Reuse the same branch for related edits.",
+     "parameters": {"type": "object", "properties": {"branch": {"type": "string"}, "path": {"type": "string"}, "old_snippet": {"type": "string"}, "new_snippet": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["branch", "path", "old_snippet", "new_snippet", "title"]}},
 ]
 
 DELEGATION_TOOLS = [
@@ -1150,6 +1153,12 @@ def execute_tool(name, arguments):
                 arguments["title"], arguments.get("body", "")
             )
 
+        if name == "code_edit_file":
+            return github_helpers.code_edit_file(
+                arguments["branch"], arguments["path"], arguments["old_snippet"],
+                arguments["new_snippet"], arguments["title"], arguments.get("body", "")
+            )
+
         if name == "write_file":
             if CONFIRMATION_MODE == "disabled":
                 return "File writing is disabled in this interface."
@@ -1265,7 +1274,7 @@ SPECIALISTS = {
         "max_iterations": 8,
         "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories", "run_python",
                        "github_list_files", "github_read_file", "github_save_file", "github_delete_file",
-                       "code_list_files", "code_read_file", "code_propose_change"],
+                       "code_list_files", "code_read_file", "code_propose_change", "code_edit_file"],
         "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
@@ -1279,14 +1288,17 @@ github_read_file to browse it, github_save_file to commit files directly, and
 github_delete_file to remove one (the user confirms deletes). Use this for standalone
 files and code output; share the GitHub URL you get back.
 
-You can also improve the assistant's OWN codebase. Use code_list_files and
-code_read_file to study the project, then code_propose_change to commit your edit to
-a branch and open a pull request the user reviews - this NEVER changes the live code
-directly, it only proposes. Always read a file before you change it, keep each pull
-request small and focused, use a clear branch name (e.g. "add-spotify-agent"), and
-reuse the same branch across multiple files in one change. Remind the user a change
-only ships after they merge the PR and redeploy. Explain your reasoning briefly and
-prefer simple, correct solutions over clever ones.
+You can also improve the assistant's OWN codebase, but only by proposing pull
+requests the user reviews - you NEVER change the live code directly. Use
+code_list_files and code_read_file to study the project first. To change an existing
+file, use code_edit_file: read it, then replace one exact, unique snippet - you don't
+reproduce the whole file, which is how you edit big files like main.py reliably. Use
+code_propose_change only for brand-new files. Always read a file before you change it,
+keep each pull request small and focused, use a clear branch name (e.g.
+"add-spotify-agent"), and reuse the same branch across all edits in one change so they
+land in a single PR. Remind the user a change only ships after they merge the PR and
+redeploy. Explain your reasoning briefly and prefer simple, correct solutions over
+clever ones.
 """,
         "persona": """
 You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior

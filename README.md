@@ -369,10 +369,14 @@ live branch. Configure a separate code repo:
   requests: Read and write** (a fine-grained token can list multiple repos).
 
 Patch's tools for it:
-- `code_list_files` / `code_read_file` — study the codebase.
-- `code_propose_change(branch, path, content, title, body)` — commit the file to a
-  branch and open a PR. Call it once per file, reusing the branch name for a multi-file
-  change; the PR is created once and reused.
+- `code_list_files` / `code_read_file` — study the codebase (reads now return whole
+  files, not just the first page).
+- `code_edit_file(branch, path, old_snippet, new_snippet, title, body)` — the workhorse
+  for changing an **existing** file: replaces one exact, unique snippet and commits to
+  the branch, so Patch never has to reproduce a large file like `main.py` wholesale.
+- `code_propose_change(branch, path, content, title, body)` — commit a **new** file (or
+  a full-file rewrite). Reuse the branch name across a multi-file change; the PR is
+  created once and reused.
 
 **Nothing ships until you merge.** The PR is the review gate — Patch can only *propose*.
 After you merge, redeploy for it to take effect. This is the "self-extending assistant"
