@@ -50,6 +50,13 @@ logger.addHandler(log_handler)
 
 load_dotenv()
 
+# Where persistent state lives (long-term memory, reminders, Company Mode state, the
+# Google token). On a cloud host the container filesystem is wiped on every redeploy,
+# so point DATA_DIR at a mounted volume (e.g. /app/data on Railway) and this state
+# survives. Defaults to the project directory for local dev, so nothing changes there.
+DATA_DIR = Path(os.environ.get("DATA_DIR") or BASE_DIR)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 _openai_client = None
 _tavily_client = None
 
@@ -392,9 +399,9 @@ CODE_EXEC_MEMORY_MB = 256
 
 # One-off reminders (Feature: proactive) persist here so they survive a restart/
 # redeploy; group_bot.py reloads and re-schedules them on startup.
-REMINDERS_FILE = BASE_DIR / "reminders.json"
+REMINDERS_FILE = DATA_DIR / "reminders.json"
 
-MEMORY_DIR = BASE_DIR / "memory_db"
+MEMORY_DIR = DATA_DIR / "memory_db"
 chroma_client = chromadb.PersistentClient(path=str(MEMORY_DIR))
 memory_collection = chroma_client.get_or_create_collection(name="long_term_memory")
 
