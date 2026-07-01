@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import os
@@ -60,7 +61,50 @@ BRIEFING_TIME = os.environ.get("BRIEFING_TIME", "08:00")  # HH:MM in TIMEZONE
 TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 EVENT_ALERT_MINUTES = int(os.environ.get("EVENT_ALERT_MINUTES", "15"))
 
-conversation_history = []
+# Short-term conversation memory is now per-chat, not one global list. Each
+# interface (CLI, each Telegram DM, the group) is its own conversation with its
+# own history, so concurrent chats don't bleed into each other. The *current*
+# conversation for the running turn is tracked in a contextvar, which propagates
+# through asyncio.to_thread into ask_manager/ask_specialist/execute_tool without
+# threading an id argument through every function. Long-term memory (Chroma) is
+# deliberately NOT per-chat - it stays a single shared knowledge store below.
+_current_conversation = contextvars.ContextVar("conversation_id", default="cli")
+
+# conv_id -> list[{"role", "content"}]. Replaces the old global conversation_history.
+conversation_histories = {}
+
+# conv_id -> the one sensitive action staged for that chat (see pending_actions
+# below). Per-chat so a write staged while DMing one agent can't be cancelled or
+# confirmed by an unrelated message in another chat.
+pending_actions = {}
+
+
+def set_conversation(conv_id):
+    """Point the current turn at a conversation (e.g. "group", "dm:code:123").
+    Call this in each interface's handler before invoking the ask_* functions."""
+    _current_conversation.set(conv_id)
+
+
+def current_conversation_id():
+    return _current_conversation.get()
+
+
+def get_history():
+    """The message list for the current conversation, created on first use."""
+    return conversation_histories.setdefault(current_conversation_id(), [])
+
+
+def get_pending_action():
+    return pending_actions.get(current_conversation_id())
+
+
+def set_pending_action(action):
+    pending_actions[current_conversation_id()] = action
+
+
+def clear_pending_action():
+    pending_actions.pop(current_conversation_id(), None)
+
 
 # Two model tiers instead of one model for everything. The premium model does
 # the work that needs real reasoning (coding, research, writing, the catch-all
@@ -88,7 +132,11 @@ MAX_HISTORY_MESSAGES = 20
 # stays unfiltered on purpose (it's the tool for seeing raw distances).
 MEMORY_DISTANCE_THRESHOLD = 1.2
 
-MAX_TOOL_ITERATIONS = 5
+# Default tool-call budget per turn for ask_ai/ask_specialist. 5 was too tight now
+# that agents do real multi-tool work - the Researcher in particular runs several
+# searches (plus recalls) and would hit the cap and return the "too many tool calls"
+# fallback mid-answer. Patch overrides this higher still (see its max_iterations).
+MAX_TOOL_ITERATIONS = 10
 # The Manager is the only caller expected to make several substantive tool
 # calls in one turn by design now (one delegation per agent in a chain) -
 # give it more headroom than ask_ai/ask_specialist's unchanged default.
@@ -400,32 +448,33 @@ def ask_ai(prompt, record_history=True):
     augmented_prompt = build_augmented_prompt(prompt)
 
     if record_history:
+        history = get_history()
         # Real history keeps the plain prompt; only this one-off call sees the
         # memory-augmented version, so /history never shows the injected memories.
-        conversation_history.append({
+        history.append({
             "role": "user",
             "content": prompt
         })
 
         # Window the history sent to the model to the most recent messages so
-        # token cost doesn't climb unbounded every turn. conversation_history
+        # token cost doesn't climb unbounded every turn. The stored history
         # itself is untouched (so /history still shows the full record); only the
         # model input is trimmed. Slice off the just-appended message first, then
         # keep the last MAX_HISTORY_MESSAGES, then re-add the augmented version.
-        recent_history = conversation_history[:-1][-MAX_HISTORY_MESSAGES:]
+        recent_history = history[:-1][-MAX_HISTORY_MESSAGES:]
         input_items = recent_history + [{
             "role": "user",
             "content": augmented_prompt
         }]
     else:
         # Called as a Manager delegation target - the Manager logs the real
-        # conversation_history entry itself, using the user's verbatim message.
+        # history entry itself, using the user's verbatim message.
         input_items = [{"role": "user", "content": augmented_prompt}]
 
     assistant_response = run_with_tools(ASSISTANT_INSTRUCTIONS, input_items, TOOLS, model=GENERAL_MODEL)
 
     if record_history:
-        conversation_history.append({
+        get_history().append({
             "role": "assistant",
             "content": assistant_response
         })
@@ -458,13 +507,14 @@ general assistant) fits best.
 
 
 def show_history():
-    if len(conversation_history) == 0:
+    history = get_history()
+    if len(history) == 0:
         print("Conversation history is empty.")
         return
 
     print("\nConversation history:")
 
-    for message in conversation_history:
+    for message in history:
         role = message["role"]
         content = message["content"]
 
@@ -643,19 +693,20 @@ User question:
 {question}
 """
 
-    temporary_history = conversation_history + [{
+    history = get_history()
+    temporary_history = history + [{
         "role": "user",
         "content": prompt
     }]
 
     answer = get_ai_response(temporary_history)
 
-    conversation_history.append({
+    history.append({
         "role": "user",
         "content": f"Asked about file {filename}: {question}"
     })
 
-    conversation_history.append({
+    history.append({
         "role": "assistant",
         "content": answer
     })
@@ -882,19 +933,20 @@ User question:
 {query}
 """
 
-    temporary_history = conversation_history + [{
+    history = get_history()
+    temporary_history = history + [{
         "role": "user",
         "content": prompt
     }]
 
     answer = get_ai_response(temporary_history)
 
-    conversation_history.append({
+    history.append({
         "role": "user",
         "content": f"Searched the web for: {query}"
     })
 
-    conversation_history.append({
+    history.append({
         "role": "assistant",
         "content": answer
     })
@@ -966,15 +1018,15 @@ def show_recall(query):
 #   "enabled"               - ask via input() and act immediately (CLI default)
 #   "disabled"               - refuse the sensitive action outright
 #   "requires_confirmation"  - no real terminal to read input() from (e.g. the
-#                              Telegram bot) - stage the action in `pending_action`
-#                              instead and tell the caller how to confirm it later
+#                              Telegram bot) - stage the action per-chat (see
+#                              pending_actions) and tell the caller how to confirm
+#                              it later
 CONFIRMATION_MODE = "enabled"
 
-# Holds at most one sensitive action awaiting out-of-band confirmation, as a dict
-# tagged with "type" ("write_file" or "send_email") plus that action's payload, else
-# None. A single global is fine here - this is a personal, single-user app. The
-# Telegram interfaces resolve it when the user replies /confirm.
-pending_action = None
+# A staged sensitive action is held per-conversation in pending_actions (defined near
+# the top of this file), tagged with "type" ("write_file"/"send_email"/"github_delete")
+# plus that action's payload. Per-chat so confirming/cancelling in one chat can't touch
+# an action staged in another; the interface resolves it when the user replies /confirm.
 
 # Set by group_bot.py to a function (specialist_key, request_text, answer_text) -> None.
 # Called only from execute_tool's delegate_to_* branches (genuine Manager-mediated
@@ -982,6 +1034,21 @@ pending_action = None
 # the group bypass the Manager entirely and shouldn't trigger a fake "delegating..."
 # announcement. None (the default) is a no-op for the CLI and the single-bot bot.py.
 on_delegation = None
+
+# The current turn's reply destination, set by group_bot.py so on_delegation knows
+# where a dispatched agent's answer should go: {"kind": "group"} posts to the group;
+# {"kind": "manager_dm", "user_id": ..., "chat_id": ...} makes each dispatched agent
+# DM the user directly (with Miles recapping). A contextvar so it propagates through
+# asyncio.to_thread into execute_tool. None (CLI/single bot) means "no routing".
+_reply_context = contextvars.ContextVar("reply_context", default=None)
+
+
+def set_reply_context(ctx):
+    _reply_context.set(ctx)
+
+
+def current_reply_context():
+    return _reply_context.get()
 
 
 def confirm_pending_action(pending):
@@ -1010,8 +1077,6 @@ def describe_pending_action(pending):
 def execute_tool(name, arguments):
     print(f"\n[tool] {name}({arguments})")
     logger.info(f"Tool call: {name}({arguments})")
-
-    global pending_action
 
     try:
         if name == "read_file":
@@ -1089,12 +1154,12 @@ def execute_tool(name, arguments):
                 return "Sending email is disabled in this interface."
 
             if CONFIRMATION_MODE == "requires_confirmation":
-                pending_action = {
+                set_pending_action({
                     "type": "send_email",
                     "to": arguments["to"],
                     "subject": arguments["subject"],
                     "body": arguments["body"],
-                }
+                })
                 logger.info(f"Staged email to {arguments['to']}, awaiting out-of-band confirmation")
                 return (
                     f"Email to {arguments['to']} (subject: '{arguments['subject']}') is staged and "
@@ -1126,7 +1191,7 @@ def execute_tool(name, arguments):
                 return "Deleting files is disabled in this interface."
 
             if CONFIRMATION_MODE == "requires_confirmation":
-                pending_action = {"type": "github_delete", "path": arguments["path"]}
+                set_pending_action({"type": "github_delete", "path": arguments["path"]})
                 logger.info(f"Staged GitHub delete of {arguments['path']}, awaiting confirmation")
                 return (
                     f"Deleting {arguments['path']} from GitHub is staged and waiting for your "
@@ -1173,11 +1238,11 @@ def execute_tool(name, arguments):
             overwrite_note = f" This will OVERWRITE the existing files/{arguments['filename']}." if file_exists else ""
 
             if CONFIRMATION_MODE == "requires_confirmation":
-                pending_action = {
+                set_pending_action({
                     "type": "write_file",
                     "filename": arguments["filename"],
                     "content": arguments["content"],
-                }
+                })
                 logger.info(f"Staged write to {arguments['filename']}, awaiting out-of-band confirmation")
                 return (
                     f"Write to files/{arguments['filename']} is staged and waiting for your "
@@ -1484,12 +1549,13 @@ def ask_specialist(specialist_key, prompt, record_history=True):
     )
 
     if record_history:
-        conversation_history.append({
+        history = get_history()
+        history.append({
             "role": "user",
             "content": f"Asked {profile['label']}: {prompt}"
         })
 
-        conversation_history.append({
+        history.append({
             "role": "assistant",
             "content": answer
         })
@@ -1510,12 +1576,13 @@ def ask_manager(prompt):
         max_iterations=MAX_MANAGER_TOOL_ITERATIONS, model=FAST_MODEL
     )
 
-    # The Manager owns the conversation_history record (using the user's literal
-    # message), not the delegated specialist/general assistant, so /history always
-    # reflects what the user actually typed rather than the Manager's tool-call
-    # phrasing of the delegated task.
-    conversation_history.append({"role": "user", "content": prompt})
-    conversation_history.append({"role": "assistant", "content": answer})
+    # The Manager owns the history record (using the user's literal message), not
+    # the delegated specialist/general assistant, so /history always reflects what
+    # the user actually typed rather than the Manager's tool-call phrasing of the
+    # delegated task.
+    history = get_history()
+    history.append({"role": "user", "content": prompt})
+    history.append({"role": "assistant", "content": answer})
     store_memory(f"User said: {prompt}\nAssistant replied: {answer[:200]}", source="chat")
 
     print()
@@ -1523,6 +1590,63 @@ def ask_manager(prompt):
     print(answer)
 
     return answer
+
+
+# Keys select_group_responders may return: every specialist, plus the general
+# assistant and the manager (for genuinely multi-step/coordination requests).
+GROUP_RESPONDER_KEYS = list(SPECIALISTS.keys()) + ["general", "manager"]
+
+_GROUP_ROUTER_INSTRUCTIONS = """
+You are a silent router for a team group chat. You never talk to the user - you only
+decide which teammate(s) should reply to a message, based on their expertise:
+""" + "".join(
+    f"- {key}: {SPECIALISTS[key]['label']}\n" for key in SPECIALISTS
+) + """- general: anything unspecialized, smalltalk, or general questions
+- manager: ONLY when the request genuinely needs several teammates coordinated in
+  sequence (e.g. "look up X, then draft a note about it"), or is too ambiguous to
+  route to one teammate
+
+Reply with ONLY a JSON object: {"responders": ["<key>", ...]}. Usually pick exactly
+one key. Pick two only when the message clearly spans two teammates' areas. Use
+"manager" alone for multi-step coordination. Never include "manager" alongside others.
+"""
+
+
+def select_group_responders(text):
+    """Pick which agent(s) should answer a plain group message. Returns a list of
+    keys from GROUP_RESPONDER_KEYS. Falls back to ["manager"] (today's behavior) on
+    any model or parse error, so a routing glitch never drops the message."""
+    try:
+        response = call_with_retries(
+            lambda: client.responses.create(
+                model=FAST_MODEL,
+                instructions=_GROUP_ROUTER_INSTRUCTIONS,
+                input=[{"role": "user", "content": text}],
+            ),
+            label="Group router call",
+        )
+        raw = response.output_text.strip()
+
+        # The model may wrap JSON in prose or a ```json fence - grab the object.
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError(f"no JSON object in router output: {raw!r}")
+
+        parsed = json.loads(raw[start:end + 1])
+        responders = [k for k in parsed.get("responders", []) if k in GROUP_RESPONDER_KEYS]
+
+        if not responders:
+            raise ValueError(f"router returned no valid keys: {parsed!r}")
+
+        # "manager" is a coordination signal, not a co-responder - if present, it wins alone.
+        if "manager" in responders:
+            return ["manager"]
+
+        return responders
+
+    except Exception as e:
+        logger.error(f"Group router failed, falling back to manager: {e}")
+        return ["manager"]
 
 
 def handle_command(user_prompt):
@@ -1541,7 +1665,7 @@ def handle_command(user_prompt):
         return True
 
     if command == "/clear":
-        conversation_history.clear()
+        get_history().clear()
         print("Conversation memory cleared.")
         return True
 

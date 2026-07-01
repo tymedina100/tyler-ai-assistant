@@ -121,18 +121,62 @@ locks = {key: asyncio.Lock() for key in BOT_KEYS}
 main_loop = None
 
 
-def is_real_human_message(update):
+def is_authorized(update):
+    """True only for a real (non-bot) sender on the allowlist. No longer restricts
+    to the group - private DMs from an allowed user are now first-class (see
+    chat_kind). The bot-sender check is what still prevents reply loops."""
     user = update.effective_user
 
     if user is None or user.is_bot:
         return False  # never react to another bot - this is what prevents reply loops
 
-    if update.effective_chat.id != GROUP_CHAT_ID:
-        return False  # ignore private DMs to any bot entirely
-
     if user.id not in ALLOWED_USER_IDS:
-        main.logger.warning(f"Rejected group message from unauthorized Telegram user {user.id}")
+        main.logger.warning(f"Rejected message from unauthorized Telegram user {user.id}")
         return False
+
+    return True
+
+
+def chat_kind(update):
+    """Where a message came from: "group" (the shared team chat), "private" (a 1:1
+    DM with whichever bot received it), or "other" (some group we don't serve)."""
+    chat = update.effective_chat
+    if chat.id == GROUP_CHAT_ID:
+        return "group"
+    if chat.type == "private":
+        return "private"
+    return "other"
+
+
+async def post_agent_answer_to_group(key, answer):
+    """Post an agent's answer to the group under its own bot identity, falling back
+    to Miles for agents that don't have their own bot yet (e.g. Quill/Robin).
+    Chunked so a long answer isn't silently dropped (see send_chunks below)."""
+    bot = bots.get(key, bots["manager"])
+    await send_chunks(bot, GROUP_CHAT_ID, answer)
+
+
+async def _handle_pending_confirmation(update, text):
+    """If the CURRENT conversation (main.set_conversation must already be called for
+    this chat) has a sensitive action staged, resolve it with this message - /confirm
+    runs it, anything else cancels - and return True. Returns False if nothing was
+    staged, so the caller proceeds with normal handling. Per-chat, so a write staged
+    while DMing one agent is never confirmed or cancelled by a message elsewhere."""
+    pending = main.get_pending_action()
+    if pending is None:
+        return False
+
+    main.clear_pending_action()  # resolved either way - confirm or cancel
+    description = main.describe_pending_action(pending)
+
+    if text.strip() == "/confirm":
+        # confirm_pending_action can do blocking I/O (Gmail send) - keep it off the loop.
+        result = await asyncio.to_thread(main.confirm_pending_action, pending)
+        main.logger.info(f"Telegram user {update.effective_user.id} confirmed {description}")
+        await reply_chunks(update.message, result)
+    else:
+        main.logger.info(f"Telegram user {update.effective_user.id} cancelled {description}")
+        await update.message.reply_text(f"Cancelled the {description}.")
 
     return True
 
@@ -161,30 +205,49 @@ async def send_chunks(bot, chat_id, text):
 
 def build_specialist_handler(key):
     async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not is_real_human_message(update):
+        if not is_authorized(update):
             return
 
+        kind = chat_kind(update)
         text = update.message.text
-        mention = f"@{bot_usernames[key]}"
-        main.logger.info(f"[{key}] handler received: {text!r} (looking for {mention!r})")
 
-        if mention.lower() not in text.lower():
-            return  # not addressed to this bot
+        if kind == "group":
+            # In the group, a specialist only answers when explicitly @mentioned;
+            # plain group messages are auto-routed by the manager bot's handler.
+            mention = f"@{bot_usernames[key]}"
+            if mention.lower() not in text.lower():
+                return  # not addressed to this bot
 
-        main.logger.info(f"[{key}] mention matched - processing")
+            main.logger.info(f"[{key}] mention matched - processing")
+            request = re.sub(re.escape(mention), "", text, count=1, flags=re.IGNORECASE).strip()
+            conv_id = "group"
 
-        stripped = re.sub(re.escape(mention), "", text, count=1, flags=re.IGNORECASE).strip()
+        elif kind == "private":
+            # A 1:1 DM with this specialist's own bot: every message is for this
+            # specialist, no @mention needed. Its own conversation thread + memory.
+            request = text.strip()
+            conv_id = f"dm:{key}:{update.effective_user.id}"
 
-        if stripped == "" or stripped == "/start":
+        else:
+            return  # some group we don't serve
+
+        if request in ("", "/start"):
             await update.message.reply_text(AGENT_INFO[key]["welcome"])
             return
 
         try:
             async with locks[key]:
-                # record_history defaults to True - this conversation gets
-                # logged to conversation_history/long-term memory exactly like
-                # /code etc. already do, even though the Manager wasn't involved.
-                answer = await asyncio.to_thread(main.ask_specialist, key, stripped)
+                # Point this turn at the right conversation so history, memory, and any
+                # staged confirmation are scoped to this exact chat (group vs. this DM).
+                main.set_conversation(conv_id)
+                main.set_reply_context({"kind": "group" if kind == "group" else "specialist_dm"})
+
+                # Resolve a sensitive action staged earlier in THIS chat first (e.g. you
+                # replied /confirm to Patch in his DM to approve a file write he staged).
+                if await _handle_pending_confirmation(update, request):
+                    return
+
+                answer = await asyncio.to_thread(main.ask_specialist, key, request)
         except Exception as e:
             main.logger.error(f"Unhandled error in {key} specialist handler: {e}")
             await update.message.reply_text("Sorry, something went wrong processing that.")
@@ -198,9 +261,25 @@ def build_specialist_handler(key):
 
 
 async def handle_manager_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_real_human_message(update):
+    """The manager bot receives both the group's plain messages (which it now
+    auto-routes to the right teammate instead of always answering itself) and its
+    own 1:1 DMs (where Miles dispatches and the dispatched agents answer you
+    directly)."""
+    if not is_authorized(update):
         return
 
+    kind = chat_kind(update)
+    if kind == "group":
+        await handle_group_message(update)
+    elif kind == "private":
+        await handle_manager_dm(update)
+    # else: some group we don't serve - ignore
+
+
+async def handle_group_message(update: Update):
+    """A plain message in the group. Instead of Miles gatekeeping every reply, a
+    lightweight router picks the best-fit teammate(s), who answer as themselves.
+    Only genuinely multi-step/coordination requests go to Miles to orchestrate."""
     text = update.message.text
     lowered = text.lower()
 
@@ -212,46 +291,93 @@ async def handle_manager_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(AGENT_INFO["manager"]["welcome"])
         return
 
-    if main.pending_action is not None:
-        async with locks["manager"]:
-            pending = main.pending_action
-            main.pending_action = None  # resolved either way - confirm or cancel
-            description = main.describe_pending_action(pending)
+    async with locks["manager"]:
+        main.set_conversation("group")
+        main.set_reply_context({"kind": "group"})
 
-            if text.strip() == "/confirm":
-                # confirm_pending_action can do blocking I/O (Gmail send) - run it
-                # off the event loop so polling isn't stalled.
-                result = await asyncio.to_thread(main.confirm_pending_action, pending)
-                main.logger.info(f"Telegram user {update.effective_user.id} confirmed {description}")
-                await update.message.reply_text(result)
-            else:
-                main.logger.info(f"Telegram user {update.effective_user.id} cancelled {description}")
-                await update.message.reply_text(f"Cancelled the {description}.")
+        # A /confirm (or cancel) for something staged in the group is resolved here.
+        if await _handle_pending_confirmation(update, text):
+            return
+
+        try:
+            responders = await asyncio.to_thread(main.select_group_responders, text)
+        except Exception as e:
+            main.logger.error(f"Group router error, falling back to Miles: {e}")
+            responders = ["manager"]
+
+        main.logger.info(f"Group router picked: {responders}")
+
+        if responders == ["manager"]:
+            # Multi-step/coordination request - Miles runs the delegation chain; each
+            # delegated agent's answer is posted to the group as itself by on_delegation,
+            # then Miles's recap is posted here.
+            try:
+                answer = await asyncio.to_thread(main.ask_manager, text)
+            except Exception as e:
+                main.logger.error(f"Unhandled error in manager handler: {e}")
+                await update.message.reply_text("Sorry, something went wrong processing that.")
+                return
+            await reply_chunks(update.message, answer)
+            return
+
+        # Otherwise the chosen teammate(s) answer directly, each as themselves.
+        for key in responders:
+            try:
+                if key == "general":
+                    answer = await asyncio.to_thread(main.ask_ai, text)
+                else:
+                    answer = await asyncio.to_thread(main.ask_specialist, key, text)
+            except Exception as e:
+                main.logger.error(f"Error while '{key}' answered a group message: {e}")
+                continue
+            await post_agent_answer_to_group(key, answer)
+
+
+async def handle_manager_dm(update: Update):
+    """A 1:1 DM with Miles. He dispatches the right agents; each dispatched agent
+    DMs you their answer directly (see on_delegation's manager_dm branch), and Miles
+    also recaps here - so a result reaches both you and the manager, like real
+    coworkers reporting back."""
+    text = update.message.text
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if text.strip() == "/start":
+        await update.message.reply_text(AGENT_INFO["manager"]["welcome"])
         return
 
-    try:
-        async with locks["manager"]:
+    async with locks["manager"]:
+        main.set_conversation(f"dm:manager:{user_id}")
+        main.set_reply_context({"kind": "manager_dm", "user_id": user_id, "chat_id": chat_id})
+
+        if await _handle_pending_confirmation(update, text):
+            return
+
+        try:
             answer = await asyncio.to_thread(main.ask_manager, text)
-    except Exception as e:
-        main.logger.error(f"Unhandled error in manager handler: {e}")
-        await update.message.reply_text("Sorry, something went wrong processing that.")
-        return
+        except Exception as e:
+            main.logger.error(f"Unhandled error in manager DM handler: {e}")
+            await update.message.reply_text("Sorry, something went wrong processing that.")
+            return
 
-    # See the matching comment in build_specialist_handler - chunk long answers so
-    # a big relay (e.g. Patch's multi-file change) isn't silently dropped.
     await reply_chunks(update.message, answer)
 
 
 def on_delegation(specialist_key, request_text, answer_text):
-    """Posts the delegation + the specialist's answer to the group as that
-    specialist's own bot, for visibility. Called from execute_tool (main.py),
-    which runs on a worker thread (via asyncio.to_thread in the handlers
-    above) - so this hands the actual Telegram calls back to the event loop
-    thread safely via run_coroutine_threadsafe rather than awaiting directly."""
+    """Posts a dispatched agent's answer where the current turn wants it. Called from
+    execute_tool (main.py) on a worker thread, so it hands the actual Telegram calls
+    back to the event loop via run_coroutine_threadsafe. The reply context (set by the
+    handler that started this turn) decides the destination:
+      - group:      Miles announces the hand-off and the agent posts its answer, both
+                    to the group, as their own bots (unchanged group behavior).
+      - manager_dm: the agent DMs the user directly as itself; if it has no bot yet or
+                    the user never opened its DM (Telegram blocks a cold first message),
+                    Miles relays the answer (labeled) in the manager DM instead."""
+    ctx = main.current_reply_context() or {"kind": "group"}
     label = "General Assistant" if specialist_key == "general" else main.SPECIALISTS[specialist_key]["label"]
     target_bot = bots.get(specialist_key, bots["manager"])
 
-    async def post():
+    async def post_group():
         try:
             if specialist_key != "general":
                 await send_chunks(bots["manager"], GROUP_CHAT_ID, f"Delegating to the {label}: {request_text}")
@@ -259,7 +385,23 @@ def on_delegation(specialist_key, request_text, answer_text):
         except Exception as e:
             main.logger.error(f"Failed to post delegation visibility message: {e}")
 
-    asyncio.run_coroutine_threadsafe(post(), main_loop)
+    async def post_dm():
+        user_id = ctx["user_id"]
+        has_own_bot = specialist_key != "general" and specialist_key in bots
+        if has_own_bot:
+            try:
+                # A user's private chat id equals their Telegram user id.
+                await send_chunks(target_bot, user_id, answer_text)
+                return
+            except Exception as e:
+                main.logger.info(f"'{specialist_key}' couldn't DM the user directly ({e}); Miles will relay.")
+        try:
+            await send_chunks(bots["manager"], ctx["chat_id"], f"{label} says:\n{answer_text}")
+        except Exception as e:
+            main.logger.error(f"Failed to relay delegation answer in the manager DM: {e}")
+
+    coro = post_dm() if ctx.get("kind") == "manager_dm" else post_group()
+    asyncio.run_coroutine_threadsafe(coro, main_loop)
 
 
 # --------------------------------------------------------------------------- #

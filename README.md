@@ -37,8 +37,10 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
 - A Telegram bot interface so you can message the assistant from your phone, with
   a Dockerfile for deploying it somewhere that runs 24/7 — see "Running 24/7" below
 - A multi-bot Telegram group interface where every agent is its own real bot with
-  its own personality, all in one shared chat with you — see "Running the multi-bot
-  group interface" below
+  its own personality, all in one shared chat with you — plain group messages are
+  auto-routed to the best-fit teammate(s) (no Manager gatekeeping), and you can also
+  message any agent privately 1:1, including DMing Miles to dispatch the team — see
+  "Running the multi-bot group interface" below
 
 ## Setup
 
@@ -568,18 +570,30 @@ python group_bot.py
 ```
 
 **How it behaves:**
-- Message the group normally (no `@mention`) and the **Manager** picks it up, decides
-  which agent(s) to delegate to, and posts the delegation + each agent's answer as
-  real messages from the right bot identities — not just a debug log line.
-- `@mention` any agent directly (e.g. `@YourResearchBot what's...`) to skip the
-  Manager entirely and talk to that agent one-on-one, right in the group.
-- Confirmations for sensitive actions (a `write_file` **or** a Gmail `send_email`)
-  always go through the **Manager**, regardless of which agent staged it (a direct
-  `@mention` conversation or a Manager delegation) — reply `/confirm` as a plain
-  message, not addressed to anyone specifically.
-- Every bot ignores messages from other bots (prevents reply loops — with privacy
-  mode off, every bot technically sees every message, including ones other bots
-  post) and ignores anything outside the configured group, including private DMs.
+- Message the group normally (no `@mention`) and a lightweight **router** picks the
+  best-fit teammate(s), who reply **as themselves** — the Manager is no longer a
+  mandatory mouthpiece. Miles only steps in to orchestrate when a request genuinely
+  needs several teammates in sequence (e.g. "look up the weather, then draft a note
+  about it"); then he dispatches and recaps, as before.
+- `@mention` any agent directly (e.g. `@YourResearchBot what's...`) to talk to exactly
+  that agent, right in the group — this skips the router entirely.
+- **Message any agent privately (1:1 DM).** Open a DM with a specialist's bot and just
+  talk — no `@mention` needed; every message goes to that specialist, in its own
+  conversation thread separate from the group. DM **Miles** to get something done and
+  he'll dispatch the right teammates; each dispatched agent **DMs you their answer
+  directly** (as themselves) and Miles also recaps in your Miles DM — so results reach
+  both you and the manager, like real coworkers reporting back.
+  - For an agent to DM you, it needs its own bot (in `BOT_KEYS`) **and** you must have
+    opened a chat with that bot once — Telegram won't let a bot cold-message you. Until
+    you do, Miles relays that agent's answer in your Miles DM as a fallback.
+- Each chat (the group and every DM) keeps its **own short-term conversation thread**,
+  but they all share the one long-term memory/knowledge store.
+- Confirmations for sensitive actions (a `write_file` **or** a Gmail `send_email`) are
+  resolved **in the chat where they were staged**: reply `/confirm` in that DM (or in
+  the group, to Miles) to approve, anything else to cancel.
+- Every bot ignores messages from other bots (prevents reply loops — with privacy mode
+  off, every bot technically sees every message, including ones other bots post) and
+  ignores any chat that isn't the configured group or an allowed user's private DM.
 
 **Deploying it:**
 
