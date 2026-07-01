@@ -1121,6 +1121,9 @@ def execute_tool(name, arguments):
         if name == "get_weather":
             return get_weather(arguments["location"])
 
+        if name == "get_crypto_price":
+            return get_crypto_price(arguments["asset"], arguments.get("vs_currency", "usd"))
+
         if name == "run_python":
             return run_python(arguments["code"])
 
