@@ -204,6 +204,33 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(state["company"]["spent_today_usd"], 1.5)
         self.assertIn("file: files/n.txt", company_mode.active_project(state)["artifacts"])
 
+    def test_prior_work_summary_chains_completed_tasks(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project = company_mode.active_project(state)
+        tasks = company_mode.project_tasks(state, project["id"])
+        first, second = tasks[0], tasks[1]
+
+        company_mode.update_task_status(
+            first["id"], "done", result="Found strong demand from freelancers.",
+            artifacts=["file: files/pack.md"], path=self.state_path,
+        )
+        state = company_mode.load_state(self.state_path)
+        summary = company_mode.prior_work_summary(state, project["id"], second["id"])
+
+        # The completed task's result + deliverable are handed forward...
+        self.assertIn("Found strong demand", summary)
+        self.assertIn("file: files/pack.md", summary)
+        # ...but a still-planned task contributes nothing yet.
+        self.assertNotIn(second["title"], summary)
+
+    def test_prior_work_summary_empty_when_nothing_done(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project = company_mode.active_project(state)
+        first = company_mode.project_tasks(state, project["id"])[0]
+        self.assertEqual(company_mode.prior_work_summary(state, project["id"], first["id"]), "")
+
     def test_record_delegation_can_meter_spend(self):
         self._assign(configured=("manager", "research"))
         company_mode.record_delegation(

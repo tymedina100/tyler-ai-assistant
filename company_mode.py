@@ -401,6 +401,27 @@ def project_tasks(state, project_id):
     return [task for task in state.get("tasks", []) if task.get("project_id") == project_id]
 
 
+def prior_work_summary(state, project_id, current_task_id, limit_chars=1500):
+    """A compact summary of what earlier tasks in this project already produced, so
+    the next agent can build on it instead of duplicating it. Includes each completed
+    task's owner, title, result (truncated), and any deliverables. Excludes the task
+    being run now. Returns "" when nothing is done yet."""
+    lines = []
+    for task in project_tasks(state, project_id):
+        if task["id"] == current_task_id or task["status"] not in {"done", "shipped"}:
+            continue
+        result = (task.get("result") or "").strip()
+        if len(result) > limit_chars:
+            result = result[:limit_chars] + " ...[truncated]"
+        block = f"- {task['owner']} ({task['title']})"
+        if result:
+            block += f":\n  Result: {result}"
+        if task.get("artifacts"):
+            block += f"\n  Deliverables: {', '.join(task['artifacts'])}"
+        lines.append(block)
+    return "\n".join(lines)
+
+
 def render_money(state):
     company = state["company"]
     return (

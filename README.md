@@ -445,7 +445,9 @@ the CEO/founder and Miles acts as COO. It stores state in `company_state.json`
    reserves budget for it, and **proposes** it. Nothing runs yet.
 3. `/approve` — kicks off the execution engine. Agents work the plan **one task at a
    time**, each replying as themselves, and every finished task is linked to a real
-   **deliverable** (a `files/` path, a GitHub file/PR URL, or saved copy).
+   **deliverable** (a `files/` path, a GitHub file/PR URL, or saved copy). Each task is
+   handed the **previous tasks' results and deliverables**, so agents build on one
+   another (research → build → copy) instead of duplicating each other's work.
 4. `/dailyreport` — shipped/open/blocked work, the artifacts produced, and the next move.
 
 Commands in the group:
