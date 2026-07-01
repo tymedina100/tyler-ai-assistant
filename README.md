@@ -157,7 +157,8 @@ Agent** instead of talking to one fixed assistant. The Manager's job is to read 
 message and get it done by delegating — via tool calls, exactly like the other tools
 in this app — to whichever agent(s) fit best:
 
-- One of the six specialists (`code`, `research`, `write`, `task`, `tasks`, `weather`)
+- One of the specialists (`code`, `research`, `news`, `write`, `task`, `tasks`,
+  `weather`, `crypto`, `calendar`, `gmail`)
 - The **general assistant** (the same all-purpose, all-tools assistant from Week 4),
   for anything that doesn't clearly fit a specialist
 
