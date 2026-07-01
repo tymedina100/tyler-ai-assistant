@@ -132,7 +132,11 @@ MAX_HISTORY_MESSAGES = 20
 # stays unfiltered on purpose (it's the tool for seeing raw distances).
 MEMORY_DISTANCE_THRESHOLD = 1.2
 
-MAX_TOOL_ITERATIONS = 5
+# Default tool-call budget per turn for ask_ai/ask_specialist. 5 was too tight now
+# that agents do real multi-tool work - the Researcher in particular runs several
+# searches (plus recalls) and would hit the cap and return the "too many tool calls"
+# fallback mid-answer. Patch overrides this higher still (see its max_iterations).
+MAX_TOOL_ITERATIONS = 10
 # The Manager is the only caller expected to make several substantive tool
 # calls in one turn by design now (one delegation per agent in a chain) -
 # give it more headroom than ask_ai/ask_specialist's unchanged default.
