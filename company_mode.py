@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import uuid
 from copy import deepcopy
@@ -7,7 +8,15 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).parent
-COMPANY_STATE_FILE = BASE_DIR / "company_state.json"
+
+
+def _data_dir():
+    """Directory for persistent state. Set DATA_DIR (e.g. a mounted volume on Railway)
+    so company_state.json survives redeploys; defaults to the project dir locally."""
+    return Path(os.environ.get("DATA_DIR") or BASE_DIR)
+
+
+COMPANY_STATE_FILE = _data_dir() / "company_state.json"
 
 # Fresh state starts on a $5/day budget so a brand-new deploy can run a small plan
 # without needing /setbudget first. Change it live any time with /setbudget <amount>.

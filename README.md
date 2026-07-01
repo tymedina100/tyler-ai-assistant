@@ -745,10 +745,19 @@ docker run --env-file .env ai-assistant-group-bot
 
 Not build-tested in this environment (no Docker available here) — verify it builds
 and runs for you first. Same deployment shape as `bot.py`: a **background worker**
-(not a web service, since it doesn't listen on a port). Mount a **persistent volume**
-so state survives redeploys — this now covers not just `/app/memory_db` (long-term
-memory) but also `/app/reminders.json` (pending reminders), `/app/company_state.json`
-(Company Mode), and `/app/token.json` (your Google login); without persistence those reset on every deploy. Set the
+(not a web service, since it doesn't listen on a port).
+
+**Persistence — mount ONE volume and set `DATA_DIR`.** A plain container's filesystem
+is wiped on every redeploy, so long-term memory, pending reminders, Company Mode state,
+and the Google token all reset unless you persist them. The app reads a `DATA_DIR` env
+var and writes all of that under it:
+
+1. On Railway (or your platform), **attach a volume** with mount path `/app/data`.
+2. Set the env var **`DATA_DIR=/app/data`**.
+
+That's it — `memory_db/`, `reminders.json`, `company_state.json`, and `token.json` now
+live on the volume and survive redeploys. Without `DATA_DIR`, everything defaults to the
+project directory (fine locally, ephemeral in a container). Then set the
 required group tokens you're using (`TELEGRAM_MANAGER_BOT_TOKEN`,
 `TELEGRAM_GROUP_CHAT_ID`, etc.) plus `OPENAI_API_KEY`. Add
 `TAVILY_API_KEY`/`OPENWEATHER_API_KEY`/`TODOIST_API_TOKEN` only for web search,

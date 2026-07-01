@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,17 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(state["company"]["daily_budget_usd"], company_mode.DEFAULT_DAILY_BUDGET_USD)
         self.assertEqual(state["projects"], [])
         self.assertEqual(state["tasks"], [])
+
+    def test_data_dir_honors_env_override(self):
+        original = os.environ.pop("DATA_DIR", None)
+        try:
+            self.assertEqual(company_mode._data_dir(), company_mode.BASE_DIR)
+            os.environ["DATA_DIR"] = self.tmpdir.name
+            self.assertEqual(company_mode._data_dir(), Path(self.tmpdir.name))
+        finally:
+            os.environ.pop("DATA_DIR", None)
+            if original is not None:
+                os.environ["DATA_DIR"] = original
 
     def test_set_budget_and_assign_goal_reserves_budget(self):
         result = company_mode.set_daily_budget(20, self.state_path)

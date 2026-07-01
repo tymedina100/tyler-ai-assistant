@@ -21,12 +21,13 @@ COPY files/ ./files/
 COPY assets/ ./assets/
 COPY scripts/ ./scripts/
 
-# memory_db/ (long-term memory), reminders.json (pending reminders),
-# company_state.json (Company Mode), and assistant.log are created here at
-# runtime. A plain container's filesystem is wiped on every restart/redeploy -
-# mount a persistent volume so state survives: /app/memory_db,
-# /app/reminders.json, /app/company_state.json, plus /app/token.json (your
-# Google login, provided as a secret/volume file - see README "Google setup").
-# See README for details.
+# Persistent state (long-term memory, reminders, Company Mode state, the Google
+# token) is created at runtime. A plain container's filesystem is wiped on every
+# restart/redeploy - so mount ONE persistent volume and point DATA_DIR at it:
+#   - attach a volume with mount path /app/data
+#   - set env var DATA_DIR=/app/data
+# The app then writes memory_db/, reminders.json, company_state.json, and token.json
+# under that volume, and they survive redeploys. Without DATA_DIR everything defaults
+# to /app (ephemeral). See README "Deploying it" for the exact Railway steps.
 
 CMD ["python", "group_bot.py"]
