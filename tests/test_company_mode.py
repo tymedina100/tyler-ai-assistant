@@ -151,6 +151,28 @@ class CompanyModeTests(unittest.TestCase):
             path=self.state_path,
         )
 
+    def test_assign_goal_accepts_dynamic_task_plan(self):
+        company_mode.set_daily_budget(20, self.state_path)
+        plan = [("research", "Validate the niche"), ("write", "Draft the sales copy")]
+        result = company_mode.assign_goal(
+            "Some goal", ["manager", "research", "write"],
+            specialist_keys=["research", "write"], path=self.state_path, tasks=plan,
+        )
+        state = company_mode.load_state(self.state_path)
+
+        self.assertIn("Company goal accepted", result)
+        self.assertEqual([t["owner"] for t in state["tasks"]], ["research", "write"])
+        self.assertEqual([t["title"] for t in state["tasks"]], ["Validate the niche", "Draft the sales copy"])
+        self.assertEqual(state["company"]["reserved_today_usd"], 2.0)  # 2 tasks x $1
+
+    def test_assign_goal_falls_back_to_default_when_no_plan(self):
+        company_mode.set_daily_budget(20, self.state_path)
+        company_mode.assign_goal(
+            "Some goal", ["manager"], specialist_keys=["code"], path=self.state_path, tasks=None,
+        )
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(len(state["tasks"]), len(company_mode.DEFAULT_ASSIGN_TASKS))
+
     def test_assigned_project_starts_proposed(self):
         self._assign()
         state = company_mode.load_state(self.state_path)
