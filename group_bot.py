@@ -359,6 +359,9 @@ async def handle_group_message(update: Update):
         if parsed_company and parsed_company[0] == "/revenue":
             await sync_and_report_revenue(update)
             return
+        if parsed_company and parsed_company[0] == "/launch":
+            await start_launch(update)
+            return
 
         company_response = company_mode.handle_company_command(
             text,
@@ -425,7 +428,7 @@ async def handle_manager_dm(update: Update):
 
         company_command = company_mode.parse_company_command(text)
         if company_command is not None:
-            if company_command[0] in {"/setbudget", "/assign", "/approve", "/cancel", "/publish", "/link", "/revenue", "/pausecompany", "/resumecompany"}:
+            if company_command[0] in {"/setbudget", "/assign", "/approve", "/cancel", "/publish", "/launch", "/link", "/revenue", "/pausecompany", "/resumecompany"}:
                 await update.message.reply_text(
                     "Company Mode changes happen in the group operating room. "
                     "Use /company, /status, or /dailyreport here for read-only context."
@@ -570,13 +573,18 @@ async def sync_and_report_revenue(update):
     product registry, and show the P&L. If the live pull fails (e.g. no token), still
     show the last-synced P&L plus why the pull was skipped."""
     products, err = await asyncio.to_thread(gumroad_helpers.list_products)
-    if err:
-        pnl = await asyncio.to_thread(company_mode.render_pnl)
-        await reply_chunks(update.message, f"{pnl}\n\n(Live Gumroad sync skipped: {err})")
-        return
-    await asyncio.to_thread(company_mode.sync_revenue, products)
+    note = f"\n\n(Live Gumroad sync skipped: {err})" if err else ""
+    if not err:
+        await asyncio.to_thread(company_mode.sync_revenue, products)
     pnl = await asyncio.to_thread(company_mode.render_pnl)
-    await reply_chunks(update.message, pnl)
+
+    # Miles reads the P&L and recommends the next move (only when there's data).
+    state = await asyncio.to_thread(company_mode.load_state)
+    if state.get("products"):
+        rec = await _run_metered(main.recommend_next_move, pnl)
+        pnl = f"{pnl}\n\n{rec}"
+
+    await reply_chunks(update.message, f"{pnl}{note}")
 
 
 def _task_prompt(project, task, prior_work=""):
@@ -875,6 +883,91 @@ async def run_publish(project, src_name, content):
 
 
 # --------------------------------------------------------------------------- #
+# Auto-draft distribution (/launch): draft launch posts + a launch email + image-
+# generation prompts for the product's visuals, grounded in the real deliverable.
+# --------------------------------------------------------------------------- #
+
+def _launch_prompt(slug, product_name, content):
+    return (
+        "You are drafting a LAUNCH KIT for a finished digital product. Use write_file to "
+        f'save ONE file named "{slug}-launch-kit.md" containing, clearly sectioned:\n'
+        "1. 2 LinkedIn posts - value-first, builder voice, not a hard ad - each ending with "
+        "the product link placeholder [LINK].\n"
+        "2. 2 short X/Twitter posts.\n"
+        "3. 1 launch email (subject line + body).\n"
+        "4. IMAGE PROMPTS - ready-to-paste text-to-image prompts (Canva/DALL-E style) for a "
+        "product COVER (16:9), a THUMBNAIL (1:1 square), and a SOCIAL CARD. Each prompt "
+        "should describe a clean, on-brand graphic with NO text/letters (the user adds the "
+        "title in Canva), and leave empty space for a headline.\n\n"
+        "Lead with value, keep everything tight, and ground it all in the actual product below.\n"
+        f"Product: {product_name}\n---\n{content}\n---"
+    )
+
+
+async def start_launch(update):
+    """Handle /launch: draft a launch kit (posts + email + image prompts) for the
+    active/most-recent project's finished deliverable."""
+    global company_runner_task
+    if company_runner_task and not company_runner_task.done():
+        await update.message.reply_text("Something's already running. Let it finish (or /cancel) before /launch.")
+        return
+
+    state = await asyncio.to_thread(company_mode.load_state)
+    project = company_mode.active_project(state) or (state["projects"][-1] if state.get("projects") else None)
+    if not project:
+        await update.message.reply_text("No project to launch yet. /assign and build something first.")
+        return
+
+    src_name, content = await asyncio.to_thread(_load_project_deliverable, state, project["id"])
+    if not content:
+        await update.message.reply_text("No finished deliverable to base a launch kit on. Run /approve first.")
+        return
+
+    company_runner_task = asyncio.create_task(run_launch(project, src_name, content))
+
+
+async def run_launch(project, src_name, content):
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", (src_name or project["title"]).rsplit(".", 1)[0]).strip("-")
+    sink = {"cost_usd": 0.0, "artifacts": [], "context": f"Launch kit for {project['id']}"}
+    prompt = _launch_prompt(slug, project["title"], content)
+
+    await post_to_group(f"Drafting a launch kit for '{project['title']}'...", "manager")
+
+    def work():
+        main.set_conversation("group")
+        main.set_reply_context({"kind": "group"})
+        main.set_execution_sink(sink)
+        main.set_company_execution(True)
+        try:
+            return main.ask_specialist("write", prompt, record_history=False)
+        finally:
+            main.set_company_execution(False)
+            main.set_execution_sink(None)
+
+    async with locks["manager"]:
+        try:
+            answer = await asyncio.to_thread(work)
+        except Exception as e:
+            main.logger.error(f"Launch kit failed: {e}")
+            await post_to_group("Launch kit drafting hit an error - check the logs.", "manager")
+            return
+
+    await post_agent_answer_to_group("write", answer)
+    try:
+        await asyncio.to_thread(company_mode.record_adhoc_spend, sink["cost_usd"], sink["artifacts"])
+    except Exception as e:
+        main.logger.error(f"Failed to record launch spend: {e}")
+
+    files = ", ".join(sink["artifacts"]) or "(see the message above)"
+    await post_to_group(
+        f"Launch kit ready for '{project['title']}'. Files: {files}\n"
+        "It has LinkedIn/X posts, a launch email, and image prompts for your cover, "
+        "thumbnail, and social card - paste those into Canva/an image generator.",
+        "manager",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Proactive scheduling: morning briefing, timed reminders, calendar event alerts.
 # The AsyncIOScheduler runs on the same event loop as the bots; job functions here
 # are coroutines, which APScheduler awaits directly.
@@ -917,6 +1010,13 @@ async def post_morning_briefing():
 
 async def post_daily_company_report():
     text = await asyncio.to_thread(company_mode.build_daily_report)
+    # If products are linked, append the P&L and Miles's next-move recommendation so
+    # the daily report is a real business review, not just a work log.
+    state = await asyncio.to_thread(company_mode.load_state)
+    if state.get("products"):
+        pnl = await asyncio.to_thread(company_mode.render_pnl)
+        rec = await _run_metered(main.recommend_next_move, pnl)
+        text = f"{text}\n\n{pnl}\n\n{rec}"
     await post_to_group(text, "manager")
 
 

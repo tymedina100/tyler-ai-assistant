@@ -1974,6 +1974,42 @@ Reply with ONLY a JSON object: {{"tasks": [{{"owner": "<agent key>", "title": "<
         return None
 
 
+NEXT_MOVE_FALLBACK = (
+    "Next move: if a product has sales, drive more traffic to it before building "
+    "anything new; if nothing's selling yet, ship one more small product for your "
+    "strongest audience. - Miles"
+)
+
+
+def recommend_next_move(pnl_summary):
+    """Given the company's product P&L, have Miles recommend ONE concrete next move
+    (build what, double down, sunset, or drive traffic). Returns a short string; a
+    plain heuristic fallback on any error so it never breaks a report."""
+    instructions = (
+        "You are Miles, a startup COO. Given the company's product P&L below, recommend "
+        "ONE concrete next move in 2-3 sentences: what to build, what to double down on, "
+        "what to sunset, or whether the priority is driving traffic to a product that "
+        "already sells. Be specific and decisive. Sign off '- Miles'."
+    )
+    try:
+        openai_client = get_openai_client()
+        response = call_with_retries(
+            lambda: openai_client.responses.create(
+                model=FAST_MODEL,
+                instructions=instructions,
+                input=[{"role": "user", "content": pnl_summary}],
+            ),
+            label="Next-move recommendation call",
+        )
+        _accrue_cost(FAST_MODEL, getattr(response, "usage", None))
+        text = (response.output_text or "").strip()
+        if text:
+            return text
+    except Exception as e:
+        logger.error(f"recommend_next_move failed: {e}")
+    return NEXT_MOVE_FALLBACK
+
+
 def handle_command(user_prompt):
     """Process one line of user input exactly like the CLI does: parse it as a
     command, print the result. Returns False on /quit, True otherwise - shared

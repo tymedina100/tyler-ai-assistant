@@ -38,6 +38,7 @@ COMPANY_COMMANDS = {
     "/approve",
     "/cancel",
     "/publish",
+    "/launch",
     "/link",
     "/products",
     "/revenue",
