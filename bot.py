@@ -8,8 +8,10 @@ main.py (ask_manager, the specialists, every tool) without duplicating it:
   (via contextlib.redirect_stdout) and relays it back as a Telegram message,
   instead of rewriting every function to return text.
 - write_file's y/n confirmation uses input(), which has no real terminal to
-  read from here - so this interface disables it via main.WRITE_FILE_ENABLED.
-  Everything else (read, search, memory, all four specialists) still works.
+  read from here - so this interface uses main.WRITE_FILE_MODE = "requires_
+  confirmation" instead: a write gets staged (main.pending_write) rather than
+  performed immediately, and the user confirms it with a follow-up "/confirm"
+  message, intercepted below before normal command handling.
 - A single asyncio.Lock() serializes message handling, so two messages never
   redirect stdout at the same time. Fine for a personal, single-user bot.
 """
@@ -47,8 +49,8 @@ if not ALLOWED_USER_IDS:
     )
 
 # This interface has no real terminal, so the write_file y/n confirmation
-# (which uses input()) can't work here - see WRITE_FILE_ENABLED in main.py.
-main.WRITE_FILE_ENABLED = False
+# (which uses input()) can't work here - see WRITE_FILE_MODE in main.py.
+main.WRITE_FILE_MODE = "requires_confirmation"
 
 WELCOME_MESSAGE = (
     "Hi! I'm Tyler's personal AI assistant, running on Telegram.\n\n"
@@ -56,7 +58,7 @@ WELCOME_MESSAGE = (
     "specialist, or use the same commands as the CLI version: /help, /code, "
     "/research, /write, /task, /remember, /recall, /search, /read, /askfile, "
     "/history, /clear.\n\n"
-    "Note: file writing is disabled over Telegram for now."
+    "Note: if I want to write a file, I'll ask you to reply /confirm first."
 )
 
 TELEGRAM_MESSAGE_LIMIT = 4000
@@ -82,6 +84,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text.strip().lower() in ("quit", "/quit"):
         await update.message.reply_text("This bot runs continuously - there's no need to quit, I'm always here.")
+        return
+
+    if main.pending_write is not None:
+        async with processing_lock:
+            pending = main.pending_write
+            main.pending_write = None  # resolved either way - confirm or cancel
+
+            if text.strip() == "/confirm":
+                result = main.write_file(pending["filename"], pending["content"])
+                main.logger.info(f"Telegram user {user_id} confirmed write to {pending['filename']}")
+                await update.message.reply_text(result)
+            else:
+                main.logger.info(f"Telegram user {user_id} cancelled pending write to {pending['filename']}")
+                await update.message.reply_text(f"Cancelled the write to files/{pending['filename']}.")
         return
 
     try:

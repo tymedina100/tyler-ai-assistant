@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -7,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 import chromadb
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 from tavily import TavilyClient
@@ -39,11 +41,20 @@ load_dotenv()
 client = OpenAI()
 tavily_client = TavilyClient()
 
+TODOIST_API_TOKEN = os.environ["TODOIST_API_TOKEN"]
+TODOIST_HEADERS = {"Authorization": f"Bearer {TODOIST_API_TOKEN}"}
+
+OPENWEATHER_API_KEY = os.environ["OPENWEATHER_API_KEY"]
+
 conversation_history = []
 
 MODEL_NAME = "gpt-5.5"
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 MAX_TOOL_ITERATIONS = 5
+# The Manager is the only caller expected to make several substantive tool
+# calls in one turn by design now (one delegation per agent in a chain) -
+# give it more headroom than ask_ai/ask_specialist's unchanged default.
+MAX_MANAGER_TOOL_ITERATIONS = 8
 
 TOOLS = [
     {"type": "function", "name": "read_file", "strict": False,
@@ -61,6 +72,15 @@ TOOLS = [
     {"type": "function", "name": "write_file", "strict": False,
      "description": "Create or overwrite a file in the sandboxed files/ folder with given text content.",
      "parameters": {"type": "object", "properties": {"filename": {"type": "string"}, "content": {"type": "string"}}, "required": ["filename", "content"]}},
+    {"type": "function", "name": "create_task", "strict": False,
+     "description": "Create a new task in the user's real Todoist task list.",
+     "parameters": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+    {"type": "function", "name": "list_tasks", "strict": False,
+     "description": "List the user's current open tasks from their real Todoist account.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "get_weather", "strict": False,
+     "description": "Get the current weather for a location.",
+     "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}},
 ]
 
 DELEGATION_TOOLS = [
@@ -74,8 +94,14 @@ DELEGATION_TOOLS = [
      "description": "Delegate a writing, drafting, or editing request to the Writer Agent.",
      "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
     {"type": "function", "name": "delegate_to_personal_assistant", "strict": False,
-     "description": "Delegate a personal note, reminder, preference, or to-do request to the Personal Assistant Agent.",
+     "description": "Delegate remembering a personal fact, reminder, or preference in long-term memory to the Personal Assistant Agent. This is NOT a real task-tracking app - for actual to-do items in the user's Todoist account, use delegate_to_tasks_agent instead.",
      "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
+    {"type": "function", "name": "delegate_to_tasks_agent", "strict": False,
+     "description": "Delegate creating or checking actual to-do items in the user's real Todoist account to the Tasks Agent. Use this for real tasks, not general reminders or preferences (that's delegate_to_personal_assistant).",
+     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
+    {"type": "function", "name": "delegate_to_weather_agent", "strict": False,
+     "description": "Delegate a current weather lookup for a location to the Weather Agent.",
+     "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}},
     {"type": "function", "name": "delegate_to_general_assistant", "strict": False,
      "description": "Delegate anything that doesn't clearly fit a specialist to the General Assistant.",
      "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
@@ -96,18 +122,36 @@ Keep explanations clear and concise.
 """
 
 MANAGER_INSTRUCTIONS = """
-You are a manager agent. Your only job is to read the user's request and delegate
-it to exactly one of the following agents using a tool call - never answer the
-user directly yourself:
+You are a manager agent. Your job is to read the user's request and get it done
+by delegating to one or more of the following agents using tool calls - never
+answer the user directly yourself:
 - delegate_to_coding_agent: programming, code-writing, code-reading, or debugging
 - delegate_to_research_agent: looking up information, facts, or current events
 - delegate_to_writer_agent: drafting, editing, or improving written content
-- delegate_to_personal_assistant: reminders, personal notes, preferences, to-do lists
-- delegate_to_general_assistant: anything else, or simple questions that don't fit
-  a specialist
-After the agent responds, present its answer back to the user as your final
-answer. Do not significantly rewrite it - relay it, with at most one short
-framing sentence.
+- delegate_to_personal_assistant: remembering personal facts, preferences, and
+  reminders in long-term memory - NOT a real task-tracking app
+- delegate_to_tasks_agent: creating or checking actual to-do items in the user's
+  real Todoist account - not general reminders or preferences (that's
+  delegate_to_personal_assistant)
+- delegate_to_weather_agent: current weather for a location
+- delegate_to_general_assistant: anything else, or simple questions that don't
+  fit a specialist
+
+Most requests need only one delegation. Some requests genuinely need more than
+one agent working in sequence - for example "look up the weather, then write me
+a note about it" requires delegating to the Weather Agent first, then to the
+Writer Agent with the weather result included in the prompt you give it. When a
+request needs more than one step:
+- Delegate one step at a time, in the order that makes sense.
+- After each agent responds, use its answer as part of the input you give the
+  next agent - quote or summarize the relevant findings directly in that next
+  tool call's argument, since the next agent cannot see prior delegations on
+  its own.
+- Never let one agent call another directly - every handoff goes through you.
+
+Once all needed delegations are done, present the final result back to the user
+as your final answer. Do not significantly rewrite a specialist's own answer -
+relay it, with at most one short framing sentence.
 """
 
 
@@ -173,11 +217,11 @@ Current message:
 """
 
 
-def run_with_tools(instructions, input_items, tools):
+def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITERATIONS):
     assistant_response = "Sorry, I tried too many tool calls without finishing. Please try rephrasing."
 
     try:
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for _ in range(max_iterations):
             response = call_with_retries(
                 lambda: client.responses.create(
                     model=MODEL_NAME,
@@ -379,6 +423,84 @@ User question:
     print(answer)
 
 
+def create_task(content):
+    try:
+        # Todoist's REST API v2 (/rest/v2/...) is deprecated as of this writing -
+        # confirmed directly against the real API, not assumed from documentation,
+        # since it returned a 410 Gone pointing to the newer /api/v1/ endpoints.
+        response = call_with_retries(
+            lambda: requests.post(
+                "https://api.todoist.com/api/v1/tasks",
+                headers=TODOIST_HEADERS,
+                json={"content": content},
+                timeout=10
+            ),
+            label="Todoist create task call"
+        )
+
+        if response.status_code != 200:
+            return f"Could not create task: {response.status_code} {response.text}"
+
+        return f"Created task: {content}"
+
+    except Exception as e:
+        logger.error(f"Todoist create_task call failed: {e}")
+        return "Sorry, something went wrong while creating the task."
+
+
+def list_tasks():
+    try:
+        response = call_with_retries(
+            lambda: requests.get(
+                "https://api.todoist.com/api/v1/tasks",
+                headers=TODOIST_HEADERS,
+                timeout=10
+            ),
+            label="Todoist list tasks call"
+        )
+
+        if response.status_code != 200:
+            return f"Could not list tasks: {response.status_code} {response.text}"
+
+        # v1's list endpoint wraps results in {"results": [...], "next_cursor": ...}
+        # rather than returning a bare list - confirmed against the real API.
+        tasks = response.json()["results"]
+
+        if not tasks:
+            return "No open tasks."
+
+        return "\n".join(f"- {task['content']}" for task in tasks)
+
+    except Exception as e:
+        logger.error(f"Todoist list_tasks call failed: {e}")
+        return "Sorry, something went wrong while listing tasks."
+
+
+def get_weather(location):
+    try:
+        response = call_with_retries(
+            lambda: requests.get(
+                "https://api.openweathermap.org/data/2.5/weather",
+                params={"q": location, "appid": OPENWEATHER_API_KEY, "units": "imperial"},
+                timeout=10
+            ),
+            label="OpenWeatherMap call"
+        )
+        data = response.json()
+
+        if response.status_code != 200:
+            return f"Could not get weather for {location}: {data.get('message', 'unknown error')}"
+
+        description = data["weather"][0]["description"]
+        temp = data["main"]["temp"]
+        feels_like = data["main"]["feels_like"]
+        return f"{location}: {description}, {temp}F (feels like {feels_like}F)"
+
+    except Exception as e:
+        logger.error(f"OpenWeatherMap call failed: {e}")
+        return f"Sorry, something went wrong while getting the weather for {location}."
+
+
 def search_web(query):
     try:
         response = call_with_retries(
@@ -499,9 +621,26 @@ def show_recall(query):
         print(f"\n[distance {memory['distance']:.4f}] {memory['text']}")
 
 
-# Set to False by interfaces that can't show an interactive y/n prompt (e.g. the
-# Telegram bot, which has no real input() - see bot.py). The CLI leaves this True.
-WRITE_FILE_ENABLED = True
+# Controls how the write_file tool gets approved, since different interfaces have
+# different ways (or no way) to ask for confirmation. One of:
+#   "enabled"               - ask via input() and write immediately (CLI default)
+#   "disabled"               - refuse all writes outright
+#   "requires_confirmation"  - no real terminal to read input() from (e.g. the
+#                              Telegram bot) - stage the write in `pending_write`
+#                              instead and tell the caller how to confirm it later
+WRITE_FILE_MODE = "enabled"
+
+# Holds {"filename": ..., "content": ...} for at most one write awaiting
+# out-of-band confirmation (used by WRITE_FILE_MODE == "requires_confirmation"),
+# else None. A single global is fine here - this is a personal, single-user app.
+pending_write = None
+
+# Set by group_bot.py to a function (specialist_key, request_text, answer_text) -> None.
+# Called only from execute_tool's delegate_to_* branches (genuine Manager-mediated
+# delegation), never from ask_specialist/ask_ai themselves - direct @mention calls in
+# the group bypass the Manager entirely and shouldn't trigger a fake "delegating..."
+# announcement. None (the default) is a no-op for the CLI and the single-bot bot.py.
+on_delegation = None
 
 
 def execute_tool(name, arguments):
@@ -540,13 +679,34 @@ def execute_tool(name, arguments):
 
             return "\n".join(memory["text"] for memory in memories)
 
+        if name == "create_task":
+            return create_task(arguments["content"])
+
+        if name == "list_tasks":
+            return list_tasks()
+
+        if name == "get_weather":
+            return get_weather(arguments["location"])
+
         if name == "write_file":
-            if not WRITE_FILE_ENABLED:
+            if WRITE_FILE_MODE == "disabled":
                 return "File writing is disabled in this interface."
 
             file_path = get_safe_file_path(arguments["filename"])
             file_exists = file_path is not None and file_path.exists()
+            overwrite_note = f" This will OVERWRITE the existing files/{arguments['filename']}." if file_exists else ""
 
+            if WRITE_FILE_MODE == "requires_confirmation":
+                global pending_write
+                pending_write = {"filename": arguments["filename"], "content": arguments["content"]}
+                logger.info(f"Staged write to {arguments['filename']}, awaiting out-of-band confirmation")
+                return (
+                    f"Write to files/{arguments['filename']} is staged and waiting for your "
+                    f"confirmation.{overwrite_note} Reply /confirm to write it, or anything "
+                    f"else to cancel it."
+                )
+
+            # WRITE_FILE_MODE == "enabled" - CLI path, unchanged from before
             if file_exists:
                 print(f"\nWARNING: files/{arguments['filename']} already exists and will be OVERWRITTEN.")
 
@@ -560,19 +720,46 @@ def execute_tool(name, arguments):
             return write_file(arguments["filename"], arguments["content"])
 
         if name == "delegate_to_coding_agent":
-            return ask_specialist("code", arguments["task"], record_history=False)
+            answer = ask_specialist("code", arguments["task"], record_history=False)
+            if on_delegation:
+                on_delegation("code", arguments["task"], answer)
+            return answer
 
         if name == "delegate_to_research_agent":
-            return ask_specialist("research", arguments["topic"], record_history=False)
+            answer = ask_specialist("research", arguments["topic"], record_history=False)
+            if on_delegation:
+                on_delegation("research", arguments["topic"], answer)
+            return answer
 
         if name == "delegate_to_writer_agent":
-            return ask_specialist("write", arguments["prompt"], record_history=False)
+            answer = ask_specialist("write", arguments["prompt"], record_history=False)
+            if on_delegation:
+                on_delegation("write", arguments["prompt"], answer)
+            return answer
 
         if name == "delegate_to_personal_assistant":
-            return ask_specialist("task", arguments["request"], record_history=False)
+            answer = ask_specialist("task", arguments["request"], record_history=False)
+            if on_delegation:
+                on_delegation("task", arguments["request"], answer)
+            return answer
+
+        if name == "delegate_to_tasks_agent":
+            answer = ask_specialist("tasks", arguments["request"], record_history=False)
+            if on_delegation:
+                on_delegation("tasks", arguments["request"], answer)
+            return answer
+
+        if name == "delegate_to_weather_agent":
+            answer = ask_specialist("weather", arguments["location"], record_history=False)
+            if on_delegation:
+                on_delegation("weather", arguments["location"], answer)
+            return answer
 
         if name == "delegate_to_general_assistant":
-            return ask_ai(arguments["prompt"], record_history=False)
+            answer = ask_ai(arguments["prompt"], record_history=False)
+            if on_delegation:
+                on_delegation("general", arguments["prompt"], answer)
+            return answer
 
         return f"Unknown tool: {name}"
 
@@ -625,8 +812,30 @@ requests and keep writing clear.
         "instructions": """
 You are an organized personal assistant. Use remember_fact to save important
 personal information, reminders, and preferences, and recall_memories to recall
-them later. Use write_file to maintain simple notes or to-do lists when asked.
-Be concise and proactive.
+them later. Use write_file to maintain simple notes when asked. You are NOT a
+real task-tracking app - for actual to-do items, that's the Tasks Agent's job,
+not yours. Be concise and proactive.
+"""
+    },
+    "tasks": {
+        "label": "Tasks Agent",
+        "tool_names": ["create_task", "list_tasks"],
+        "instructions": """
+You are a task management assistant connected to the user's real Todoist
+account. Use create_task to add new tasks and list_tasks to see what's
+currently open before adding duplicates or when asked what's on the list.
+You manage a real external to-do list - this is different from the Personal
+Assistant Agent, which only saves general facts/reminders to memory. Be concise.
+"""
+    },
+    "weather": {
+        "label": "Weather Agent",
+        "tool_names": ["get_weather"],
+        "instructions": """
+You are a weather assistant. Use get_weather to look up current conditions
+for a location the user asks about. Report temperature and conditions
+briefly and clearly. If the location is ambiguous (e.g. multiple cities
+share a name), ask which one or state your assumption.
 """
     },
 }
@@ -663,7 +872,7 @@ def ask_specialist(specialist_key, prompt, record_history=True):
 
 def ask_manager(prompt):
     input_items = [{"role": "user", "content": prompt}]
-    answer = run_with_tools(MANAGER_INSTRUCTIONS, input_items, DELEGATION_TOOLS)
+    answer = run_with_tools(MANAGER_INSTRUCTIONS, input_items, DELEGATION_TOOLS, max_iterations=MAX_MANAGER_TOOL_ITERATIONS)
 
     # The Manager owns the conversation_history record (using the user's literal
     # message), not the delegated specialist/general assistant, so /history always
@@ -676,6 +885,8 @@ def ask_manager(prompt):
     print()
     print("Manager response:")
     print(answer)
+
+    return answer
 
 
 def handle_command(user_prompt):
