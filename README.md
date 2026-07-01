@@ -409,11 +409,36 @@ team message you unprompted:
 - **Calendar event alerts.** A heads-up posts `EVENT_ALERT_MINUTES` before each of
   today's timed calendar events. Today's alerts are (re)scheduled at startup and again
   after each morning briefing.
+- **Company Mode daily report.** At `DAILY_REPORT_TIME`, Miles posts a supervised
+  startup-style report with the active project, open work, reserved/spent budget, and
+  the next recommended move.
 
 These only run in the group interface (that's where a persistent process lives); the CLI
 and single bot store reminders but don't fire them. Configure via `.env`:
 `HOME_LOCATION`, `BRIEFING_TIME` (e.g. `08:00`), `TIMEZONE` (e.g. `America/New_York`),
-`EVENT_ALERT_MINUTES` (e.g. `15`).
+`EVENT_ALERT_MINUTES` (e.g. `15`), and `DAILY_REPORT_TIME` (e.g. `18:00`).
+
+## Company Mode (Telegram Startup OS)
+
+Company Mode turns the Telegram group into a supervised operating room where you are
+the CEO/founder and Miles acts as COO. It stores state in `company_state.json`
+(gitignored) and uses a daily USD budget ledger with estimates/reservations, not exact
+token accounting yet.
+
+Commands in the group:
+
+- `/company` or `/status` — show operating mode, daily budget, active project, and
+  open tasks.
+- `/setbudget 20` — set today's company budget to $20.
+- `/assign <goal>` — create an active project and reserve budget for a small work plan.
+- `/dailyreport` — show shipped/open/blocked work and the next recommendation.
+- `/pausecompany` / `/resumecompany` — stop or restart new assigned work.
+
+Company Mode is deliberately supervised: agents can produce PRs, files, research,
+copy, and validation artifacts, but sending email, deleting files, publishing,
+deploying, paid spend, or new-agent creation still uses the existing `/confirm` gate.
+Only agents listed in `BOT_KEYS` speak as themselves; other specialists can still
+contribute through Miles-labeled delegation.
 
 ## Google setup (Calendar & Gmail)
 
@@ -622,13 +647,13 @@ Not build-tested in this environment (no Docker available here) — verify it bu
 and runs for you first. Same deployment shape as `bot.py`: a **background worker**
 (not a web service, since it doesn't listen on a port). Mount a **persistent volume**
 so state survives redeploys — this now covers not just `/app/memory_db` (long-term
-memory) but also `/app/reminders.json` (pending reminders) and `/app/token.json`
-(your Google login); without persistence those reset on every deploy. Set the
+memory) but also `/app/reminders.json` (pending reminders), `/app/company_state.json`
+(Company Mode), and `/app/token.json` (your Google login); without persistence those reset on every deploy. Set the
 required group tokens you're using (`TELEGRAM_MANAGER_BOT_TOKEN`,
 `TELEGRAM_GROUP_CHAT_ID`, etc.) plus `OPENAI_API_KEY`. Add
 `TAVILY_API_KEY`/`OPENWEATHER_API_KEY`/`TODOIST_API_TOKEN` only for web search,
-weather, or Todoist, and keep `HOME_LOCATION`/`BRIEFING_TIME`/`TIMEZONE`/
-`EVENT_ALERT_MINUTES` as optional scheduling configuration.
+weather, or Todoist, and keep `HOME_LOCATION`/`BRIEFING_TIME`/`DAILY_REPORT_TIME`/
+`TIMEZONE`/`EVENT_ALERT_MINUTES` as optional scheduling configuration.
 
 **One thing to remember:** `BOT_KEYS` in `group_bot.py` controls which agents are
 active. Whenever you create a new bot and want to add it to a *deployed* instance,

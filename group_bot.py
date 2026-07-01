@@ -41,11 +41,13 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 import main
+import company_mode
 
 
 load_dotenv()
 
 GROUP_CHAT_ID = int(os.environ["TELEGRAM_GROUP_CHAT_ID"])
+DAILY_REPORT_TIME = os.environ.get("DAILY_REPORT_TIME", "18:00")
 
 ALLOWED_USER_IDS = {
     int(user_id.strip())
@@ -299,6 +301,15 @@ async def handle_group_message(update: Update):
         if await _handle_pending_confirmation(update, text):
             return
 
+        company_response = company_mode.handle_company_command(
+            text,
+            configured_agent_keys=BOT_KEYS,
+            specialist_keys=list(main.SPECIALISTS.keys()),
+        )
+        if company_response is not None:
+            await reply_chunks(update.message, company_response)
+            return
+
         try:
             responders = await asyncio.to_thread(main.select_group_responders, text)
         except Exception as e:
@@ -353,6 +364,22 @@ async def handle_manager_dm(update: Update):
         if await _handle_pending_confirmation(update, text):
             return
 
+        company_command = company_mode.parse_company_command(text)
+        if company_command is not None:
+            if company_command[0] in {"/setbudget", "/assign", "/pausecompany", "/resumecompany"}:
+                await update.message.reply_text(
+                    "Company Mode changes happen in the group operating room. "
+                    "Use /company, /status, or /dailyreport here for read-only context."
+                )
+            else:
+                company_response = company_mode.handle_company_command(
+                    text,
+                    configured_agent_keys=BOT_KEYS,
+                    specialist_keys=list(main.SPECIALISTS.keys()),
+                )
+                await reply_chunks(update.message, company_response)
+            return
+
         try:
             answer = await asyncio.to_thread(main.ask_manager, text)
         except Exception as e:
@@ -376,6 +403,10 @@ def on_delegation(specialist_key, request_text, answer_text):
     ctx = main.current_reply_context() or {"kind": "group"}
     label = "General Assistant" if specialist_key == "general" else main.SPECIALISTS[specialist_key]["label"]
     target_bot = bots.get(specialist_key, bots["manager"])
+    try:
+        company_mode.record_delegation(specialist_key, request_text, answer_text)
+    except Exception as e:
+        main.logger.error(f"Failed to record Company Mode delegation: {e}")
 
     async def post_group():
         try:
@@ -443,6 +474,11 @@ async def post_morning_briefing():
     await post_to_group(text, "manager")
     # Fresh day - (re)schedule today's event alerts right after the briefing.
     await schedule_todays_event_alerts()
+
+
+async def post_daily_company_report():
+    text = await asyncio.to_thread(company_mode.build_daily_report)
+    await post_to_group(text, "manager")
 
 
 async def fire_reminder(reminder):
@@ -542,6 +578,14 @@ async def start_scheduler():
         id="morning-briefing",
         replace_existing=True,
     )
+
+    report_hour, report_minute = _parse_briefing_time(DAILY_REPORT_TIME)
+    scheduler.add_job(
+        post_daily_company_report,
+        trigger=CronTrigger(hour=report_hour, minute=report_minute),
+        id="daily-company-report",
+        replace_existing=True,
+    )
     scheduler.start()
 
     # Live reminder scheduling comes through this hook from execute_tool/set_reminder.
@@ -549,7 +593,10 @@ async def start_scheduler():
 
     await reload_reminders()
     await schedule_todays_event_alerts()
-    print(f"Scheduler running - morning briefing at {main.BRIEFING_TIME} ({main.TIMEZONE}).")
+    print(
+        f"Scheduler running - morning briefing at {main.BRIEFING_TIME}, "
+        f"daily company report at {DAILY_REPORT_TIME} ({main.TIMEZONE})."
+    )
 
 
 async def run_all():

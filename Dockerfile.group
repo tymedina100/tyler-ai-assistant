@@ -16,13 +16,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py group_bot.py google_helpers.py github_helpers.py ./
+COPY main.py group_bot.py company_mode.py google_helpers.py github_helpers.py ./
 COPY files/ ./files/
 
-# memory_db/ (long-term memory), reminders.json (pending reminders), and
-# assistant.log are created here at runtime. A plain container's filesystem is
-# wiped on every restart/redeploy - mount a persistent volume so state survives:
-# /app/memory_db and /app/reminders.json, plus /app/token.json (your Google login,
-# provided as a secret/volume file - see README "Google setup"). See README for details.
+# memory_db/ (long-term memory), reminders.json (pending reminders),
+# company_state.json (Company Mode), and assistant.log are created here at
+# runtime. A plain container's filesystem is wiped on every restart/redeploy -
+# mount a persistent volume so state survives: /app/memory_db,
+# /app/reminders.json, /app/company_state.json, plus /app/token.json (your
+# Google login, provided as a secret/volume file - see README "Google setup").
+# See README for details.
 
 CMD ["python", "group_bot.py"]

@@ -117,6 +117,16 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(self.main.get_pending_action()["filename"], "a.txt")
         self.main.clear_pending_action()
 
+    def test_pending_action_description_includes_company_context(self):
+        description = self.main.describe_pending_action({
+            "type": "send_email",
+            "to": "customer@example.com",
+            "company_context": "Project proj_123 / task task_456",
+        })
+
+        self.assertIn("email to customer@example.com", description)
+        self.assertIn("proj_123", description)
+
 
 if __name__ == "__main__":
     unittest.main()
