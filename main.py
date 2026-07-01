@@ -25,7 +25,11 @@ import google_helpers
 # Windows consoles default to a limited encoding (cp1252) that can't print
 # every Unicode character (e.g. em dashes, curly quotes) - web search results
 # and AI output can easily contain these, so force UTF-8 output to avoid crashes.
-sys.stdout.reconfigure(encoding="utf-8")
+# Guarded because stdout isn't always a real terminal stream: under pytest capture
+# or when stdout is redirected (bot.py relays via a StringIO), reconfigure may be
+# absent, and importing main must never crash just because of that.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 BASE_DIR = Path(__file__).parent
 
@@ -141,6 +145,34 @@ def clear_pending_action():
     pending_actions.pop(current_conversation_id(), None)
 
 
+# Company Mode v2 (metered autonomy) execution context. When the checkpointed engine
+# runs a task it sets a per-task "sink" that model calls accrue real USD cost and
+# produced-artifact links into, and flips _company_execution so execute_tool auto-
+# approves *produce* actions (file/PR writes) while still staging *irreversible* ones
+# (email/delete). Both default to "off", so the CLI and ordinary bot turns are
+# completely unaffected - the sink being None makes every accrue call a no-op.
+_execution_sink = contextvars.ContextVar("execution_sink", default=None)
+_company_execution = contextvars.ContextVar("company_execution", default=False)
+
+
+def set_execution_sink(sink):
+    """Point the current turn's cost/artifact accrual at `sink` (a dict with keys
+    cost_usd, artifacts, context) or None to disable it."""
+    _execution_sink.set(sink)
+
+
+def current_execution_sink():
+    return _execution_sink.get()
+
+
+def set_company_execution(value):
+    _company_execution.set(bool(value))
+
+
+def in_company_execution():
+    return _company_execution.get()
+
+
 # Two model tiers instead of one model for everything. The premium model does
 # the work that needs real reasoning (coding, research, writing, the catch-all
 # general assistant); the fast/cheap model handles work that's mostly routing or
@@ -152,6 +184,61 @@ PREMIUM_MODEL = "gpt-5.5"
 FAST_MODEL = "gpt-5.4-mini"
 GENERAL_MODEL = PREMIUM_MODEL  # the general assistant fields arbitrary questions
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+
+# Rough USD price per 1,000 tokens as (input_rate, output_rate) per model. Company
+# Mode meters real token usage against these so the daily budget reflects actual
+# spend, not a flat estimate. This is the ONE place to update when prices or model
+# ids change - confirm the real numbers for your account before trusting the ledger.
+# An unknown model falls back to DEFAULT_MODEL_PRICE and logs a warning, so a model
+# swap can never silently meter $0 and hide runaway cost.
+DEFAULT_MODEL_PRICE = (0.01, 0.03)
+MODEL_PRICING = {
+    PREMIUM_MODEL: (0.01, 0.03),
+    FAST_MODEL: (0.002, 0.006),
+    EMBEDDING_MODEL_NAME: (0.0001, 0.0),
+}
+
+
+def usage_to_usd(model, usage):
+    """Convert an OpenAI usage object to USD via MODEL_PRICING. Tolerant of the two
+    usage shapes we see - the Responses API (input_tokens/output_tokens) and the
+    embeddings API (prompt_tokens/total_tokens) - and of a missing/odd shape, which
+    degrades to $0 plus a warning rather than crashing a turn. VERIFY the real
+    attribute names against the installed openai SDK; getattr guards keep a mismatch
+    from throwing."""
+    if usage is None:
+        return 0.0
+
+    in_rate, out_rate = MODEL_PRICING.get(model, DEFAULT_MODEL_PRICE)
+    if model not in MODEL_PRICING:
+        logger.warning(f"No price for model {model!r}; using default rate for metering.")
+
+    input_tokens = getattr(usage, "input_tokens", None)
+    if input_tokens is None:
+        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    output_tokens = getattr(usage, "output_tokens", None)
+    if output_tokens is None:
+        # Embeddings report only total_tokens; treat the remainder as "input".
+        total = getattr(usage, "total_tokens", 0) or 0
+        output_tokens = max(0, total - input_tokens)
+
+    return round((input_tokens / 1000.0) * in_rate + (output_tokens / 1000.0) * out_rate, 6)
+
+
+def _accrue_cost(model, usage):
+    """Add a model call's USD cost to the active execution sink, if any. A no-op
+    outside Company Mode execution (sink is None), so ordinary turns are unaffected."""
+    sink = current_execution_sink()
+    if sink is not None:
+        sink["cost_usd"] = round(sink.get("cost_usd", 0.0) + usage_to_usd(model, usage), 6)
+
+
+def _record_artifact(note):
+    """Append a produced-deliverable note (a file path or PR/URL) to the active
+    execution sink, if any. A no-op outside Company Mode execution."""
+    sink = current_execution_sink()
+    if sink is not None and note:
+        sink.setdefault("artifacts", []).append(note)
 
 # Cap how many past messages ask_ai resends to the model each turn. conversation_
 # history itself still grows unbounded (so /history shows everything), but the
@@ -398,6 +485,7 @@ def get_ai_response(input_messages, model=PREMIUM_MODEL, instructions=ASSISTANT_
             label="OpenAI chat call"
         )
 
+        _accrue_cost(model, getattr(response, "usage", None))
         return response.output_text
 
     except Exception:
@@ -411,6 +499,7 @@ def get_embedding(text):
             lambda: openai_client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=text),
             label="OpenAI embedding call"
         )
+        _accrue_cost(EMBEDDING_MODEL_NAME, getattr(response, "usage", None))
         return response.data[0].embedding
 
     except Exception:
@@ -459,6 +548,8 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
                 ),
                 label="OpenAI chat call"
             )
+
+            _accrue_cost(model, getattr(response, "usage", None))
 
             function_calls = [item for item in response.output if item.type == "function_call"]
 
@@ -1246,11 +1337,13 @@ def execute_tool(name, arguments):
                 return "Sending email is disabled in this interface."
 
             if CONFIRMATION_MODE == "requires_confirmation":
+                sink = current_execution_sink()
                 set_pending_action({
                     "type": "send_email",
                     "to": arguments["to"],
                     "subject": arguments["subject"],
                     "body": arguments["body"],
+                    "company_context": sink.get("context", "") if sink else "",
                 })
                 logger.info(f"Staged email to {arguments['to']}, awaiting out-of-band confirmation")
                 return (
@@ -1276,14 +1369,21 @@ def execute_tool(name, arguments):
             return github_helpers.read_file(arguments["path"])
 
         if name == "github_save_file":
-            return github_helpers.save_file(arguments["path"], arguments["content"])
+            result = github_helpers.save_file(arguments["path"], arguments["content"])
+            _record_artifact(f"github: {arguments['path']}")
+            return result
 
         if name == "github_delete_file":
             if CONFIRMATION_MODE == "disabled":
                 return "Deleting files is disabled in this interface."
 
             if CONFIRMATION_MODE == "requires_confirmation":
-                set_pending_action({"type": "github_delete", "path": arguments["path"]})
+                sink = current_execution_sink()
+                set_pending_action({
+                    "type": "github_delete",
+                    "path": arguments["path"],
+                    "company_context": sink.get("context", "") if sink else "",
+                })
                 logger.info(f"Staged GitHub delete of {arguments['path']}, awaiting confirmation")
                 return (
                     f"Deleting {arguments['path']} from GitHub is staged and waiting for your "
@@ -1310,18 +1410,30 @@ def execute_tool(name, arguments):
         if name == "code_propose_change":
             # No /confirm gate here: the pull request IS the review step - nothing
             # merges to the base branch (or ships) until the user approves it.
-            return github_helpers.code_propose_change(
+            result = github_helpers.code_propose_change(
                 arguments["branch"], arguments["path"], arguments["content"],
                 arguments["title"], arguments.get("body", "")
             )
+            _record_artifact(result)
+            return result
 
         if name == "code_edit_file":
-            return github_helpers.code_edit_file(
+            result = github_helpers.code_edit_file(
                 arguments["branch"], arguments["path"], arguments["old_snippet"],
                 arguments["new_snippet"], arguments["title"], arguments.get("body", "")
             )
+            _record_artifact(result)
+            return result
 
         if name == "write_file":
+            # During supervised Company Mode execution, writing a file is a *produce*
+            # action (a deliverable, reversible, sandboxed) so it runs without a
+            # /confirm - but it's recorded as an artifact of the current task.
+            if in_company_execution():
+                result = write_file(arguments["filename"], arguments["content"])
+                _record_artifact(f"file: files/{arguments['filename']}")
+                return result
+
             if CONFIRMATION_MODE == "disabled":
                 return "File writing is disabled in this interface."
 
@@ -1718,6 +1830,7 @@ def select_group_responders(text):
             ),
             label="Group router call",
         )
+        _accrue_cost(FAST_MODEL, getattr(response, "usage", None))
         raw = response.output_text.strip()
 
         # The model may wrap JSON in prose or a ```json fence - grab the object.

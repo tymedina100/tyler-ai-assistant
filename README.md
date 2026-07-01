@@ -122,6 +122,19 @@ Type a message and press Enter to chat with the AI, or use one of the commands a
 Files you want to `/read` or `/askfile` must live inside the `files/` folder — paths
 outside it are rejected for safety.
 
+## Running the tests
+
+The project ships with a small `unittest` suite (Company Mode's budget/ledger logic
+and the safety "hardening" helpers). Run it from the project root:
+
+```powershell
+python -m unittest discover -s tests
+```
+
+The tests stub out the external services (OpenAI, Chroma, Tavily, etc.), so they run
+offline and need no API keys. Run them before deploying a change to Railway — they're
+fast and catch the obvious regressions in state handling and file safety.
+
 ## How long-term memory works
 
 Unlike `conversation_history` (a plain in-memory list that's lost when you `/quit`),
@@ -422,23 +435,64 @@ and single bot store reminders but don't fire them. Configure via `.env`:
 
 Company Mode turns the Telegram group into a supervised operating room where you are
 the CEO/founder and Miles acts as COO. It stores state in `company_state.json`
-(gitignored) and uses a daily USD budget ledger with estimates/reservations, not exact
-token accounting yet.
+(gitignored). As of **v2** it runs on a **real, metered daily budget** and can
+**autonomously work an assigned goal** one task at a time — safely and supervised.
+
+### The v2 loop: propose → approve → work
+
+1. `/setbudget 20` — set today's budget to $20.
+2. `/assign <goal>` — Miles drafts a small work plan (research → build → write → tidy),
+   reserves budget for it, and **proposes** it. Nothing runs yet.
+3. `/approve` — kicks off the execution engine. Agents work the plan **one task at a
+   time**, each replying as themselves, and every finished task is linked to a real
+   **deliverable** (a `files/` path, a GitHub file/PR URL, or saved copy).
+4. `/dailyreport` — shipped/open/blocked work, the artifacts produced, and the next move.
 
 Commands in the group:
 
-- `/company` or `/status` — show operating mode, daily budget, active project, and
-  open tasks.
-- `/setbudget 20` — set today's company budget to $20.
-- `/assign <goal>` — create an active project and reserve budget for a small work plan.
-- `/dailyreport` — show shipped/open/blocked work and the next recommendation.
-- `/pausecompany` / `/resumecompany` — stop or restart new assigned work.
+- `/company` or `/status` — operating mode, budget ledger, active project, open tasks.
+- `/setbudget 20` — set today's company budget.
+- `/assign <goal>` — plan + reserve budget for a goal (creates a *proposed* project).
+- `/approve` — start working the proposed plan.
+- `/cancel` — drop the active project and release its reserved budget.
+- `/dailyreport` — shipped/open/blocked work, artifacts, and the next recommendation.
+- `/pausecompany` / `/resumecompany` — halt/resume the engine (checked between tasks).
 
-Company Mode is deliberately supervised: agents can produce PRs, files, research,
-copy, and validation artifacts, but sending email, deleting files, publishing,
-deploying, paid spend, or new-agent creation still uses the existing `/confirm` gate.
-Only agents listed in `BOT_KEYS` speak as themselves; other specialists can still
-contribute through Miles-labeled delegation.
+(`/approve`, `/cancel`, `/setbudget`, `/assign`, and pause/resume are group-only — the
+Miles DM is read-only for `/company`, `/status`, `/dailyreport`.)
+
+### Metered budget + hard cap (the financial brake)
+
+Every model call is now priced against `MODEL_PRICING` in `main.py` (input/output rate
+per 1,000 tokens) and the **actual** spend is added to today's ledger — not a flat
+estimate. This covers both autonomous execution and ordinary delegated chat in the
+group. **Confirm the real prices for your account** in `MODEL_PRICING` before trusting
+the numbers; an unknown model falls back to a default rate and logs a warning so cost is
+never silently `$0`.
+
+A fresh deploy starts on a **$5/day budget** by default (`DEFAULT_DAILY_BUDGET_USD` in
+`company_mode.py`); change it live any time with `/setbudget <amount>`. If you're running
+a persisted `company_state.json` from before v2, run `/setbudget 5` once to adopt it.
+
+The engine enforces the cap **between tasks**: if the day's budget is exhausted it stops
+and defers the rest. Because the check is at task boundaries, a single task can overshoot
+the remaining budget by at most its own cost (itself bounded by the tool-call cap) — keep
+per-day budgets modest and raise them as a product proves out.
+
+### What stays supervised
+
+During autonomous execution, *produce* actions (writing a file, saving a file or opening
+a PR on GitHub) run without a prompt — they're the deliverables. *Irreversible* actions
+(**sending email, deleting a file**, and by policy publishing/deploying/paid spend/
+new-agent creation) still stage behind `/confirm`: the task is marked **blocked** and the
+engine stops so you can approve it (the `/confirm` prompt shows which project/task it's
+for). Reply `/confirm` in the group, then `/approve` again to continue the plan.
+
+Only agents listed in `BOT_KEYS` speak as themselves; other specialists still contribute
+through Miles-labeled delegation.
+
+> Revenue/product-selling (tracking launches and money earned) is intentionally **not**
+> in v2 — it's planned for v3, once the pipeline reliably produces budgeted deliverables.
 
 ## Google setup (Calendar & Gmail)
 

@@ -17,7 +17,7 @@ class CompanyModeTests(unittest.TestCase):
         state = company_mode.load_state(self.state_path)
 
         self.assertEqual(state["company"]["mode"], "running")
-        self.assertEqual(state["company"]["daily_budget_usd"], 0.0)
+        self.assertEqual(state["company"]["daily_budget_usd"], company_mode.DEFAULT_DAILY_BUDGET_USD)
         self.assertEqual(state["projects"], [])
         self.assertEqual(state["tasks"], [])
 
@@ -36,8 +36,8 @@ class CompanyModeTests(unittest.TestCase):
         self.assertIn("Company goal accepted", assigned)
         self.assertEqual(len(state["projects"]), 1)
         self.assertEqual(len(state["tasks"]), 4)
-        self.assertEqual(state["company"]["reserved_today_usd"], 8.0)
-        self.assertEqual(company_mode.remaining_budget(state), 12.0)
+        self.assertEqual(state["company"]["reserved_today_usd"], 4.0)  # 4 tasks x $1 reserve
+        self.assertEqual(company_mode.remaining_budget(state), 16.0)
 
     def test_assign_blocks_when_budget_is_too_small(self):
         company_mode.set_daily_budget(2, self.state_path)
@@ -66,9 +66,9 @@ class CompanyModeTests(unittest.TestCase):
         state = company_mode.load_state(self.state_path)
 
         self.assertIn("updated to done", result)
-        self.assertEqual(state["tasks"][0]["spent_usd"], 2.0)
-        self.assertEqual(state["company"]["reserved_today_usd"], 6.0)
-        self.assertEqual(state["company"]["spent_today_usd"], 2.0)
+        self.assertEqual(state["tasks"][0]["spent_usd"], 1.0)  # defaults to the $1 reserve
+        self.assertEqual(state["company"]["reserved_today_usd"], 3.0)  # 4 - this task's 1
+        self.assertEqual(state["company"]["spent_today_usd"], 1.0)
 
     def test_command_parsing_and_pause_resume(self):
         self.assertEqual(company_mode.parse_company_command("/setbudget $25"), ("/setbudget", "$25"))
@@ -122,6 +122,96 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(recorded["status"], "done")
         self.assertEqual(recorded["owner"], "research")
         self.assertIn("Found demand", recorded["result"])
+
+    # --- v2: checkpointed execution + metered spend ---
+
+    def _assign(self, goal="Ship a sellable artifact", configured=("manager", "code")):
+        company_mode.set_daily_budget(20, self.state_path)
+        company_mode.assign_goal(
+            goal,
+            configured_agent_keys=list(configured),
+            specialist_keys=["code", "research", "write", "tasks"],
+            path=self.state_path,
+        )
+
+    def test_assigned_project_starts_proposed(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(company_mode.active_project(state)["status"], "proposed")
+
+    def test_approve_project_activates_and_returns_id(self):
+        self._assign()
+        message, project_id = company_mode.approve_project(self.state_path)
+        self.assertIn("Approved", message)
+        self.assertIsNotNone(project_id)
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(company_mode.active_project(state)["status"], "active")
+
+    def test_task_status_reconciles_actual_spend(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        task_id = state["tasks"][0]["id"]
+
+        company_mode.update_task_status(task_id, "done", result="done", spent_usd=0.5, path=self.state_path)
+        state = company_mode.load_state(self.state_path)
+        task = next(t for t in state["tasks"] if t["id"] == task_id)
+
+        self.assertEqual(task["spent_usd"], 0.5)  # actual, not the $1 reserve
+        self.assertEqual(state["company"]["spent_today_usd"], 0.5)
+        self.assertEqual(state["company"]["reserved_today_usd"], 3.0)  # 4 - this task's 1 reserve
+
+    def test_next_planned_task_advances_after_completion(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project = company_mode.active_project(state)
+        first = company_mode.next_planned_task(state, project["id"])
+        self.assertIsNotNone(first)
+
+        company_mode.update_task_status(first["id"], "done", spent_usd=0.1, path=self.state_path)
+        state = company_mode.load_state(self.state_path)
+        second = company_mode.next_planned_task(state, project["id"])
+        self.assertNotEqual(first["id"], second["id"])
+
+    def test_mark_task_blocked_records_spend_and_artifacts(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        task_id = state["tasks"][0]["id"]
+
+        company_mode.mark_task_blocked(
+            task_id, "needs approval", spent_usd=0.25,
+            artifacts=["file: files/x.txt"], path=self.state_path,
+        )
+        state = company_mode.load_state(self.state_path)
+        task = next(t for t in state["tasks"] if t["id"] == task_id)
+
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["spent_usd"], 0.25)
+        self.assertIn("file: files/x.txt", task["artifacts"])
+        self.assertIn("file: files/x.txt", company_mode.active_project(state)["artifacts"])
+
+    def test_cancel_project_releases_reserve(self):
+        self._assign()
+        result = company_mode.cancel_project(self.state_path)
+        self.assertIn("Cancelled", result)
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(state["company"]["reserved_today_usd"], 0.0)
+        self.assertIsNone(state["company"]["active_project_id"])
+
+    def test_record_adhoc_spend_counts_against_budget(self):
+        self._assign()
+        company_mode.record_adhoc_spend(1.5, artifacts=["file: files/n.txt"], path=self.state_path)
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(state["company"]["spent_today_usd"], 1.5)
+        self.assertIn("file: files/n.txt", company_mode.active_project(state)["artifacts"])
+
+    def test_record_delegation_can_meter_spend(self):
+        self._assign(configured=("manager", "research"))
+        company_mode.record_delegation(
+            "research", "look into demand", "found some", self.state_path,
+            spent_usd=0.3, artifacts=["note"],
+        )
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(state["company"]["spent_today_usd"], 0.3)
 
 
 if __name__ == "__main__":
