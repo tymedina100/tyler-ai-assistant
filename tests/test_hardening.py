@@ -32,6 +32,12 @@ class FakeChromaClient:
         return FakeCollection()
 
 
+class FakeUsage:
+    """Stand-in for an OpenAI usage object with arbitrary token-count attributes."""
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
 def import_main_with_stubs():
     fake_chromadb = types.SimpleNamespace(PersistentClient=FakeChromaClient)
     fake_openai = types.SimpleNamespace(OpenAI=lambda: object())
@@ -126,6 +132,64 @@ class HardeningTests(unittest.TestCase):
 
         self.assertIn("email to customer@example.com", description)
         self.assertIn("proj_123", description)
+
+    # --- v2: metering + company-execution gating ---
+
+    def test_usage_to_usd_responses_shape(self):
+        usage = FakeUsage(input_tokens=1000, output_tokens=1000)
+        # PREMIUM_MODEL priced (0.01, 0.03) per 1k → 0.01 + 0.03 = 0.04
+        self.assertAlmostEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.04, places=6)
+
+    def test_usage_to_usd_embedding_shape(self):
+        usage = FakeUsage(prompt_tokens=1000, total_tokens=1000)
+        # EMBEDDING priced (0.0001, 0.0); output = total - input = 0
+        self.assertAlmostEqual(
+            self.main.usage_to_usd(self.main.EMBEDDING_MODEL_NAME, usage), 0.0001, places=6
+        )
+
+    def test_usage_to_usd_unknown_model_uses_default(self):
+        usage = FakeUsage(input_tokens=1000, output_tokens=0)
+        # DEFAULT_MODEL_PRICE input rate 0.01
+        self.assertAlmostEqual(self.main.usage_to_usd("mystery-model", usage), 0.01, places=6)
+
+    def test_usage_to_usd_none_and_bad_shape_are_zero_safe(self):
+        self.assertEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, None), 0.0)
+        self.assertEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, FakeUsage()), 0.0)
+
+    def test_company_execution_writes_file_directly_and_records_artifact(self):
+        self.main.set_conversation("test:companywrite")
+        sink = {"cost_usd": 0.0, "artifacts": [], "context": "Project p / task t"}
+        self.main.set_execution_sink(sink)
+        self.main.set_company_execution(True)
+        try:
+            result = self.main.execute_tool("write_file", {"filename": "v2_exec.txt", "content": "hi"})
+            self.assertIn("Saved", result)
+            self.assertTrue((self.main.FILES_DIR / "v2_exec.txt").exists())
+            self.assertTrue(any("v2_exec.txt" in a for a in sink["artifacts"]))
+        finally:
+            (self.main.FILES_DIR / "v2_exec.txt").unlink(missing_ok=True)
+            self.main.set_company_execution(False)
+            self.main.set_execution_sink(None)
+
+    def test_company_execution_still_stages_send_email_with_context(self):
+        previous_mode = self.main.CONFIRMATION_MODE
+        self.main.CONFIRMATION_MODE = "requires_confirmation"
+        self.main.set_conversation("test:companyemail")
+        self.main.set_execution_sink({"cost_usd": 0.0, "artifacts": [], "context": "Project p / task t"})
+        self.main.set_company_execution(True)
+        try:
+            result = self.main.execute_tool(
+                "send_email", {"to": "a@b.com", "subject": "Hi", "body": "x"}
+            )
+            self.assertIn("staged", result.lower())
+            pending = self.main.get_pending_action()
+            self.assertEqual(pending["type"], "send_email")
+            self.assertEqual(pending["company_context"], "Project p / task t")
+        finally:
+            self.main.clear_pending_action()
+            self.main.set_company_execution(False)
+            self.main.set_execution_sink(None)
+            self.main.CONFIRMATION_MODE = previous_mode
 
 
 if __name__ == "__main__":

@@ -9,7 +9,12 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 COMPANY_STATE_FILE = BASE_DIR / "company_state.json"
 
-DEFAULT_TASK_ESTIMATE_USD = 2.0
+# Fresh state starts on a $5/day budget so a brand-new deploy can run a small plan
+# without needing /setbudget first. Change it live any time with /setbudget <amount>.
+DEFAULT_DAILY_BUDGET_USD = 5.0
+# Per-task budget *reservation* (a soft pre-check hold). Kept small so a 4-task plan
+# fits inside the $5 default; the real metered token cost replaces it as tasks finish.
+DEFAULT_TASK_ESTIMATE_USD = 1.0
 DEFAULT_ASSIGN_TASKS = [
     ("research", "Validate demand, competitors, and buyer pain for this goal."),
     ("code", "Identify the smallest buildable asset or PR that moves this goal forward."),
@@ -21,6 +26,8 @@ COMPANY_COMMANDS = {
     "/company",
     "/setbudget",
     "/assign",
+    "/approve",
+    "/cancel",
     "/status",
     "/dailyreport",
     "/pausecompany",
@@ -42,7 +49,7 @@ def new_state():
         "company": {
             "mode": "running",
             "budget_date": today,
-            "daily_budget_usd": 0.0,
+            "daily_budget_usd": DEFAULT_DAILY_BUDGET_USD,
             "reserved_today_usd": 0.0,
             "spent_today_usd": 0.0,
             "active_project_id": None,
@@ -186,11 +193,13 @@ def assign_goal(goal, configured_agent_keys, specialist_keys=None, path=COMPANY_
         )
 
     project_id = f"proj_{uuid.uuid4().hex[:8]}"
+    # v2: a fresh project starts "proposed" - it doesn't run until the user /approve's
+    # it (checkpointed autonomy). /assign only plans and reserves budget.
     project = {
         "id": project_id,
         "title": _project_title(goal),
         "goal": goal,
-        "status": "active",
+        "status": "proposed",
         "created_at": _now().isoformat(),
         "task_ids": [],
         "artifacts": [],
@@ -238,6 +247,10 @@ def update_task_status(task_id, status, result="", artifacts=None, spent_usd=Non
                 task["result"] = result
             if artifacts:
                 task["artifacts"].extend(artifacts)
+                for project in state.get("projects", []):
+                    if project["id"] == task["project_id"]:
+                        project.setdefault("artifacts", []).extend(artifacts)
+                        break
             if status in {"done", "shipped", "blocked"} and previous_status not in {"done", "shipped", "blocked"}:
                 spend = task["reserved_usd"] if spent_usd is None else _money(spent_usd)
                 task["spent_usd"] = spend
@@ -250,11 +263,80 @@ def update_task_status(task_id, status, result="", artifacts=None, spent_usd=Non
     return f"Task not found: {task_id}"
 
 
-def record_delegation(owner, request_text, answer_text, path=COMPANY_STATE_FILE):
+def mark_task_blocked(task_id, reason, spent_usd=None, artifacts=None, path=COMPANY_STATE_FILE):
+    """Park a task that needs your approval to proceed (a gated action was staged).
+    Records any real spend/artifacts produced so far and releases its reserve."""
+    return update_task_status(
+        task_id, "blocked", result=reason, artifacts=artifacts, spent_usd=spent_usd, path=path
+    )
+
+
+def next_planned_task(state, project_id):
+    """The first not-yet-worked task of a project, in creation order, or None."""
+    for task in project_tasks(state, project_id):
+        if task["status"] == "planned":
+            return task
+    return None
+
+
+def approve_project(path=COMPANY_STATE_FILE):
+    """Flip the active project from 'proposed' to 'active' so the engine may run it.
+    Returns (message, project_id_or_None) - the caller starts the runner if an id
+    comes back."""
     state = load_state(path)
     project = active_project(state)
     if not project:
-        add_event(state, "delegation", f"{owner} handled delegated work without an active project.")
+        return "No project to approve. Use /assign <goal> first.", None
+    if state["company"]["mode"] == "paused":
+        return "Company Mode is paused. Use /resumecompany before approving work.", None
+    if project["status"] == "active":
+        return f"{project['title']} is already approved and running.", project["id"]
+    if project["status"] != "proposed":
+        return f"{project['title']} is {project['status']} - nothing to approve.", None
+
+    project["status"] = "active"
+    add_event(state, "project_approved", f"Approved project: {project['title']}", project_id=project["id"])
+    save_state(state, path)
+    return f"Approved: {project['title']}. Starting the work plan now.", project["id"]
+
+
+def cancel_project(path=COMPANY_STATE_FILE):
+    """Cancel the active project and release any budget still reserved for its open
+    tasks. Returns a status message."""
+    state = load_state(path)
+    project = active_project(state)
+    if not project:
+        return "No active project to cancel."
+
+    released = 0.0
+    for task in project_tasks(state, project["id"]):
+        if task["status"] in {"planned", "in_progress", "blocked"} and task["reserved_usd"]:
+            released += task["reserved_usd"]
+            task["reserved_usd"] = 0.0
+            task["status"] = "cancelled"
+
+    project["status"] = "cancelled"
+    state["company"]["reserved_today_usd"] = _money(max(0.0, state["company"]["reserved_today_usd"] - released))
+    state["company"]["active_project_id"] = None
+    add_event(state, "project_cancelled", f"Cancelled project: {project['title']}",
+              project_id=project["id"], amount_usd=released)
+    save_state(state, path)
+    return f"Cancelled {project['title']} and released ${released:.2f} of reserved budget."
+
+
+def record_delegation(owner, request_text, answer_text, path=COMPANY_STATE_FILE,
+                      spent_usd=None, artifacts=None):
+    # New kwargs go AFTER path so the existing positional-path callers still work.
+    state = load_state(path)
+    project = active_project(state)
+    spend = _money(spent_usd) if spent_usd else 0.0
+    artifacts = list(artifacts or [])
+    if not project:
+        add_event(state, "delegation", f"{owner} handled delegated work without an active project.",
+                  amount_usd=spend or None)
+        if spend:
+            # Even without a project, real spend still counts against today's budget.
+            state["company"]["spent_today_usd"] = _money(state["company"]["spent_today_usd"] + spend)
         save_state(state, path)
         return None
 
@@ -268,18 +350,43 @@ def record_delegation(owner, request_text, answer_text, path=COMPANY_STATE_FILE)
         "status": "done",
         "estimate_usd": 0.0,
         "reserved_usd": 0.0,
-        "spent_usd": 0.0,
+        "spent_usd": spend,
         "created_at": _now().isoformat(),
         "updated_at": _now().isoformat(),
         "result": answer_text[:1000],
-        "artifacts": [],
+        "artifacts": artifacts,
         "notes": ["Recorded from Miles delegation."],
     }
     state["tasks"].append(task)
     project["task_ids"].append(task_id)
-    add_event(state, "delegation", f"{owner} handled delegated work: {task['title']}", project_id=project["id"], task_id=task_id)
+    if spend:
+        state["company"]["spent_today_usd"] = _money(state["company"]["spent_today_usd"] + spend)
+    if artifacts:
+        project.setdefault("artifacts", []).extend(artifacts)
+    add_event(state, "delegation", f"{owner} handled delegated work: {task['title']}",
+              project_id=project["id"], task_id=task_id, amount_usd=spend or None)
     save_state(state, path)
     return task_id
+
+
+def record_adhoc_spend(spent_usd, artifacts=None, path=COMPANY_STATE_FILE):
+    """Count real spend from an ad-hoc chat turn (e.g. delegating to Miles in the
+    group) against today's budget, and attach any produced artifacts to the active
+    project. Keeps the daily ledger honest for work that happens outside the
+    autonomous engine. A no-op when there's nothing to record."""
+    spend = _money(spent_usd) if spent_usd else 0.0
+    artifacts = list(artifacts or [])
+    if not spend and not artifacts:
+        return
+
+    state = load_state(path)
+    if spend:
+        state["company"]["spent_today_usd"] = _money(state["company"]["spent_today_usd"] + spend)
+    project = active_project(state)
+    if project and artifacts:
+        project.setdefault("artifacts", []).extend(artifacts)
+    add_event(state, "adhoc_spend", "Ad-hoc chat spend.", amount_usd=spend or None)
+    save_state(state, path)
 
 
 def active_project(state):
@@ -318,12 +425,18 @@ def render_company_status(path=COMPANY_STATE_FILE):
         return "\n".join(lines)
 
     tasks = project_tasks(state, project["id"])
-    open_tasks = [task for task in tasks if task["status"] not in {"done", "shipped"}]
-    lines.append(f"Active project: {project['title']} ({project['id']})")
+    open_tasks = [task for task in tasks if task["status"] not in {"done", "shipped", "cancelled"}]
+    lines.append(f"Active project: {project['title']} ({project['id']}) - {project['status']}")
     lines.append(f"Open tasks: {len(open_tasks)}/{len(tasks)}")
     for task in open_tasks[:6]:
         suffix = " via Miles" if task["delivery"] == "via_miles" else ""
         lines.append(f"- {task['id']} [{task['status']}] {task['owner']}{suffix}: {task['title']} (${task['estimate_usd']:.2f})")
+
+    artifacts = [a for task in tasks for a in task.get("artifacts", [])]
+    if artifacts:
+        lines.append(f"Artifacts so far: {len(artifacts)} (see /dailyreport)")
+    if project["status"] == "proposed":
+        lines.append("Reply /approve to start the work plan, or /cancel to drop it.")
     return "\n".join(lines)
 
 
@@ -337,6 +450,7 @@ def render_assignment(project, task_specs, state, specialist_keys):
     for owner, delivery, title, estimate in task_specs:
         suffix = " via Miles" if delivery == "via_miles" else ""
         lines.append(f"- {owner}{suffix}: {title} (${estimate:.2f} reserved)")
+    lines.append("Reply /approve to start the work plan, or /cancel to drop it and release the budget.")
     lines.append("Approval gates remain active for sending, deleting, publishing, deploying, paid spend, or new-agent creation.")
     return "\n".join(lines)
 
@@ -356,7 +470,7 @@ def build_daily_report(path=COMPANY_STATE_FILE):
     tasks = project_tasks(state, project["id"])
     done = [task for task in tasks if task["status"] in {"done", "shipped"}]
     blocked = [task for task in tasks if task["status"] == "blocked"]
-    open_tasks = [task for task in tasks if task["status"] not in {"done", "shipped", "blocked"}]
+    open_tasks = [task for task in tasks if task["status"] not in {"done", "shipped", "blocked", "cancelled"}]
 
     lines.append(f"Project: {project['title']}")
     lines.append(f"Shipped/done: {len(done)} | Open: {len(open_tasks)} | Blocked: {len(blocked)}")
@@ -369,6 +483,12 @@ def build_daily_report(path=COMPANY_STATE_FILE):
     if open_tasks:
         lines.append("Next:")
         lines.extend(f"- {task['owner']}: {task['title']}" for task in open_tasks[:5])
+
+    artifacts = [a for task in tasks for a in task.get("artifacts", [])]
+    if artifacts:
+        lines.append("Artifacts (deliverables produced):")
+        lines.extend(f"- {a}" for a in artifacts[:10])
+
     lines.append("Recommendation: keep scope tight, finish one artifact, then decide whether to sell, validate, or build tomorrow.")
     return "\n".join(lines)
 
@@ -399,6 +519,13 @@ def handle_company_command(text, configured_agent_keys, specialist_keys=None, pa
         return pause_company(path)
     if command == "/resumecompany":
         return resume_company(path)
+    if command == "/cancel":
+        return cancel_project(path)
+    if command == "/approve":
+        # Flipping status is fine here, but only group_bot can actually start the
+        # background runner - it intercepts /approve before reaching this branch.
+        message, _ = approve_project(path)
+        return message
     if command == "/setbudget":
         if not arg:
             return "Usage: /setbudget <amount_usd>"

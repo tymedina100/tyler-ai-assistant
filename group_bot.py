@@ -46,7 +46,28 @@ import company_mode
 
 load_dotenv()
 
-GROUP_CHAT_ID = int(os.environ["TELEGRAM_GROUP_CHAT_ID"])
+
+def _require_env(name, hint=""):
+    """Read a required environment variable, exiting with a clear message instead of
+    a raw KeyError traceback if it's missing - matches the friendly-failure style the
+    rest of the app uses. On Railway these are set as service variables, so a typo or
+    an unset one should say exactly what to fix, not dump a stack trace into the logs."""
+    value = os.environ.get(name)
+    if not value:
+        message = f"Missing required environment variable {name}."
+        raise SystemExit(f"{message} {hint}".strip())
+    return value
+
+
+try:
+    GROUP_CHAT_ID = int(_require_env(
+        "TELEGRAM_GROUP_CHAT_ID",
+        "Send any message in your group, then read the chat id from "
+        "https://api.telegram.org/bot<TOKEN>/getUpdates.",
+    ))
+except ValueError:
+    raise SystemExit("TELEGRAM_GROUP_CHAT_ID must be the numeric group chat id (e.g. -1001234567890).")
+
 DAILY_REPORT_TIME = os.environ.get("DAILY_REPORT_TIME", "18:00")
 
 ALLOWED_USER_IDS = {
@@ -121,6 +142,10 @@ bots = {}
 bot_usernames = {}
 locks = {key: asyncio.Lock() for key in BOT_KEYS}
 main_loop = None
+
+# The single in-flight Company Mode plan runner (Feature: v2 checkpointed autonomy).
+# One at a time - /approve refuses to start a second while this is running.
+company_runner_task = None
 
 
 def is_authorized(update):
@@ -249,7 +274,7 @@ def build_specialist_handler(key):
                 if await _handle_pending_confirmation(update, request):
                     return
 
-                answer = await asyncio.to_thread(main.ask_specialist, key, request)
+                answer = await _run_metered(main.ask_specialist, key, request)
         except Exception as e:
             main.logger.error(f"Unhandled error in {key} specialist handler: {e}")
             await update.message.reply_text("Sorry, something went wrong processing that.")
@@ -301,6 +326,17 @@ async def handle_group_message(update: Update):
         if await _handle_pending_confirmation(update, text):
             return
 
+        # /approve and /cancel drive the background execution engine, so they're
+        # intercepted here rather than handled as plain string commands.
+        parsed_company = company_mode.parse_company_command(text)
+        if parsed_company and parsed_company[0] == "/approve":
+            await start_company_plan(update)
+            return
+        if parsed_company and parsed_company[0] == "/cancel":
+            _cancel_running_plan()
+            await reply_chunks(update.message, await asyncio.to_thread(company_mode.cancel_project))
+            return
+
         company_response = company_mode.handle_company_command(
             text,
             configured_agent_keys=BOT_KEYS,
@@ -323,7 +359,7 @@ async def handle_group_message(update: Update):
             # delegated agent's answer is posted to the group as itself by on_delegation,
             # then Miles's recap is posted here.
             try:
-                answer = await asyncio.to_thread(main.ask_manager, text)
+                answer = await _run_metered(main.ask_manager, text)
             except Exception as e:
                 main.logger.error(f"Unhandled error in manager handler: {e}")
                 await update.message.reply_text("Sorry, something went wrong processing that.")
@@ -335,9 +371,9 @@ async def handle_group_message(update: Update):
         for key in responders:
             try:
                 if key == "general":
-                    answer = await asyncio.to_thread(main.ask_ai, text)
+                    answer = await _run_metered(main.ask_ai, text)
                 else:
-                    answer = await asyncio.to_thread(main.ask_specialist, key, text)
+                    answer = await _run_metered(main.ask_specialist, key, text)
             except Exception as e:
                 main.logger.error(f"Error while '{key}' answered a group message: {e}")
                 continue
@@ -366,7 +402,7 @@ async def handle_manager_dm(update: Update):
 
         company_command = company_mode.parse_company_command(text)
         if company_command is not None:
-            if company_command[0] in {"/setbudget", "/assign", "/pausecompany", "/resumecompany"}:
+            if company_command[0] in {"/setbudget", "/assign", "/approve", "/cancel", "/pausecompany", "/resumecompany"}:
                 await update.message.reply_text(
                     "Company Mode changes happen in the group operating room. "
                     "Use /company, /status, or /dailyreport here for read-only context."
@@ -381,7 +417,7 @@ async def handle_manager_dm(update: Update):
             return
 
         try:
-            answer = await asyncio.to_thread(main.ask_manager, text)
+            answer = await _run_metered(main.ask_manager, text)
         except Exception as e:
             main.logger.error(f"Unhandled error in manager DM handler: {e}")
             await update.message.reply_text("Sorry, something went wrong processing that.")
@@ -433,6 +469,196 @@ def on_delegation(specialist_key, request_text, answer_text):
 
     coro = post_dm() if ctx.get("kind") == "manager_dm" else post_group()
     asyncio.run_coroutine_threadsafe(coro, main_loop)
+
+
+# --------------------------------------------------------------------------- #
+# Company Mode v2: metered budget + checkpointed autonomous execution engine.
+# /assign proposes a plan; /approve starts run_company_plan, which works one task at
+# a time, metering real token spend, honoring /pausecompany and a hard daily cap
+# between tasks, and linking each finished task to a real deliverable (artifact).
+# --------------------------------------------------------------------------- #
+
+async def _run_metered(fn, *args):
+    """Run a blocking main.ask_* call with a cost sink attached, then bill the real
+    token spend (and any artifacts) against today's budget as ad-hoc chat spend. Used
+    for reactive Miles delegations so the daily ledger reflects all delegated work,
+    not just the autonomous engine. Does NOT set company_execution, so normal
+    /confirm gating for file writes/email is unchanged in ad-hoc chat."""
+    sink = {"cost_usd": 0.0, "artifacts": [], "context": "ad-hoc chat"}
+
+    def work():
+        main.set_execution_sink(sink)
+        try:
+            return fn(*args)
+        finally:
+            main.set_execution_sink(None)
+
+    answer = await asyncio.to_thread(work)
+    try:
+        await asyncio.to_thread(company_mode.record_adhoc_spend, sink["cost_usd"], sink["artifacts"])
+    except Exception as e:
+        main.logger.error(f"Failed to record ad-hoc spend: {e}")
+    return answer
+
+
+def _cancel_running_plan():
+    global company_runner_task
+    if company_runner_task and not company_runner_task.done():
+        company_runner_task.cancel()
+    company_runner_task = None
+
+
+async def start_company_plan(update):
+    """Handle /approve: flip the project to active and kick off the background runner."""
+    global company_runner_task
+    if company_runner_task and not company_runner_task.done():
+        await update.message.reply_text(
+            "A work plan is already running. Use /pausecompany to halt it or /cancel to stop it."
+        )
+        return
+
+    message, project_id = await asyncio.to_thread(company_mode.approve_project)
+    await update.message.reply_text(message)
+    if project_id:
+        company_runner_task = asyncio.create_task(run_company_plan(project_id))
+
+
+def _task_prompt(project, task):
+    return (
+        f"You are {task['owner']} working on a company project. Deliver a concrete result.\n"
+        f"Company goal: {project['goal']}\n"
+        f"Your task: {task['title']}\n"
+        "If you produce a file or open a pull request, do it now with your tools - that "
+        "saved output is recorded as this task's deliverable. Keep it tight and in scope."
+    )
+
+
+def _defer_remaining(project_id):
+    """Mark still-planned tasks as blocked (deferred) and release their reserve when
+    the daily budget runs out mid-plan."""
+    state = company_mode.load_state()
+    for task in company_mode.project_tasks(state, project_id):
+        if task["status"] == "planned":
+            company_mode.update_task_status(
+                task["id"], "blocked", result="Deferred: daily budget exhausted.", spent_usd=0.0
+            )
+
+
+def _complete_project(project_id):
+    state = company_mode.load_state()
+    for project in state["projects"]:
+        if project["id"] == project_id:
+            project["status"] = "completed"
+    company_mode.save_state(state)
+
+
+async def _run_one_task(project, task):
+    """Execute a single task through its owner agent under company-execution rules.
+    Returns "done" or "blocked" (a gated action needs the user's /confirm)."""
+    owner = task["owner"] if task["owner"] in main.SPECIALISTS else None
+    context = f"Project {project['id']} / task {task['id']}"
+    sink = {"cost_usd": 0.0, "artifacts": [], "context": context}
+    prompt = _task_prompt(project, task)
+
+    await asyncio.to_thread(company_mode.update_task_status, task["id"], "in_progress")
+    await post_to_group(f"Starting: {task['owner']} - {task['title']}", "manager")
+
+    def work():
+        main.set_conversation("group")
+        main.set_reply_context({"kind": "group"})
+        main.set_execution_sink(sink)
+        main.set_company_execution(True)
+        try:
+            if owner:
+                return main.ask_specialist(owner, prompt, record_history=False)
+            return main.ask_ai(prompt, record_history=False)
+        finally:
+            main.set_company_execution(False)
+            main.set_execution_sink(None)
+
+    async with locks["manager"]:
+        try:
+            answer = await asyncio.to_thread(work)
+        except Exception as e:
+            main.logger.error(f"Company task {task['id']} errored: {e}")
+            await asyncio.to_thread(
+                company_mode.mark_task_blocked, task["id"],
+                "Errored while running - see logs.", sink["cost_usd"], sink["artifacts"],
+            )
+            await post_to_group(f"Task {task['id']} hit an error and was parked.", "manager")
+            return "blocked"
+
+    await post_agent_answer_to_group(owner or "manager", answer)
+
+    spent = sink["cost_usd"]
+    artifacts = sink["artifacts"]
+
+    # A gated action (send email / delete) staged during the run means the task needs
+    # your approval. It's keyed to the "group" conversation; leave it staged so
+    # /confirm resolves it, mark the task blocked, and stop so the next task can't
+    # overwrite the pending action.
+    staged = main.pending_actions.get("group")
+    if staged is not None:
+        reason = f"Needs your approval: {main.describe_pending_action(staged)}. Reply /confirm to proceed."
+        await asyncio.to_thread(
+            company_mode.mark_task_blocked, task["id"], reason, spent, artifacts
+        )
+        await post_to_group(reason, "manager")
+        return "blocked"
+
+    await asyncio.to_thread(
+        company_mode.update_task_status, task["id"], "done", answer[:1000], artifacts, spent
+    )
+    state = await asyncio.to_thread(company_mode.load_state)
+    await post_to_group(company_mode.render_money(state), "manager")
+    return "done"
+
+
+async def run_company_plan(project_id):
+    """Work a project's tasks one at a time until done, paused, blocked, or the daily
+    budget is exhausted. Checks pause + budget between every task (the checkpoints)."""
+    try:
+        while True:
+            state = await asyncio.to_thread(company_mode.load_state)
+            project = next((p for p in state["projects"] if p["id"] == project_id), None)
+            if not project or project["status"] != "active":
+                return  # cancelled or completed elsewhere
+
+            if state["company"]["mode"] == "paused":
+                await post_to_group(
+                    "Company Mode is paused - work plan halted. /resumecompany then /approve to continue.",
+                    "manager",
+                )
+                return
+
+            if company_mode.remaining_budget(state) <= 0:
+                await asyncio.to_thread(_defer_remaining, project_id)
+                await post_to_group(
+                    f"Daily budget exhausted - stopping. {company_mode.render_money(state)}. "
+                    "Raise /setbudget and /approve to continue.",
+                    "manager",
+                )
+                return
+
+            task = company_mode.next_planned_task(state, project_id)
+            if task is None:
+                await asyncio.to_thread(_complete_project, project_id)
+                await post_to_group(
+                    f"Work plan complete for {project['title']}. {company_mode.render_money(state)}. "
+                    "See /dailyreport for the deliverables.",
+                    "manager",
+                )
+                return
+
+            outcome = await _run_one_task(project, task)
+            if outcome == "blocked":
+                return  # wait for the user to resolve, then re-/approve
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        main.logger.error(f"Company plan runner crashed: {e}")
+        await post_to_group("The work plan hit an unexpected error and stopped. Check the logs.", "manager")
 
 
 # --------------------------------------------------------------------------- #
@@ -609,7 +835,10 @@ async def run_all():
     # (e.g. the Manager checking for @mentions of specialists that haven't
     # started polling yet would otherwise KeyError).
     for key in BOT_KEYS:
-        token = os.environ[AGENT_INFO[key]["env_var"]]
+        token = _require_env(
+            AGENT_INFO[key]["env_var"],
+            f"It's the BotFather token for the '{key}' bot listed in BOT_KEYS.",
+        )
         app = ApplicationBuilder().token(token).build()
         applications[key] = app
         bots[key] = app.bot
