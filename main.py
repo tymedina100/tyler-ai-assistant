@@ -1210,6 +1210,12 @@ def execute_tool(name, arguments):
                 on_delegation("research", arguments["topic"], answer)
             return answer
 
+        if name == "delegate_to_news_agent":
+            answer = ask_specialist("news", arguments["topic"], record_history=False)
+            if on_delegation:
+                on_delegation("news", arguments["topic"], answer)
+            return answer
+
         if name == "delegate_to_writer_agent":
             answer = ask_specialist("write", arguments["prompt"], record_history=False)
             if on_delegation:
