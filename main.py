@@ -179,6 +179,9 @@ DELEGATION_TOOLS = [
     {"type": "function", "name": "delegate_to_research_agent", "strict": False,
      "description": "Delegate a research or information-lookup request to the Researcher Agent.",
      "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}},
+    {"type": "function", "name": "delegate_to_news_agent", "strict": False,
+     "description": "Delegate current news requests, headline roundups, source-cited news summaries, or topic-based news briefs to the News Agent.",
+     "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}},
     {"type": "function", "name": "delegate_to_writer_agent", "strict": False,
      "description": "Delegate a writing, drafting, or editing request to the Writer Agent.",
      "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
@@ -237,6 +240,8 @@ user's request and get it done by delegating to one or more of the following
 agents using tool calls - never answer the user directly yourself:
 - delegate_to_coding_agent: programming, code-writing, code-reading, or debugging
 - delegate_to_research_agent: looking up information, facts, or current events
+- delegate_to_news_agent: current news requests, headline roundups, source-cited
+  news summaries, and topic-based news briefs
 - delegate_to_writer_agent: drafting, editing, or improving written content
 - delegate_to_personal_assistant: remembering personal facts, preferences, and
   reminders in long-term memory - NOT a real task-tracking app
@@ -266,10 +271,10 @@ Once all needed delegations are done, present the final result back to the user
 as your final answer. Do not significantly rewrite a specialist's own answer -
 relay it, keeping their own voice and sign-off intact, with at most one short
 framing sentence in your own calm, organized Chief-of-Staff tone. Each specialist
-is a distinct character on the team (Patch codes, Scout researches, Quill writes,
-Sage assists, Roster runs the task list, Gale does weather, Cadence handles
-calendar and reminders, Piper handles email) - let their personality come through
-rather than flattening everyone into one voice.
+is a distinct character on the team (Patch codes, Scout researches, Herald leads
+news, Quill writes, Sage assists, Roster runs the task list, Gale does weather,
+Cadence handles calendar and reminders, Piper handles email) - let their
+personality come through rather than flattening everyone into one voice.
 """
 
 
@@ -1205,6 +1210,12 @@ def execute_tool(name, arguments):
                 on_delegation("research", arguments["topic"], answer)
             return answer
 
+        if name == "delegate_to_news_agent":
+            answer = ask_specialist("news", arguments["topic"], record_history=False)
+            if on_delegation:
+                on_delegation("news", arguments["topic"], answer)
+            return answer
+
         if name == "delegate_to_writer_agent":
             answer = ask_specialist("write", arguments["prompt"], record_history=False)
             if on_delegation:
@@ -1326,6 +1337,24 @@ before searching again. Be clear about what is verified fact versus speculation.
 You are Scout, the team's researcher. Voice: curious, energetic fact-hound who
 loves a good source and always says where a claim came from. You clearly label
 what's "verified" versus "unconfirmed". Sign off with "- Scout".
+"""
+    },
+    "news": {
+        "name": "Herald",
+        "label": "Herald (News Agent)",
+        "model": FAST_MODEL,
+        "tool_names": ["search_the_web", "recall_memories"],
+        "role": """
+You are a news assistant. Use search_the_web for current coverage and cite the
+sources you rely on. Use recall_memories to check whether the user has relevant
+past context or preferences before summarizing. Lead with the headline, group
+updates by topic, and separate verified reporting from uncertainty, early reports,
+or analysis. Do not invent details beyond the sources you found.
+""",
+        "persona": """
+You are Herald, the team's news specialist. Voice: crisp newsroom anchor. Lead
+with the headline, group developments by topic, cite sources cleanly, and keep the
+copy tight. Sign off with "- Herald".
 """
     },
     "write": {

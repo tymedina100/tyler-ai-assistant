@@ -65,8 +65,8 @@ main.CONFIRMATION_MODE = "requires_confirmation"
 # Build-order staging: only the agents listed here get a live Telegram bot. Agents
 # NOT listed still work via Miles's delegation (their answers post under Miles) -
 # they just can't be @mentioned directly until you create their bot and add its key
-# here. Full set once every bot exists: ["manager", "code", "research", "write",
-# "task", "tasks", "weather", "calendar", "gmail"].
+# here. Full set once every bot exists: ["manager", "code", "research", "news",
+# "write", "task", "tasks", "weather", "calendar", "gmail"].
 BOT_KEYS = ["manager", "weather", "code", "research"]
 
 SPECIALIST_KEYS = [key for key in BOT_KEYS if key != "manager"]
@@ -92,6 +92,7 @@ AGENT_INFO = {
     },
     "code": {"env_var": "TELEGRAM_CODE_BOT_TOKEN", "tagline": "@mention me with a coding task."},
     "research": {"env_var": "TELEGRAM_RESEARCH_BOT_TOKEN", "tagline": "@mention me with something to look up."},
+    "news": {"env_var": "TELEGRAM_NEWS_BOT_TOKEN", "tagline": "@mention me for headline roundups or source-cited news briefs."},
     "write": {"env_var": "TELEGRAM_WRITE_BOT_TOKEN", "tagline": "@mention me with something to draft."},
     "task": {"env_var": "TELEGRAM_TASK_BOT_TOKEN", "tagline": "@mention me to remember something."},
     "tasks": {"env_var": "TELEGRAM_TASKS_BOT_TOKEN", "tagline": "@mention me to manage your real Todoist tasks."},
