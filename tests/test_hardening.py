@@ -70,6 +70,20 @@ class HardeningTests(unittest.TestCase):
     def test_safe_file_path_rejects_traversal(self):
         self.assertIsNone(self.main.get_safe_file_path("../.env"))
 
+    def test_safe_file_path_strips_redundant_files_prefix(self):
+        # An agent passing "files/pack.md" should hit the same file as "pack.md",
+        # not files/files/pack.md.
+        self.assertEqual(
+            self.main.get_safe_file_path("files/pack.md"),
+            self.main.get_safe_file_path("pack.md"),
+        )
+        self.assertEqual(
+            self.main.get_safe_file_path("./pack.md"),
+            self.main.get_safe_file_path("pack.md"),
+        )
+        # Traversal is still blocked after stripping.
+        self.assertIsNone(self.main.get_safe_file_path("files/../../.env"))
+
     def test_write_file_refuses_oversized_content(self):
         content = "x" * (self.main.MAX_WRITE_FILE_CHARS + 1)
         result = self.main.write_file("oversized.txt", content)

@@ -74,6 +74,11 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(company_mode.parse_company_command("/setbudget $25"), ("/setbudget", "$25"))
         self.assertIsNone(company_mode.parse_company_command("hello team"))
 
+    def test_parse_company_command_strips_bot_mention(self):
+        # Telegram appends @botname to commands in multi-bot groups.
+        self.assertEqual(company_mode.parse_company_command("/dailyreport@TyManagerBot"), ("/dailyreport", ""))
+        self.assertEqual(company_mode.parse_company_command("/setbudget@TyManagerBot 25"), ("/setbudget", "25"))
+
         paused = company_mode.handle_company_command(
             "/pausecompany",
             configured_agent_keys=["manager"],

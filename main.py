@@ -680,7 +680,19 @@ def show_history():
 
 def get_safe_file_path(filename):
     files_dir_path = FILES_DIR.resolve()
-    file_path = (FILES_DIR / filename).resolve()
+
+    # Agents sometimes pass a path that already includes the "files/" prefix (they
+    # copy it from an artifact note like "file: files/pack.md"). Left as-is that
+    # resolves to files/files/pack.md and 404s. Drop a leading "./" and a single
+    # leading "files/" so both "pack.md" and "files/pack.md" work. Everything lives
+    # under files/ anyway, and "../" traversal is still caught by the check below.
+    cleaned = filename.strip()
+    if cleaned.startswith("./") or cleaned.startswith(".\\"):
+        cleaned = cleaned[2:]
+    if cleaned.lower().startswith("files/") or cleaned.lower().startswith("files\\"):
+        cleaned = cleaned[len("files/"):]
+
+    file_path = (FILES_DIR / cleaned).resolve()
 
     try:
         file_path.relative_to(files_dir_path)
