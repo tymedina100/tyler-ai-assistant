@@ -42,6 +42,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 
 import main
 import company_mode
+import gumroad_helpers
 
 
 load_dotenv()
@@ -355,6 +356,9 @@ async def handle_group_message(update: Update):
         if parsed_company and parsed_company[0] == "/assign":
             await assign_with_dynamic_plan(update, parsed_company[1])
             return
+        if parsed_company and parsed_company[0] == "/revenue":
+            await sync_and_report_revenue(update)
+            return
 
         company_response = company_mode.handle_company_command(
             text,
@@ -421,7 +425,7 @@ async def handle_manager_dm(update: Update):
 
         company_command = company_mode.parse_company_command(text)
         if company_command is not None:
-            if company_command[0] in {"/setbudget", "/assign", "/approve", "/cancel", "/publish", "/pausecompany", "/resumecompany"}:
+            if company_command[0] in {"/setbudget", "/assign", "/approve", "/cancel", "/publish", "/link", "/revenue", "/pausecompany", "/resumecompany"}:
                 await update.message.reply_text(
                     "Company Mode changes happen in the group operating room. "
                     "Use /company, /status, or /dailyreport here for read-only context."
@@ -559,6 +563,20 @@ async def assign_with_dynamic_plan(update, goal):
         goal, BOT_KEYS, list(main.SPECIALISTS.keys()), company_mode.COMPANY_STATE_FILE, plan,
     )
     await reply_chunks(update.message, result)
+
+
+async def sync_and_report_revenue(update):
+    """Handle /revenue: pull live sales from Gumroad (I/O off the loop), update the
+    product registry, and show the P&L. If the live pull fails (e.g. no token), still
+    show the last-synced P&L plus why the pull was skipped."""
+    products, err = await asyncio.to_thread(gumroad_helpers.list_products)
+    if err:
+        pnl = await asyncio.to_thread(company_mode.render_pnl)
+        await reply_chunks(update.message, f"{pnl}\n\n(Live Gumroad sync skipped: {err})")
+        return
+    await asyncio.to_thread(company_mode.sync_revenue, products)
+    pnl = await asyncio.to_thread(company_mode.render_pnl)
+    await reply_chunks(update.message, pnl)
 
 
 def _task_prompt(project, task, prior_work=""):

@@ -173,6 +173,40 @@ class CompanyModeTests(unittest.TestCase):
         state = company_mode.load_state(self.state_path)
         self.assertEqual(len(state["tasks"]), len(company_mode.DEFAULT_ASSIGN_TASKS))
 
+    def test_link_sync_revenue_and_pnl(self):
+        company_mode.set_daily_budget(20, self.state_path)
+        company_mode.assign_goal(
+            "Build a widget", ["manager", "code"], specialist_keys=["code"], path=self.state_path,
+        )
+        state = company_mode.load_state(self.state_path)
+        task_id = state["tasks"][0]["id"]
+        company_mode.update_task_status(task_id, "done", spent_usd=1.5, path=self.state_path)
+
+        msg = company_mode.link_product("https://tymedina.gumroad.com/l/widget", self.state_path)
+        self.assertIn("Linked", msg)
+
+        gumroad = [{
+            "id": "P1", "short_url": "https://tymedina.gumroad.com/l/widget",
+            "sales_count": 3, "sales_usd_cents": 5700,
+        }]
+        company_mode.sync_revenue(gumroad, self.state_path)
+        state = company_mode.load_state(self.state_path)
+        product = state["products"][0]
+        self.assertEqual(product["sales_count"], 3)
+        self.assertEqual(product["revenue_usd"], 57.0)
+        self.assertEqual(product["gumroad_product_id"], "P1")
+
+        rows, totals = company_mode.product_pnl(state)
+        self.assertEqual(rows[0]["spend"], 1.5)
+        self.assertEqual(rows[0]["revenue"], 57.0)
+        self.assertEqual(rows[0]["net"], 55.5)
+        self.assertEqual(totals["net"], 55.5)
+        self.assertIn("net +$55.50", company_mode.render_pnl(self.state_path))
+
+    def test_link_product_requires_a_project(self):
+        result = company_mode.link_product("https://x.gumroad.com/l/y", self.state_path)
+        self.assertIn("No project", result)
+
     def test_assigned_project_starts_proposed(self):
         self._assign()
         state = company_mode.load_state(self.state_path)

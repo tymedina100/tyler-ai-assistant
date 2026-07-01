@@ -38,6 +38,9 @@ COMPANY_COMMANDS = {
     "/approve",
     "/cancel",
     "/publish",
+    "/link",
+    "/products",
+    "/revenue",
     "/status",
     "/dailyreport",
     "/pausecompany",
@@ -67,6 +70,7 @@ def new_state():
         "projects": [],
         "tasks": [],
         "events": [],
+        "products": [],
     }
 
 
@@ -76,7 +80,7 @@ def normalize_state(state):
         return base
 
     normalized = deepcopy(base)
-    normalized.update({k: state.get(k, normalized[k]) for k in ("projects", "tasks", "events")})
+    normalized.update({k: state.get(k, normalized[k]) for k in ("projects", "tasks", "events", "products")})
     normalized["company"].update(state.get("company", {}))
 
     if normalized["company"].get("budget_date") != today_key():
@@ -428,6 +432,138 @@ def project_tasks(state, project_id):
     return [task for task in state.get("tasks", []) if task.get("project_id") == project_id]
 
 
+# --------------------------------------------------------------------------- #
+# Products + revenue (v3 money loop). A product links a project to a live Gumroad
+# listing so we can compare what the company SPENT building it against what it EARNED.
+# --------------------------------------------------------------------------- #
+
+def _latest_project(state):
+    """The active project, or the most recently created one if none is active."""
+    project = active_project(state)
+    if project:
+        return project
+    projects = state.get("projects", [])
+    return projects[-1] if projects else None
+
+
+def project_spend(state, project_id):
+    """Total real USD metered against a project (sum of its tasks' spent_usd)."""
+    return _money(sum(task.get("spent_usd", 0.0) for task in project_tasks(state, project_id)))
+
+
+def link_product(gumroad_url, path=COMPANY_STATE_FILE):
+    """Attach a live Gumroad URL to the active (or most recent) project, creating a
+    product registry entry so /revenue can track its sales."""
+    gumroad_url = (gumroad_url or "").strip()
+    if not gumroad_url:
+        return "Usage: /link <gumroad-product-url>"
+
+    state = load_state(path)
+    project = _latest_project(state)
+    if not project:
+        return "No project to link yet. /assign and build something first."
+
+    for product in state["products"]:
+        if product["project_id"] == project["id"]:
+            product["gumroad_url"] = gumroad_url
+            save_state(state, path)
+            return f"Updated the Gumroad link for '{project['title']}'."
+
+    state["products"].append({
+        "project_id": project["id"],
+        "title": project["title"],
+        "gumroad_url": gumroad_url,
+        "gumroad_product_id": None,
+        "sales_count": 0,
+        "revenue_usd": 0.0,
+        "last_synced": None,
+    })
+    add_event(state, "product_linked", f"Linked {project['title']} to {gumroad_url}", project_id=project["id"])
+    save_state(state, path)
+    return f"Linked '{project['title']}' to {gumroad_url}. Run /revenue to pull its sales."
+
+
+def sync_revenue(gumroad_products, path=COMPANY_STATE_FILE):
+    """Update the product registry from a list of Gumroad products (dicts with
+    short_url, id, sales_count, sales_usd_cents). Matches on the linked short_url.
+    Pure - the caller fetches from Gumroad and passes the data in."""
+    state = load_state(path)
+    by_url = {p.get("short_url", "").rstrip("/"): p for p in (gumroad_products or []) if p.get("short_url")}
+    now = _now().isoformat()
+
+    for product in state["products"]:
+        match = by_url.get((product.get("gumroad_url") or "").rstrip("/"))
+        if not match:
+            continue
+        product["gumroad_product_id"] = match.get("id")
+        product["sales_count"] = match.get("sales_count", 0) or 0
+        product["revenue_usd"] = _money((match.get("sales_usd_cents", 0) or 0) / 100.0)
+        product["last_synced"] = now
+
+    save_state(state, path)
+    return state
+
+
+def product_pnl(state):
+    """Per-product P&L: [{title, url, spend, revenue, net, sales_count}], plus totals."""
+    rows = []
+    for product in state.get("products", []):
+        spend = project_spend(state, product["project_id"])
+        revenue = _money(product.get("revenue_usd", 0.0))
+        rows.append({
+            "title": product["title"],
+            "url": product.get("gumroad_url", ""),
+            "spend": spend,
+            "revenue": revenue,
+            "net": _money(revenue - spend),
+            "sales_count": product.get("sales_count", 0),
+        })
+    totals = {
+        "spend": _money(sum(r["spend"] for r in rows)),
+        "revenue": _money(sum(r["revenue"] for r in rows)),
+        "net": _money(sum(r["net"] for r in rows)),
+        "sales_count": sum(r["sales_count"] for r in rows),
+    }
+    return rows, totals
+
+
+def render_products(path=COMPANY_STATE_FILE):
+    state = load_state(path)
+    products = state.get("products", [])
+    if not products:
+        return "No products linked yet. Ship something, then /link <gumroad-url>."
+    lines = ["Products"]
+    for product in products:
+        synced = product.get("last_synced")
+        synced_note = f" (synced {synced[:16]})" if synced else " (not synced - run /revenue)"
+        lines.append(
+            f"- {product['title']}: {product.get('sales_count', 0)} sales, "
+            f"${_money(product.get('revenue_usd', 0.0)):.2f}{synced_note}\n  {product.get('gumroad_url', '')}"
+        )
+    return "\n".join(lines)
+
+
+def render_pnl(path=COMPANY_STATE_FILE):
+    """P&L view for /revenue: spend vs revenue per product and overall."""
+    state = load_state(path)
+    rows, totals = product_pnl(state)
+    if not rows:
+        return "No products linked yet. Ship something, then /link <gumroad-url> and /revenue."
+    lines = ["Company P&L (spend vs revenue)"]
+    for row in rows:
+        sign = "+" if row["net"] >= 0 else "-"
+        lines.append(
+            f"- {row['title']}: {row['sales_count']} sales | earned ${row['revenue']:.2f} | "
+            f"spent ${row['spend']:.2f} | net {sign}${abs(row['net']):.2f}"
+        )
+    sign = "+" if totals["net"] >= 0 else "-"
+    lines.append(
+        f"Total: {totals['sales_count']} sales | earned ${totals['revenue']:.2f} | "
+        f"spent ${totals['spend']:.2f} | net {sign}${abs(totals['net']):.2f}"
+    )
+    return "\n".join(lines)
+
+
 def prior_work_summary(state, project_id, current_task_id, limit_chars=1500):
     """A compact summary of what earlier tasks in this project already produced, so
     the next agent can build on it instead of duplicating it. Includes each completed
@@ -572,6 +708,10 @@ def handle_company_command(text, configured_agent_keys, specialist_keys=None, pa
         return resume_company(path)
     if command == "/cancel":
         return cancel_project(path)
+    if command == "/link":
+        return link_product(arg, path)
+    if command == "/products":
+        return render_products(path)
     if command == "/approve":
         # Flipping status is fine here, but only group_bot can actually start the
         # background runner - it intercepts /approve before reaching this branch.
