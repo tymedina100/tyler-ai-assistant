@@ -21,9 +21,9 @@ A beginner-friendly command-line AI assistant built with Python and the OpenAI A
 - `/search <query>` command to search the web and get a summarized answer
 - `/remember <fact>` command to explicitly save something to long-term memory
 - `/recall <query>` command to see what long-term memory has stored about a topic
-- Six specialist agents, each a named character with its own personality, role, and
-  curated tool access, including real external connectors (Todoist, OpenWeatherMap) —
-  see "Specialist agents" and "Meet the team" below
+- Nine specialist agents, each a named character with a real job title, its own
+  personality, and curated tool access, including real external connectors (Todoist,
+  OpenWeatherMap, Google, Gumroad) — see "Specialist agents" and "Meet the team" below
 - Cost-aware model tiering: a cheaper/faster model handles routing and simple lookups
   while the premium model does the reasoning-heavy work, plus a capped history window
   and a memory-relevance cutoff to keep token cost down — see "Cost: two model tiers"
@@ -99,11 +99,11 @@ GITHUB_CODE_BASE=main
 - Get a free Tavily key (used for `/search`) from https://tavily.com
 - `TELEGRAM_BOT_TOKEN`/`TELEGRAM_ALLOWED_USER_IDS` are only needed if you're running
   the Telegram bot (`bot.py`) — see "Running 24/7" below. Not required for the CLI.
-- Get a free OpenWeatherMap key (used by the Weather Agent) from
+- Get a free OpenWeatherMap key (used by Cadence for weather lookups) from
   https://openweathermap.org/api — note new keys can take up to ~10 minutes (rarely,
   longer) to activate after signup, so a fresh key returning an "Invalid API key"
   error isn't necessarily wrong, just not active yet.
-- Get your Todoist API token (used by the Tasks Agent) from the Todoist app:
+- Get your Todoist API token (used by Sage, the Operations Manager) from the Todoist app:
   Settings → Integrations → Developer. Works with any Todoist account, free or paid.
 - Google Calendar/Gmail (used by Cadence and Piper) use OAuth, not an `.env` key —
   run `python google_auth.py` once to connect them. See "Google setup" below.
@@ -124,8 +124,9 @@ outside it are rejected for safety.
 
 ## Running the tests
 
-The project ships with a small `unittest` suite (Company Mode's budget/ledger logic
-and the safety "hardening" helpers). Run it from the project root:
+The project ships with a small `unittest` suite (Company Mode's budget/ledger logic,
+the safety "hardening" helpers, and a roster-consistency check that catches miswired
+agents). Run it from the project root:
 
 ```powershell
 python -m unittest discover -s tests
@@ -179,15 +180,16 @@ Agent** instead of talking to one fixed assistant. The Manager's job is to read 
 message and get it done by delegating — via tool calls, exactly like the other tools
 in this app — to whichever agent(s) fit best:
 
-- One of the six specialists (`code`, `research`, `write`, `task`, `tasks`, `weather`)
+- One of the nine specialists (`code`, `research`, `write`, `task`, `marketing`,
+  `editor`, `finance`, `calendar`, `gmail`)
 - The **general assistant** (the same all-purpose, all-tools assistant from Week 4),
   for anything that doesn't clearly fit a specialist
 
 **Multi-step delegation.** Most requests need only one agent, but the Manager can
 delegate to *more than one in sequence* when a request genuinely needs it — e.g.
-"look up the weather in Seattle, then write me a note about whether I should bring an
-umbrella" delegates to the Weather Agent first, then to the Writer Agent with the
-weather result included in that next delegation's prompt. Every handoff still goes
+"research the competition, then draft a launch post from the findings" delegates to
+the Head of Research first, then to the Head of Marketing with the research result
+included in that next delegation's prompt. Every handoff still goes
 through the Manager — agents never call each other directly, and architecturally
 can't (a specialist's own tool-calling loop only has access to its own curated tools,
 never the delegation tools). The Manager has a higher tool-call budget than other
@@ -195,8 +197,9 @@ agents (`MAX_MANAGER_TOOL_ITERATIONS = 8` vs. `MAX_TOOL_ITERATIONS = 10`) becaus
 the Manager is expected to spend its budget on delegation chains while specialists
 may spend theirs on search, memory recall, and verification before answering.
 
-You'll see one response block per agent involved (e.g. `Weather Agent response: ...`,
-then `Writer Agent response: ...`), then the Manager's final answer (`Manager
+You'll see one response block per agent involved (e.g. `Scout (Head of Research)
+response: ...`, then `Sway (Head of Marketing & Growth) response: ...`), then the
+Manager's final answer (`Manager
 response: ...`), which relays the result. That's intentional — it's the delegation
 chain made visible, not a bug. Note the Manager's routing is a real judgment call by
 the model, not a fixed rule: a question like "what's the capital of Norway?" might get
@@ -211,41 +214,40 @@ so your original wording is never lost or paraphrased in the permanent record.
 
 ## Specialist agents
 
-Beyond the general assistant, six specialist commands each use the same tool-calling
+Beyond the general assistant, nine specialists each use the same tool-calling
 machinery as plain chat, but with a different system prompt and a **curated subset**
 of tools — not every specialist can do everything. Each one is also a **named
-character with its own personality** (see "Meet the team" below):
+character with a real job title and its own personality** (see "Meet the team" below):
 
 | Command | Specialist | Tools it has |
 |---|---|---|
-| `/code <task>` | **Patch** (Coding Agent) | read file, write file, search the web, recall memory |
-| `/research <topic>` | **Scout** (Researcher Agent) | search the web, recall memory, remember a fact |
-| `/write <prompt>` | **Quill** (Writer Agent) | read file, write file, recall memory |
-| `/task <request>` | **Sage** (Personal Assistant Agent) | remember a fact, recall memory, write file, read file |
-| (Manager-only — no direct slash command) | **Roster** (Tasks Agent) | create/list real Todoist tasks |
-| (Manager-only — no direct slash command) | **Gale** (Weather Agent) | current weather lookup |
-| (Manager-only — no direct slash command) | **Cadence** (Calendar & Scheduler Agent) | Google Calendar events + timed reminders |
-| (Manager-only — no direct slash command) | **Piper** (Gmail Agent) | search/read/draft/send email |
+| `/code <task>` | **Patch** (Head of Engineering) | read file, write file, search the web, recall memory, run code, GitHub |
+| `/research <topic>` | **Scout** (Head of Research) | search the web, recall memory, remember a fact — also runs the news desk |
+| `/write <prompt>` | **Quill** (Content Lead) | read file, write file, recall memory |
+| `/task <request>` | **Sage** (Operations Manager) | remember a fact, recall memory, write/read file, create/list real Todoist tasks |
+| (Manager-only — no direct slash command) | **Sway** (Head of Marketing & Growth) | search the web, read/write file, remember/recall memory |
+| (Manager-only — no direct slash command) | **Vera** (Managing Editor) | read file, search the web, recall memory |
+| (Manager-only — no direct slash command) | **Ledger** (CFO) | company status, live revenue/P&L report, remember/recall memory |
+| (Manager-only — no direct slash command) | **Cadence** (Executive Assistant) | Google Calendar events + timed reminders + weather lookup |
+| (Manager-only — no direct slash command) | **Piper** (Communications & Support Lead) | search/read/draft/send email, recall memory |
 
-**Patch can also run code.** The Coding Agent has a `run_python` tool that actually
+**Patch can also run code.** The Head of Engineering has a `run_python` tool that actually
 executes Python in a sandbox (see "Code execution" below), so it can test and verify
 what it writes instead of guessing.
 
-This is deliberate: for example, the Researcher Agent *cannot* call `write_file` even
+This is deliberate: for example, Scout (Head of Research) *cannot* call `write_file` even
 if asked to — it genuinely doesn't have access to that tool, so it'll tell you it can't
 and offer the content for you to save yourself, rather than faking it. Scoping each
 agent to only the tools its role needs is a basic safety practice (least privilege),
 not just an organizational nicety.
 
-**Personal Assistant Agent vs. Tasks Agent — these sound similar but are deliberately
-different:** the Personal Assistant only saves general facts, reminders, and
-preferences to local long-term memory (the same Chroma store everything else uses) —
-it is *not* a real task tracker. The Tasks Agent is connected to your actual Todoist
-account via its REST API and creates/checks real to-do items there. Both the
-specialists' own instructions and the Manager's delegation tool descriptions spell
-this distinction out explicitly, since without it the Manager would have no reliable
-way to choose between them (e.g. "remind me to call mom" routes to the Personal
-Assistant; "add buy groceries to my Todoist" routes to the Tasks Agent).
+**Sage covers both memory and the real task list.** The Operations Manager saves
+general facts and preferences to local long-term memory (the same Chroma store
+everything else uses) *and* is connected to your actual Todoist account via its REST
+API, creating and checking real to-do items there. (These used to be two separate
+agents — a Personal Assistant and a Tasks Agent — whose split confused the Manager's
+routing; merging them means "remind me to call mom" and "add buy groceries to my
+Todoist" both land with Sage, who picks the right tool.)
 
 All agents share the same `conversation_history` and long-term memory as plain
 chat and each other — there's one memory store for the whole assistant, not one per
@@ -268,21 +270,30 @@ Telegram bot, and the multi-bot group all show the same characters:
 
 - **Miles** — the Manager / Chief of Staff. Reads your request and routes it; relays
   each specialist's answer while keeping their voice intact.
-- **Patch** — Coding Agent. Blunt, pragmatic senior engineer.
-- **Scout** — Researcher Agent. Curious fact-hound who cites sources.
-- **Quill** — Writer Agent. Warm wordsmith who cares about tone.
-- **Sage** — Personal Assistant Agent. Calm and organized; remembers your preferences.
-- **Roster** — Tasks Agent. Crisp operator for your real Todoist list.
-- **Gale** — Weather Agent. Cheery weather nerd.
-- **Cadence** — Calendar & Scheduler Agent. Unflappable and precise; runs your Google
-  Calendar and your reminders.
-- **Piper** — Gmail Agent. Brisk and discreet; triages, drafts, and sends email.
+- **Patch** — Head of Engineering. Blunt, pragmatic senior engineer.
+- **Scout** — Head of Research. Curious fact-hound who cites sources; also runs the
+  news desk (headline-led, source-cited briefs).
+- **Quill** — Content Lead. Warm wordsmith who cares about tone.
+- **Sage** — Operations Manager. Calm and organized; remembers your preferences and
+  runs your real Todoist list.
+- **Sway** — Head of Marketing & Growth. Sharp and benefit-led; owns positioning,
+  landing-page copy, SEO, and launch content. Allergic to hype without proof.
+- **Vera** — Managing Editor. The final quality gate: reviews every deliverable
+  against a checklist and returns "APPROVED" or a numbered list of required fixes.
+- **Ledger** — CFO. Dry and numerate; owns the daily budget, spend, and per-product
+  P&L. Leads with the number.
+- **Cadence** — Executive Assistant. Unflappable and precise; runs your Google
+  Calendar, your reminders, and the weather desk.
+- **Piper** — Communications & Support Lead. Brisk and discreet; triages, drafts, and
+  sends email, including customer-support triage for the company's products.
 - **Robin** — the general assistant (the all-rounder for anything that doesn't fit a
   specialist).
 
-Cadence and Piper are the newest hires: they work today via Miles's delegation (their
-answers post under Miles in the group), and get their own Telegram bots once you create
-them and add `"calendar"` / `"gmail"` to `BOT_KEYS`.
+Sway, Vera, and Ledger are the newest hires from the roster reorg (which also merged
+the old News Agent into Scout, the old Tasks Agent into Sage, and retired the Weather
+Agent's seat — the weather *tool* moved to Cadence). Cadence and Piper still work via
+Miles's delegation until you create their bots and add `"calendar"` / `"gmail"` to
+`BOT_KEYS`.
 
 Personalities are just prompt text, so they're easy to retune: edit the `persona`
 field on each `SPECIALISTS` entry (or `MANAGER_INSTRUCTIONS` / `ASSISTANT_INSTRUCTIONS`
@@ -295,13 +306,13 @@ a name never drifts between interfaces.
 Not every request needs the most powerful (most expensive) model, so agents run on one
 of two tiers instead of one model for everything:
 
-- **`PREMIUM_MODEL`** — used where real reasoning matters: **Patch** (coding),
-  **Scout** (research), **Quill** (writing), and **Robin** (the catch-all general
-  assistant).
+- **`PREMIUM_MODEL`** — used where real reasoning matters: **Patch** (engineering),
+  **Scout** (research), **Quill** (writing), **Sway** (marketing), **Vera** (editorial
+  review), and **Robin** (the catch-all general assistant).
 - **`FAST_MODEL`** — a cheaper, faster model for work that's mostly routing or a thin
   wrapper over an API result: **Miles** (the Manager's delegation decision is a
-  classification task), **Gale** (weather), **Roster** (Todoist), and **Sage**
-  (personal-assistant memory ops).
+  classification task), **Sage** (memory + Todoist ops), **Ledger** (reads the ledger
+  and P&L tools), **Cadence** (calendar/reminders/weather), and **Piper** (Gmail).
 
 Both are constants at the top of `main.py`, and every call defaults to `PREMIUM_MODEL`,
 so nothing silently downgrades — a call is only cheap where the code deliberately passes
@@ -321,7 +332,7 @@ Two related token-cost guards also live in `main.py`:
 
 ## Code execution (Patch)
 
-Patch (the Coding Agent) has a `run_python` tool that actually executes Python and
+Patch (the Head of Engineering) has a `run_python` tool that actually executes Python and
 returns its stdout, stderr, and exit code — so it can test what it writes rather than
 guessing. Execution is **sandboxed, but pragmatically, not as a hard security jail:**
 
@@ -404,7 +415,7 @@ Patch's tools for it:
 **Nothing ships until you merge.** The PR is the review gate — Patch can only *propose*.
 After you merge, redeploy for it to take effect. This is the "self-extending assistant"
 loop: ask in Telegram ("add a Spotify agent"), Patch opens a PR, you review and merge.
-Because Patch is the Coding Agent, its internal tool-call budget is also a bit higher
+Because Patch is the Head of Engineering, its internal tool-call budget is also a bit higher
 (`max_iterations: 8`) to fit a browse → read → propose flow in one turn.
 
 ## Proactive & scheduling (Telegram group)
@@ -441,8 +452,8 @@ the CEO/founder and Miles acts as COO. It stores state in `company_state.json`
 ### The v2 loop: propose → approve → work
 
 1. `/setbudget 20` — set today's budget to $20.
-2. `/assign <goal>` — Miles drafts a small work plan (research → build → write → tidy),
-   reserves budget for it, and **proposes** it. Nothing runs yet.
+2. `/assign <goal>` — Miles drafts a small work plan (research → build → write →
+   editor review), reserves budget for it, and **proposes** it. Nothing runs yet.
 3. `/approve` — kicks off the execution engine. Agents work the plan **one task at a
    time**, each replying as themselves, and every finished task is linked to a real
    **deliverable** (a `files/` path, a GitHub file/PR URL, or saved copy). Each task is
@@ -509,6 +520,10 @@ project to its Gumroad listing, and `/revenue` pulls **real** sales from the Gum
 Applications) to show per-product **P&L**: what the company *spent* building it (real
 metered token cost) vs what it *earned*. `/products` lists everything you've shipped with
 its sales. This is what makes the company measurable instead of just busy.
+
+The same numbers are also available conversationally: **Ledger (the CFO)** has
+`get_company_status` and `get_revenue_report` tools, so you can just ask "how's the
+budget today?" or "which product is actually profitable?" in the group or a DM.
 
 ### What stays supervised
 
@@ -613,7 +628,7 @@ python bot.py
   doesn't resume any further steps the original request may have implied. Re-prompt
   for those once the write is confirmed.
 - Everything else — plain chat through the Manager (including multi-step delegation),
-  all six specialists, file reading, web search, long-term memory — works the same as
+  all nine specialists, file reading, web search, long-term memory — works the same as
   the CLI.
 - Long Telegram messages are split into multiple replies (Telegram's limit is ~4096
   characters per message).
@@ -674,16 +689,25 @@ duplication — this file is purely the "who's listening, who replies as whom" l
    TELEGRAM_RESEARCH_BOT_TOKEN=...
    TELEGRAM_WRITE_BOT_TOKEN=...
    TELEGRAM_TASK_BOT_TOKEN=...
-   TELEGRAM_TASKS_BOT_TOKEN=...
-   TELEGRAM_WEATHER_BOT_TOKEN=...
+   TELEGRAM_MARKETING_BOT_TOKEN=...
+   TELEGRAM_EDITOR_BOT_TOKEN=...
+   TELEGRAM_FINANCE_BOT_TOKEN=...
    TELEGRAM_GROUP_CHAT_ID=...
    ```
    `TELEGRAM_GROUP_CHAT_ID` only needs setting once — send any message in the group,
    then check which chat ID any of your bots received it from (e.g. via
    `https://api.telegram.org/bot<TOKEN>/getUpdates`).
+
+   **Migrating from the pre-reorg roster?** The old news/weather/tasks bots are
+   repurposed for the new hires: in BotFather use `/setname` to retitle each bot
+   (display name only — the @username is fixed at creation, so e.g. the old news
+   bot keeps its @handle while displaying as Sway), then copy the old token value
+   into the matching new var (news → marketing, weather → editor, tasks → finance)
+   and delete the old var. On a deployed instance, make the same env-var swap on
+   the platform and redeploy.
 5. In `group_bot.py`, add the agent's key to `BOT_KEYS` (near the top of the file) —
-   this is how you control which agents are actually active without needing all 7
-   bots created before anything works. Start small (e.g. just Manager + one
+   this is how you control which agents are actually active without needing every
+   bot created before anything works. Start small (e.g. just Manager + one
    specialist) and expand as you create more bots.
 
 **Optional: give every bot its own profile picture.**

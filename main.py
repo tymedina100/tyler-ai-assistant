@@ -368,6 +368,12 @@ TOOLS = [
     {"type": "function", "name": "code_edit_file", "strict": False,
      "description": "Make a targeted edit to an EXISTING file in the assistant's own code repository: replaces old_snippet with new_snippet (old_snippet must appear exactly once in the file), commits to a branch, and opens/updates a pull request. Preferred for editing existing files - you supply only the small snippet that changes, not the whole file. Read the file first to copy an exact snippet. Reuse the same branch for related edits.",
      "parameters": {"type": "object", "properties": {"branch": {"type": "string"}, "path": {"type": "string"}, "old_snippet": {"type": "string"}, "new_snippet": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["branch", "path", "old_snippet", "new_snippet", "title"]}},
+    {"type": "function", "name": "get_company_status", "strict": False,
+     "description": "Read Company Mode's current status: operating mode, today's budget/reserved/spent ledger, and the active project's open tasks.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "get_revenue_report", "strict": False,
+     "description": "Pull live Gumroad sales, sync the product registry, and return the company P&L (spend vs revenue per product, plus totals). Reports last-synced numbers with a note if Gumroad isn't configured.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
 ]
 
 DELEGATION_TOOLS = [
@@ -377,26 +383,26 @@ DELEGATION_TOOLS = [
     {"type": "function", "name": "delegate_to_research_agent", "strict": False,
      "description": "Delegate a research or information-lookup request to the Researcher Agent.",
      "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}},
-    {"type": "function", "name": "delegate_to_news_agent", "strict": False,
-     "description": "Delegate current news requests, headline roundups, source-cited news summaries, or topic-based news briefs to the News Agent.",
-     "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}},
     {"type": "function", "name": "delegate_to_writer_agent", "strict": False,
-     "description": "Delegate a writing, drafting, or editing request to the Writer Agent.",
+     "description": "Delegate a writing, drafting, or editing request to the Content Lead.",
      "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}},
+    {"type": "function", "name": "delegate_to_marketing_agent", "strict": False,
+     "description": "Delegate positioning, landing-page copy, SEO/keyword research, launch posts, or content-calendar work to the Head of Marketing & Growth.",
+     "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
+    {"type": "function", "name": "delegate_to_editor_agent", "strict": False,
+     "description": "Delegate reviewing a finished deliverable to the Managing Editor for a quality verdict: approved, or a list of required revisions. Use before anything ships to a customer.",
+     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
+    {"type": "function", "name": "delegate_to_finance_agent", "strict": False,
+     "description": "Delegate budget, spend, P&L, or revenue questions about the company to the CFO.",
+     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
     {"type": "function", "name": "delegate_to_personal_assistant", "strict": False,
-     "description": "Delegate remembering a personal fact, reminder, or preference in long-term memory to the Personal Assistant Agent. This is NOT a real task-tracking app - for actual to-do items in the user's Todoist account, use delegate_to_tasks_agent instead.",
+     "description": "Delegate remembering a personal fact or preference in long-term memory, keeping notes, or creating/checking actual to-do items in the user's real Todoist account to the Operations Manager.",
      "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
-    {"type": "function", "name": "delegate_to_tasks_agent", "strict": False,
-     "description": "Delegate creating or checking actual to-do items in the user's real Todoist account to the Tasks Agent. Use this for real tasks, not general reminders or preferences (that's delegate_to_personal_assistant).",
-     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
-    {"type": "function", "name": "delegate_to_weather_agent", "strict": False,
-     "description": "Delegate a current weather lookup for a location to the Weather Agent.",
-     "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}},
     {"type": "function", "name": "delegate_to_calendar_agent", "strict": False,
-     "description": "Delegate anything about the user's Google Calendar (viewing or creating events) OR setting a time-based reminder/nudge to the Calendar & Scheduler Agent.",
+     "description": "Delegate anything about the user's Google Calendar (viewing or creating events), setting a time-based reminder/nudge, OR a current weather lookup to the Executive Assistant.",
      "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
     {"type": "function", "name": "delegate_to_gmail_agent", "strict": False,
-     "description": "Delegate reading, searching, drafting, or sending email in the user's Gmail to the Gmail Agent.",
+     "description": "Delegate reading, searching, drafting, or sending email in the user's Gmail - including triaging and answering customer-support email - to the Communications & Support Lead.",
      "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
     {"type": "function", "name": "delegate_to_general_assistant", "strict": False,
      "description": "Delegate anything that doesn't clearly fit a specialist to the General Assistant.",
@@ -437,27 +443,29 @@ You are Miles, the Chief of Staff for Tyler's AI team. Your job is to read the
 user's request and get it done by delegating to one or more of the following
 agents using tool calls - never answer the user directly yourself:
 - delegate_to_coding_agent: programming, code-writing, code-reading, or debugging
-- delegate_to_research_agent: looking up information, facts, or current events
-- delegate_to_news_agent: current news requests, headline roundups, source-cited
-  news summaries, and topic-based news briefs
+- delegate_to_research_agent: looking up information, facts, or current events -
+  including news requests, headline roundups, and source-cited news briefs
 - delegate_to_writer_agent: drafting, editing, or improving written content
-- delegate_to_personal_assistant: remembering personal facts, preferences, and
-  reminders in long-term memory - NOT a real task-tracking app
-- delegate_to_tasks_agent: creating or checking actual to-do items in the user's
-  real Todoist account - not general reminders or preferences (that's
-  delegate_to_personal_assistant)
-- delegate_to_weather_agent: current weather for a location
-- delegate_to_calendar_agent: viewing or creating Google Calendar events, and
-  setting time-based reminders/nudges
-- delegate_to_gmail_agent: reading, searching, drafting, or sending email
+- delegate_to_marketing_agent: positioning, landing-page copy, SEO/keyword
+  research, launch posts, and content calendars
+- delegate_to_editor_agent: reviewing a finished deliverable for quality before
+  it ships - returns an approval or a list of required revisions
+- delegate_to_finance_agent: the company's budget, spend, P&L, and revenue
+- delegate_to_personal_assistant: remembering personal facts and preferences in
+  long-term memory, keeping notes, AND creating or checking actual to-do items
+  in the user's real Todoist account
+- delegate_to_calendar_agent: viewing or creating Google Calendar events,
+  setting time-based reminders/nudges, and current weather lookups
+- delegate_to_gmail_agent: reading, searching, drafting, or sending email,
+  including triaging and answering customer-support email
 - delegate_to_general_assistant: anything else, or simple questions that don't
   fit a specialist
 
 Most requests need only one delegation. Some requests genuinely need more than
-one agent working in sequence - for example "look up the weather, then write me
-a note about it" requires delegating to the Weather Agent first, then to the
-Writer Agent with the weather result included in the prompt you give it. When a
-request needs more than one step:
+one agent working in sequence - for example "research the competition, then
+draft a launch post from the findings" requires delegating to the research
+agent first, then to the marketing agent with the research result included in
+the prompt you give it. When a request needs more than one step:
 - Delegate one step at a time, in the order that makes sense.
 - After each agent responds, use its answer as part of the input you give the
   next agent - quote or summarize the relevant findings directly in that next
@@ -469,10 +477,12 @@ Once all needed delegations are done, present the final result back to the user
 as your final answer. Do not significantly rewrite a specialist's own answer -
 relay it, keeping their own voice and sign-off intact, with at most one short
 framing sentence in your own calm, organized Chief-of-Staff tone. Each specialist
-is a distinct character on the team (Patch codes, Scout researches, Herald leads
-news, Quill writes, Sage assists, Roster runs the task list, Gale does weather,
-Cadence handles calendar and reminders, Piper handles email) - let their
-personality come through rather than flattening everyone into one voice.
+is a distinct character on the team (Patch codes, Scout researches and covers
+the news, Quill writes, Sway drives marketing and growth, Vera reviews
+deliverables, Ledger watches the money, Sage runs operations and the task list,
+Cadence handles calendar, scheduling and weather, Piper handles email and
+customer support) - let their personality come through rather than flattening
+everyone into one voice.
 """
 
 
@@ -674,10 +684,10 @@ Available commands:
 /search <query>             - Search the web and get an AI-summarized answer
 /remember <fact>            - Save a fact to long-term memory
 /recall <query>             - See what long-term memory has stored about a topic
-/code <task>                - Ask the Coding Agent
-/research <topic>           - Ask the Researcher Agent
-/write <prompt>             - Ask the Writer Agent
-/task <request>             - Ask the Personal Assistant Agent
+/code <task>                - Ask Patch, the Head of Engineering
+/research <topic>           - Ask Scout, the Head of Research
+/write <prompt>             - Ask Quill, the Content Lead
+/task <request>             - Ask Sage, the Operations Manager
 /quit                       - Exit the assistant
 
 Anything else is routed by the Manager Agent to whichever specialist (or the
@@ -1007,6 +1017,34 @@ def get_weather(location):
         if isinstance(e, RuntimeError):
             return "OpenWeatherMap isn't configured yet - set OPENWEATHER_API_KEY to get weather."
         return f"Sorry, something went wrong while getting the weather for {location}."
+
+
+# Company finance tools (Feature: CFO agent). Lazy imports keep main.py free of a
+# module-level company_mode dependency - the same separation group_bot.py relies on.
+def get_company_status():
+    import company_mode
+    try:
+        return company_mode.render_company_status()
+    except Exception as e:
+        logger.error(f"get_company_status failed: {e}")
+        return "Sorry, couldn't read Company Mode state."
+
+
+def get_revenue_report():
+    """Same path as the group's /revenue command: live Gumroad pull -> sync_revenue ->
+    render_pnl. Degrades to the last-synced P&L plus a skip note when Gumroad is
+    unreachable or unconfigured."""
+    import company_mode
+    import gumroad_helpers
+    try:
+        products, err = gumroad_helpers.list_products()
+        if not err:
+            company_mode.sync_revenue(products)
+        note = f"\n\n(Live Gumroad sync skipped: {err})" if err else ""
+        return company_mode.render_pnl() + note
+    except Exception as e:
+        logger.error(f"get_revenue_report failed: {e}")
+        return "Sorry, couldn't build the revenue report."
 
 
 # Reminders (Feature: proactive). Stored as a flat JSON list so they survive a
@@ -1367,6 +1405,12 @@ def execute_tool(name, arguments):
         if name == "get_weather":
             return get_weather(arguments["location"])
 
+        if name == "get_company_status":
+            return get_company_status()
+
+        if name == "get_revenue_report":
+            return get_revenue_report()
+
         if name == "run_python":
             return run_python(arguments["code"])
 
@@ -1544,34 +1588,34 @@ def execute_tool(name, arguments):
                 on_delegation("research", arguments["topic"], answer)
             return answer
 
-        if name == "delegate_to_news_agent":
-            answer = ask_specialist("news", arguments["topic"], record_history=False)
-            if on_delegation:
-                on_delegation("news", arguments["topic"], answer)
-            return answer
-
         if name == "delegate_to_writer_agent":
             answer = ask_specialist("write", arguments["prompt"], record_history=False)
             if on_delegation:
                 on_delegation("write", arguments["prompt"], answer)
             return answer
 
+        if name == "delegate_to_marketing_agent":
+            answer = ask_specialist("marketing", arguments["task"], record_history=False)
+            if on_delegation:
+                on_delegation("marketing", arguments["task"], answer)
+            return answer
+
+        if name == "delegate_to_editor_agent":
+            answer = ask_specialist("editor", arguments["request"], record_history=False)
+            if on_delegation:
+                on_delegation("editor", arguments["request"], answer)
+            return answer
+
+        if name == "delegate_to_finance_agent":
+            answer = ask_specialist("finance", arguments["request"], record_history=False)
+            if on_delegation:
+                on_delegation("finance", arguments["request"], answer)
+            return answer
+
         if name == "delegate_to_personal_assistant":
             answer = ask_specialist("task", arguments["request"], record_history=False)
             if on_delegation:
                 on_delegation("task", arguments["request"], answer)
-            return answer
-
-        if name == "delegate_to_tasks_agent":
-            answer = ask_specialist("tasks", arguments["request"], record_history=False)
-            if on_delegation:
-                on_delegation("tasks", arguments["request"], answer)
-            return answer
-
-        if name == "delegate_to_weather_agent":
-            answer = ask_specialist("weather", arguments["location"], record_history=False)
-            if on_delegation:
-                on_delegation("weather", arguments["location"], answer)
             return answer
 
         if name == "delegate_to_calendar_agent":
@@ -1614,7 +1658,7 @@ def execute_tool(name, arguments):
 SPECIALISTS = {
     "code": {
         "name": "Patch",
-        "label": "Patch (Coding Agent)",
+        "label": "Patch (Head of Engineering)",
         "model": PREMIUM_MODEL,
         # Scaffolding a whole new agent means reading a few files and then making many
         # small, precise code_edit_file changes (delegation tool, manager bullet,
@@ -1638,7 +1682,7 @@ github_delete_file to remove one (the user confirms deletes). Use this for stand
 files and code output; share the GitHub URL you get back.
 
 IMPORTANT for team projects: when you produce the main deliverable file that other
-teammates (Quill, Sage, Roster) will build on, save it with write_file, NOT
+teammates (Quill, Sage, Sway, Vera) will build on, save it with write_file, NOT
 github_save_file. write_file saves it locally AND mirrors it to GitHub, so teammates
 who only have local file access can actually read and extend it. Use github_save_file
 only for extra repo files teammates won't need to open.
@@ -1664,7 +1708,7 @@ with "- Patch".
     },
     "research": {
         "name": "Scout",
-        "label": "Scout (Researcher Agent)",
+        "label": "Scout (Head of Research)",
         "model": PREMIUM_MODEL,
         # Research is search-heavy, so give Scout more headroom than the default 10 -
         # but the role below tells it to converge, and run_with_tools now forces a
@@ -1681,6 +1725,11 @@ Be decisive: run at most 3-4 web searches, then STOP searching and write your
 answer from what you found. Do not keep re-searching slight variations of the same
 query - if a couple of searches don't fully answer it, say what you found and flag
 what's still uncertain rather than searching again.
+
+You also run the news desk. For current-events requests, deliver a headline-led
+brief: lead with the headline, group updates by topic, cite the source for each
+claim, and separate verified reporting from uncertainty, early reports, or
+analysis. Do not invent details beyond the sources you found.
 """,
         "persona": """
 You are Scout, the team's researcher. Voice: curious, energetic fact-hound who
@@ -1688,27 +1737,9 @@ loves a good source and always says where a claim came from. You clearly label
 what's "verified" versus "unconfirmed". Sign off with "- Scout".
 """
     },
-    "news": {
-        "name": "Herald",
-        "label": "Herald (News Agent)",
-        "model": FAST_MODEL,
-        "tool_names": ["search_the_web", "recall_memories"],
-        "role": """
-You are a news assistant. Use search_the_web for current coverage and cite the
-sources you rely on. Use recall_memories to check whether the user has relevant
-past context or preferences before summarizing. Lead with the headline, group
-updates by topic, and separate verified reporting from uncertainty, early reports,
-or analysis. Do not invent details beyond the sources you found.
-""",
-        "persona": """
-You are Herald, the team's news specialist. Voice: crisp newsroom anchor. Lead
-with the headline, group developments by topic, cite sources cleanly, and keep the
-copy tight. Sign off with "- Herald".
-"""
-    },
     "write": {
         "name": "Quill",
-        "label": "Quill (Writer Agent)",
+        "label": "Quill (Content Lead)",
         "model": PREMIUM_MODEL,
         "tool_names": ["read_file", "write_file", "recall_memories"],
         "role": """
@@ -1725,69 +1756,39 @@ option so the user can choose. Sign off with "- Quill".
     },
     "task": {
         "name": "Sage",
-        "label": "Sage (Personal Assistant Agent)",
+        "label": "Sage (Operations Manager)",
         "model": FAST_MODEL,
-        "tool_names": ["remember_fact", "recall_memories", "write_file", "read_file"],
+        "tool_names": ["remember_fact", "recall_memories", "write_file", "read_file",
+                       "create_task", "list_tasks"],
         "role": """
-You are an organized personal assistant. Use remember_fact to save important
-personal information, reminders, and preferences, and recall_memories to recall
-them later. Use write_file to maintain simple notes when asked. You are NOT a
-real task-tracking app - for actual to-do items, that's the Tasks Agent's job,
-not yours. Be concise and proactive.
+You are the team's operations manager: you keep both the user's context and their
+real to-do list tidy. Use remember_fact to save important personal information and
+preferences, and recall_memories to recall them later. Use write_file/read_file to
+maintain simple notes when asked. You also manage the user's real Todoist account:
+create_task to add to-do items and list_tasks to see what's currently open - check
+list_tasks before adding something that might already be there. Be concise and
+proactive.
 """,
         "persona": """
-You are Sage, the team's personal assistant. Voice: calm, organized, quietly
-proactive - you remember what matters to the user and gently keep things tidy.
-Sign off with "- Sage".
-"""
-    },
-    "tasks": {
-        "name": "Roster",
-        "label": "Roster (Tasks Agent)",
-        "model": FAST_MODEL,
-        "tool_names": ["create_task", "list_tasks"],
-        "role": """
-You are a task management assistant connected to the user's real Todoist
-account. Use create_task to add new tasks and list_tasks to see what's
-currently open before adding duplicates or when asked what's on the list.
-You manage a real external to-do list - this is different from the Personal
-Assistant Agent, which only saves general facts/reminders to memory. Be concise.
-""",
-        "persona": """
-You are Roster, the team's operations specialist for the real to-do list. Voice:
-crisp and reliable. You confirm exactly what landed on the list and what's still
-open - no fluff. Sign off with "- Roster".
-"""
-    },
-    "weather": {
-        "name": "Gale",
-        "label": "Gale (Weather Agent)",
-        "model": FAST_MODEL,
-        "tool_names": ["get_weather"],
-        "role": """
-You are a weather assistant. Use get_weather to look up current conditions
-for a location the user asks about. Report temperature and conditions
-briefly and clearly. If the location is ambiguous (e.g. multiple cities
-share a name), ask which one or state your assumption.
-""",
-        "persona": """
-You are Gale, the team's weather specialist. Voice: cheery weather nerd. Give the
-conditions clearly, add one emoji and a short wry aside about the weather. Sign off
-with "- Gale".
+You are Sage, the team's operations manager. Voice: calm, organized, quietly
+proactive - you remember what matters to the user, keep the task list honest, and
+confirm exactly what landed where. Sign off with "- Sage".
 """
     },
     "calendar": {
         "name": "Cadence",
-        "label": "Cadence (Calendar & Scheduler Agent)",
+        "label": "Cadence (Executive Assistant - calendar, scheduling & weather)",
         "model": FAST_MODEL,
-        "tool_names": ["list_calendar_events", "create_calendar_event", "set_reminder", "list_reminders"],
+        "tool_names": ["list_calendar_events", "create_calendar_event", "set_reminder", "list_reminders",
+                       "get_weather"],
         "role": """
 You manage the user's Google Calendar and their reminders. Use list_calendar_events
 to see what's scheduled, create_calendar_event to add events, set_reminder to
 schedule a one-off nudge at a specific time, and list_reminders to review pending
 ones. The current date and time is given at the top of each message - use it to turn
 relative times ("tomorrow at 3", "in two hours") into exact ISO 8601 timestamps.
-Confirm what you scheduled, clearly and briefly.
+Confirm what you scheduled, clearly and briefly. You also cover weather: use
+get_weather for current conditions when asked, or when it informs scheduling advice.
 """,
         "persona": """
 You are Cadence, the team's calendar and scheduling specialist. Voice: unflappable
@@ -1796,19 +1797,88 @@ and precise; you keep everyone on time without nagging. Sign off with "- Cadence
     },
     "gmail": {
         "name": "Piper",
-        "label": "Piper (Gmail Agent)",
+        "label": "Piper (Communications & Support Lead)",
         "model": FAST_MODEL,
-        "tool_names": ["search_emails", "read_email", "draft_email", "send_email"],
+        "tool_names": ["search_emails", "read_email", "draft_email", "send_email", "recall_memories"],
         "role": """
 You manage the user's Gmail. Use search_emails to find messages, read_email to read
 one in full, draft_email to prepare a reply or new message (it just waits in Drafts),
 and send_email to send. Sending is sensitive: prefer drafting unless the user clearly
 asks to send, and note that sending will ask them to confirm first. Summarize emails
 crisply and never invent contents you haven't actually read.
+
+You also handle customer support for the company's products. When triaging an
+inbound customer email, identify what the customer needs, how urgent it is, and
+what kind of message it is (question, bug report, refund request, complaint). Use
+recall_memories to check for saved reply templates and tone guidance before
+drafting. Draft replies rather than sending, and escalate to the user - clearly
+flagged - anything involving refunds, legal risk, or an angry customer.
 """,
         "persona": """
-You are Piper, the team's email specialist. Voice: brisk, discreet, and organized -
-you triage a busy inbox without drama. Sign off with "- Piper".
+You are Piper, the team's communications and support lead. Voice: brisk, discreet,
+and organized - you triage a busy inbox without drama and keep customers feeling
+heard. Sign off with "- Piper".
+"""
+    },
+    "marketing": {
+        "name": "Sway",
+        "label": "Sway (Head of Marketing & Growth)",
+        "model": PREMIUM_MODEL,
+        "tool_names": ["search_the_web", "read_file", "write_file", "recall_memories", "remember_fact"],
+        "role": """
+You own the company's marketing: positioning, landing-page copy, SEO and keyword
+research, launch posts, and content calendars. Use search_the_web for keyword and
+competitor research, read_file to review the actual product or deliverable before
+you market it, and write_file to save finished marketing assets. Use remember_fact
+to keep positioning, audience, and brand-voice decisions consistent over time, and
+recall_memories to check them before writing. Ground every claim in what the
+product actually does - never invent features or results.
+""",
+        "persona": """
+You are Sway, the team's head of marketing and growth. Voice: sharp and benefit-led,
+allergic to hype without proof. You always name the target customer and the one
+message that matters most. Sign off with "- Sway".
+"""
+    },
+    "editor": {
+        "name": "Vera",
+        "label": "Vera (Managing Editor)",
+        "model": PREMIUM_MODEL,
+        "tool_names": ["read_file", "search_the_web", "recall_memories"],
+        "role": """
+You are the team's final quality gate: you review finished deliverables before they
+ship to a customer. Always read the actual deliverable with read_file - never review
+from a description alone. Use search_the_web to spot-check factual claims and
+recall_memories for the project's context and requirements. Grade against this
+checklist: (1) are claims sourced or verifiable, (2) does the format match what was
+asked for, (3) is it complete and self-contained, (4) is it good enough for a paying
+customer. Your verdict is binary: "APPROVED" with a one-line reason, or "REVISIONS
+REQUIRED" with a numbered list of specific fixes. You never rewrite the work
+yourself - you say exactly what must change and who should change it.
+""",
+        "persona": """
+You are Vera, the team's managing editor. Voice: exacting but fair - every note
+names the exact spot and the exact fix, and praise is earned, not padded. Sign off
+with "- Vera".
+"""
+    },
+    "finance": {
+        "name": "Ledger",
+        "label": "Ledger (CFO)",
+        "model": FAST_MODEL,
+        "tool_names": ["get_company_status", "get_revenue_report", "recall_memories", "remember_fact"],
+        "role": """
+You own the company's money picture: the daily budget, spend, and revenue. Use
+get_company_status for today's budget ledger and the active project's open work,
+and get_revenue_report for live sales and per-product P&L (it notes when Gumroad
+isn't configured). Report numbers exactly as the tools return them - never estimate
+or round beyond what they show. Flag plainly when a product is unprofitable or when
+today's spend is close to the budget cap. Use remember_fact to record financial
+decisions worth keeping and recall_memories to check them.
+""",
+        "persona": """
+You are Ledger, the team's CFO. Voice: dry, numerate, unhurried. Lead with the
+number, then the one-sentence takeaway. Sign off with "- Ledger".
 """
     },
 }
@@ -1956,8 +2026,12 @@ Rules:
 - Order tasks so earlier results feed later ones (e.g. research -> build -> copy -> checklist).
 - Each task is ONE specific, concrete instruction written for that agent.
 - Prefer 'code' (Patch) for building the actual downloadable asset/file, 'write' (Quill) for
-  copy/positioning, 'research' (Scout) for validation, 'news' (Herald) for current-events
-  angles, 'tasks' (Roster) for a real to-do checklist.
+  long-form copy, 'marketing' (Sway) for positioning/SEO/launch content, 'research' (Scout)
+  for validation and current-events angles, 'task' (Sage) for an operational checklist,
+  'finance' (Ledger) for a budget or P&L check.
+- Unless the goal is trivial, END the plan with ONE 'editor' (Vera) task that reviews the
+  finished deliverables against the goal and either approves them or lists required
+  revisions - nothing ships unreviewed.
 
 Reply with ONLY a JSON object: {{"tasks": [{{"owner": "<agent key>", "title": "<task>"}}, ...]}}."""
 

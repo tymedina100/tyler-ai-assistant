@@ -48,7 +48,7 @@ class CompanyModeTests(unittest.TestCase):
         assigned = company_mode.assign_goal(
             "Build a tiny paid landing page product",
             configured_agent_keys=["manager", "code", "research"],
-            specialist_keys=["code", "research", "write", "tasks"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
             path=self.state_path,
         )
         state = company_mode.load_state(self.state_path)
@@ -64,7 +64,7 @@ class CompanyModeTests(unittest.TestCase):
         result = company_mode.assign_goal(
             "Build a marketplace",
             configured_agent_keys=["manager"],
-            specialist_keys=["code", "research", "write", "tasks"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
             path=self.state_path,
         )
 
@@ -76,7 +76,7 @@ class CompanyModeTests(unittest.TestCase):
         company_mode.assign_goal(
             "Ship a sellable artifact",
             configured_agent_keys=["manager", "code"],
-            specialist_keys=["code", "research", "write", "tasks"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
             path=self.state_path,
         )
         state = company_mode.load_state(self.state_path)
@@ -155,7 +155,7 @@ class CompanyModeTests(unittest.TestCase):
         company_mode.assign_goal(
             goal,
             configured_agent_keys=list(configured),
-            specialist_keys=["code", "research", "write", "tasks"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
             path=self.state_path,
         )
 
@@ -347,6 +347,22 @@ class CompanyModeTests(unittest.TestCase):
 
     def test_publish_command_is_recognized(self):
         self.assertEqual(company_mode.parse_company_command("/publish"), ("/publish", ""))
+
+    def test_normalize_state_migrates_retired_task_owners(self):
+        state = company_mode.new_state()
+        state["tasks"] = [
+            {"id": "t1", "owner": "news"},
+            {"id": "t2", "owner": "tasks"},
+            {"id": "t3", "owner": "weather"},
+            {"id": "t4", "owner": "code"},
+        ]
+
+        normalized = company_mode.normalize_state(state)
+
+        self.assertEqual(
+            [t["owner"] for t in normalized["tasks"]],
+            ["research", "task", "task", "code"],
+        )
 
     def test_record_delegation_can_meter_spend(self):
         self._assign(configured=("manager", "research"))
