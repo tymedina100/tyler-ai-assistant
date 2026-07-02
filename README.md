@@ -460,6 +460,8 @@ Commands in the group:
 - `/approve` — start working the proposed plan.
 - `/cancel` — drop the active project and release its reserved budget.
 - `/publish` — package the finished project for sale (assisted; see below).
+- `/launch` — draft a launch kit: LinkedIn/X posts, a launch email, and **image-
+  generation prompts** for the cover, thumbnail, and social card.
 - `/link <gumroad-url>` — link the finished project to its live Gumroad product.
 - `/products` — list linked products with their sales and revenue.
 - `/revenue` — pull live sales from Gumroad and show per-product **P&L** (spent vs earned).

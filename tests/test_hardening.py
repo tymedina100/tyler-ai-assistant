@@ -205,6 +205,42 @@ class HardeningTests(unittest.TestCase):
         with patch.object(main, "get_openai_client", lambda: Client("not json at all")):
             self.assertIsNone(main.plan_company_goal("goal", ["research"]))
 
+    def test_recommend_next_move_returns_text_and_falls_back(self):
+        main = self.main
+
+        class Resp:
+            def __init__(self, text):
+                self.output_text = text
+                self.usage = None
+
+        class Responses:
+            def __init__(self, text):
+                self.text = text
+
+            def create(self, **kwargs):
+                return Resp(self.text)
+
+        class Client:
+            def __init__(self, text):
+                self.responses = Responses(text)
+
+        with patch.object(main, "get_openai_client", lambda: Client("Double down on the builder product. - Miles")):
+            rec = main.recommend_next_move("some P&L")
+        self.assertIn("Double down", rec)
+
+        class Boom:
+            def create(self, **kwargs):
+                raise RuntimeError("boom")
+
+        class BoomClient:
+            responses = Boom()
+
+        # Skip the retry back-off sleeps so the fallback test stays fast.
+        with patch.object(main, "call_with_retries", lambda func, **kw: func()), \
+                patch.object(main, "get_openai_client", lambda: BoomClient()):
+            rec = main.recommend_next_move("some P&L")
+        self.assertEqual(rec, main.NEXT_MOVE_FALLBACK)
+
     def test_run_with_tools_synthesizes_when_budget_exhausted(self):
         """When the tool loop runs out of iterations, it should make a final no-tools
         call and return that synthesized answer, not the canned failure message."""
