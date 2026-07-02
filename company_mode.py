@@ -449,6 +449,42 @@ def prior_work_summary(state, project_id, current_task_id, limit_chars=1500):
     return "\n".join(lines)
 
 
+DELIVERABLE_INJECT_CHARS = 5000
+
+
+def build_task_prompt(project, task, prior_work="", deliverable_name=None, deliverable_content=None):
+    """Build the prompt for one company task. Beyond the goal + prior-work summary, it
+    injects the CURRENT deliverable's actual content when available so the agent builds
+    on the real file (even one a teammate saved to GitHub that this agent can't read
+    with its own tools) instead of producing a fragmented, duplicate file."""
+    prompt = (
+        f"You are {task['owner']} working on a company project. Deliver a concrete result.\n"
+        f"Company goal: {project['goal']}\n"
+        f"Your task: {task['title']}\n"
+    )
+    if prior_work:
+        prompt += (
+            "\nYour teammates have ALREADY completed earlier steps on this project. Build "
+            "on their work - do NOT redo it or produce a duplicate:\n"
+            f"{prior_work}\n"
+        )
+    if deliverable_content:
+        snippet = deliverable_content[:DELIVERABLE_INJECT_CHARS]
+        truncated = "\n... [truncated]" if len(deliverable_content) > DELIVERABLE_INJECT_CHARS else ""
+        prompt += (
+            f"\nThe project's current deliverable file is `{deliverable_name}`. Here is its "
+            "CURRENT content - EXTEND or REFINE this same file (write to the same filename); "
+            "do NOT create a new or companion file:\n"
+            f"---\n{snippet}{truncated}\n---\n"
+        )
+    prompt += (
+        "\nIf you produce a file or open a pull request, do it now with your tools - that "
+        "saved output is recorded as this task's deliverable. Focus only on YOUR task, keep "
+        "it tight and in scope, and don't repeat what a teammate already delivered."
+    )
+    return prompt
+
+
 def render_money(state):
     company = state["company"]
     return (
