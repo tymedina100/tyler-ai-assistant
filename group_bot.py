@@ -587,28 +587,6 @@ async def sync_and_report_revenue(update):
     await reply_chunks(update.message, f"{pnl}{note}")
 
 
-def _task_prompt(project, task, prior_work=""):
-    prompt = (
-        f"You are {task['owner']} working on a company project. Deliver a concrete result.\n"
-        f"Company goal: {project['goal']}\n"
-        f"Your task: {task['title']}\n"
-    )
-    if prior_work:
-        prompt += (
-            "\nYour teammates have ALREADY completed earlier steps on this project. Build "
-            "on their work - do NOT redo it or produce a duplicate:\n"
-            f"{prior_work}\n"
-            "If a teammate already produced a file (see Deliverables above), read it with "
-            "your tools first and extend or refine THAT file instead of creating a new one.\n"
-        )
-    prompt += (
-        "\nIf you produce a file or open a pull request, do it now with your tools - that "
-        "saved output is recorded as this task's deliverable. Focus only on YOUR task, keep "
-        "it tight and in scope, and don't repeat what a teammate already delivered."
-    )
-    return prompt
-
-
 def _defer_remaining(project_id):
     """Mark still-planned tasks as blocked (deferred) and release their reserve when
     the daily budget runs out mid-plan."""
@@ -635,11 +613,17 @@ async def _run_one_task(project, task):
     context = f"Project {project['id']} / task {task['id']}"
     sink = {"cost_usd": 0.0, "artifacts": [], "context": context}
 
-    # Feed everything earlier tasks already produced into this task's prompt so the
-    # agent builds on it instead of duplicating it (the assembly-line handoff).
+    # Feed earlier tasks' summaries AND the current deliverable's real content into this
+    # task's prompt so the agent builds on the actual file (even one a teammate saved to
+    # GitHub that this agent can't read itself) instead of producing a duplicate.
     state_now = await asyncio.to_thread(company_mode.load_state)
     prior_work = company_mode.prior_work_summary(state_now, project["id"], task["id"])
-    prompt = _task_prompt(project, task, prior_work)
+    deliverable_name, deliverable_content = await asyncio.to_thread(
+        _load_project_deliverable, state_now, project["id"]
+    )
+    prompt = company_mode.build_task_prompt(
+        project, task, prior_work, deliverable_name, deliverable_content
+    )
 
     await asyncio.to_thread(company_mode.update_task_status, task["id"], "in_progress")
     await post_to_group(f"Starting: {task['owner']} - {task['title']}", "manager")
