@@ -57,6 +57,18 @@ load_dotenv()
 DATA_DIR = Path(os.environ.get("DATA_DIR") or BASE_DIR)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Make persistence obvious in the logs. A missing/mismatched DATA_DIR means state
+# silently resets on every redeploy - print exactly where state is going so that's
+# visible at startup instead of a mystery.
+if os.environ.get("DATA_DIR"):
+    print(f"[state] Persistent state dir: {DATA_DIR}")
+else:
+    print(
+        f"[state] WARNING: DATA_DIR is not set - state lives in {DATA_DIR}, which is "
+        "EPHEMERAL on a cloud host and resets on every redeploy. Set DATA_DIR to your "
+        "mounted volume's path (e.g. /app/data) to persist Company Mode state + memory."
+    )
+
 _openai_client = None
 _tavily_client = None
 
