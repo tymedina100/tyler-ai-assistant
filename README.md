@@ -460,6 +460,9 @@ Commands in the group:
 - `/approve` — start working the proposed plan.
 - `/cancel` — drop the active project and release its reserved budget.
 - `/publish` — package the finished project for sale (assisted; see below).
+- `/link <gumroad-url>` — link the finished project to its live Gumroad product.
+- `/products` — list linked products with their sales and revenue.
+- `/revenue` — pull live sales from Gumroad and show per-product **P&L** (spent vs earned).
 - `/dailyreport` — shipped/open/blocked work, artifacts, and the next recommendation.
 - `/pausecompany` / `/resumecompany` — halt/resume the engine (checked between tasks).
 
@@ -495,6 +498,15 @@ exact Gumroad go-live steps. The one thing that stays yours is the final upload 
 which is the right control for an irreversible, money-adjacent action anyway. (True
 end-to-end auto-publishing would require browser automation or a platform like Stripe
 whose API can create products; revenue tracking is planned for v3.)
+
+### Revenue tracking (the money loop)
+
+Once a product is live, close the loop: `/link <gumroad-url>` attaches the finished
+project to its Gumroad listing, and `/revenue` pulls **real** sales from the Gumroad API
+(read-only — set `GUMROAD_ACCESS_TOKEN` from Gumroad → Settings → Advanced →
+Applications) to show per-product **P&L**: what the company *spent* building it (real
+metered token cost) vs what it *earned*. `/products` lists everything you've shipped with
+its sales. This is what makes the company measurable instead of just busy.
 
 ### What stays supervised
 
