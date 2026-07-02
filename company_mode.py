@@ -11,9 +11,10 @@ BASE_DIR = Path(__file__).parent
 
 
 def _data_dir():
-    """Directory for persistent state. Set DATA_DIR (e.g. a mounted volume on Railway)
-    so company_state.json survives redeploys; defaults to the project dir locally."""
-    return Path(os.environ.get("DATA_DIR") or BASE_DIR)
+    """Directory for persistent state. Uses DATA_DIR if set, else Railway's
+    RAILWAY_VOLUME_MOUNT_PATH (auto-set when a volume is attached), else the project
+    dir - so company_state.json survives redeploys whenever a volume is present."""
+    return Path(os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or BASE_DIR)
 
 
 COMPANY_STATE_FILE = _data_dir() / "company_state.json"

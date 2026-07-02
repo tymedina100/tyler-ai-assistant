@@ -21,7 +21,7 @@ BASE_DIR = Path(__file__).parent
 # token.json is refreshed at runtime, so it lives in DATA_DIR (a mounted volume on a
 # cloud deploy) to survive redeploys. credentials.json is only needed for the one-time
 # local google_auth.py run, so it stays in the project dir.
-DATA_DIR = Path(os.environ.get("DATA_DIR") or BASE_DIR)
+DATA_DIR = Path(os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or BASE_DIR)
 TOKEN_FILE = DATA_DIR / "token.json"
 CREDENTIALS_FILE = BASE_DIR / "credentials.json"
 

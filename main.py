@@ -51,22 +51,25 @@ logger.addHandler(log_handler)
 load_dotenv()
 
 # Where persistent state lives (long-term memory, reminders, Company Mode state, the
-# Google token). On a cloud host the container filesystem is wiped on every redeploy,
-# so point DATA_DIR at a mounted volume (e.g. /app/data on Railway) and this state
-# survives. Defaults to the project directory for local dev, so nothing changes there.
-DATA_DIR = Path(os.environ.get("DATA_DIR") or BASE_DIR)
+# Google token). A cloud host wipes the container filesystem on every redeploy, so
+# state must sit on a mounted volume. Resolve the volume path in order:
+#   1. DATA_DIR, if set explicitly.
+#   2. RAILWAY_VOLUME_MOUNT_PATH - Railway sets this automatically when a volume is
+#      attached, so persistence "just works" with a volume and no manual var to align.
+#   3. the project directory (fine locally; EPHEMERAL on a cloud host).
+_data_dir_env = os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+DATA_DIR = Path(_data_dir_env or BASE_DIR)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Make persistence obvious in the logs. A missing/mismatched DATA_DIR means state
-# silently resets on every redeploy - print exactly where state is going so that's
-# visible at startup instead of a mystery.
-if os.environ.get("DATA_DIR"):
+# Surface where state is going so a missing volume (state silently resetting every
+# redeploy) is obvious at startup instead of a mystery.
+if _data_dir_env:
     print(f"[state] Persistent state dir: {DATA_DIR}")
 else:
     print(
-        f"[state] WARNING: DATA_DIR is not set - state lives in {DATA_DIR}, which is "
-        "EPHEMERAL on a cloud host and resets on every redeploy. Set DATA_DIR to your "
-        "mounted volume's path (e.g. /app/data) to persist Company Mode state + memory."
+        f"[state] WARNING: no mounted volume detected - state lives in {DATA_DIR}, which "
+        "is EPHEMERAL on a cloud host and resets on every redeploy. Attach a Railway "
+        "volume (or set DATA_DIR) to persist Company Mode state + memory."
     )
 
 _openai_client = None
