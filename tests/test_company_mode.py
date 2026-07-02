@@ -24,14 +24,22 @@ class CompanyModeTests(unittest.TestCase):
 
     def test_data_dir_honors_env_override(self):
         original = os.environ.pop("DATA_DIR", None)
+        original_rv = os.environ.pop("RAILWAY_VOLUME_MOUNT_PATH", None)
         try:
             self.assertEqual(company_mode._data_dir(), company_mode.BASE_DIR)
             os.environ["DATA_DIR"] = self.tmpdir.name
             self.assertEqual(company_mode._data_dir(), Path(self.tmpdir.name))
+            # With DATA_DIR unset, it falls back to the Railway volume mount path.
+            os.environ.pop("DATA_DIR", None)
+            os.environ["RAILWAY_VOLUME_MOUNT_PATH"] = self.tmpdir.name
+            self.assertEqual(company_mode._data_dir(), Path(self.tmpdir.name))
         finally:
             os.environ.pop("DATA_DIR", None)
+            os.environ.pop("RAILWAY_VOLUME_MOUNT_PATH", None)
             if original is not None:
                 os.environ["DATA_DIR"] = original
+            if original_rv is not None:
+                os.environ["RAILWAY_VOLUME_MOUNT_PATH"] = original_rv
 
     def test_set_budget_and_assign_goal_reserves_budget(self):
         result = company_mode.set_daily_budget(20, self.state_path)
