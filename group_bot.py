@@ -89,9 +89,9 @@ main.CONFIRMATION_MODE = "requires_confirmation"
 # Build-order staging: only the agents listed here get a live Telegram bot. Agents
 # NOT listed still work via Miles's delegation (their answers post under Miles) -
 # they just can't be @mentioned directly until you create their bot and add its key
-# here. Full set once every bot exists: ["manager", "code", "research", "news",
-# "write", "task", "tasks", "weather", "calendar", "gmail"].
-BOT_KEYS = ["manager", "weather", "code", "research", "write", "tasks", "task", "news"]
+# here. Full set once every bot exists: ["manager", "code", "research", "write",
+# "task", "marketing", "editor", "finance", "calendar", "gmail"].
+BOT_KEYS = ["manager", "code", "research", "write", "task", "marketing", "editor", "finance"]
 
 SPECIALIST_KEYS = [key for key in BOT_KEYS if key != "manager"]
 
@@ -115,14 +115,14 @@ AGENT_INFO = {
         ),
     },
     "code": {"env_var": "TELEGRAM_CODE_BOT_TOKEN", "tagline": "@mention me with a coding task."},
-    "research": {"env_var": "TELEGRAM_RESEARCH_BOT_TOKEN", "tagline": "@mention me with something to look up."},
-    "news": {"env_var": "TELEGRAM_NEWS_BOT_TOKEN", "tagline": "@mention me for headline roundups or source-cited news briefs."},
+    "research": {"env_var": "TELEGRAM_RESEARCH_BOT_TOKEN", "tagline": "@mention me with something to look up or for a news brief."},
     "write": {"env_var": "TELEGRAM_WRITE_BOT_TOKEN", "tagline": "@mention me with something to draft."},
-    "task": {"env_var": "TELEGRAM_TASK_BOT_TOKEN", "tagline": "@mention me to remember something."},
-    "tasks": {"env_var": "TELEGRAM_TASKS_BOT_TOKEN", "tagline": "@mention me to manage your real Todoist tasks."},
-    "weather": {"env_var": "TELEGRAM_WEATHER_BOT_TOKEN", "tagline": "@mention me for the forecast."},
-    "calendar": {"env_var": "TELEGRAM_CALENDAR_BOT_TOKEN", "tagline": "@mention me about your calendar or to set a reminder."},
-    "gmail": {"env_var": "TELEGRAM_GMAIL_BOT_TOKEN", "tagline": "@mention me to check or send email."},
+    "task": {"env_var": "TELEGRAM_TASK_BOT_TOKEN", "tagline": "@mention me to remember something or manage your Todoist tasks."},
+    "marketing": {"env_var": "TELEGRAM_MARKETING_BOT_TOKEN", "tagline": "@mention me for positioning, launch posts, SEO, or growth ideas."},
+    "editor": {"env_var": "TELEGRAM_EDITOR_BOT_TOKEN", "tagline": "@mention me to review a deliverable before it ships."},
+    "finance": {"env_var": "TELEGRAM_FINANCE_BOT_TOKEN", "tagline": "@mention me for budget, P&L, or revenue questions."},
+    "calendar": {"env_var": "TELEGRAM_CALENDAR_BOT_TOKEN", "tagline": "@mention me about your calendar, a reminder, or the weather."},
+    "gmail": {"env_var": "TELEGRAM_GMAIL_BOT_TOKEN", "tagline": "@mention me to check or send email, or handle a customer message."},
 }
 
 # Fill in each specialist's label + welcome from main.SPECIALISTS (the single

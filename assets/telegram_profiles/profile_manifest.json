@@ -9,63 +9,42 @@
   {
     "key": "code",
     "name": "Patch",
-    "role": "Coding Agent",
+    "role": "Head of Engineering",
     "env_var": "TELEGRAM_CODE_BOT_TOKEN",
     "file": "code-patch.jpg"
   },
   {
     "key": "research",
     "name": "Scout",
-    "role": "Researcher Agent",
+    "role": "Head of Research",
     "env_var": "TELEGRAM_RESEARCH_BOT_TOKEN",
     "file": "research-scout.jpg"
   },
   {
-    "key": "news",
-    "name": "Herald",
-    "role": "News Agent",
-    "env_var": "TELEGRAM_NEWS_BOT_TOKEN",
-    "file": "news-herald.jpg"
-  },
-  {
     "key": "write",
     "name": "Quill",
-    "role": "Writer Agent",
+    "role": "Content Lead",
     "env_var": "TELEGRAM_WRITE_BOT_TOKEN",
     "file": "write-quill.jpg"
   },
   {
     "key": "task",
     "name": "Sage",
-    "role": "Personal Assistant Agent",
+    "role": "Operations Manager",
     "env_var": "TELEGRAM_TASK_BOT_TOKEN",
     "file": "task-sage.jpg"
   },
   {
-    "key": "tasks",
-    "name": "Roster",
-    "role": "Tasks Agent",
-    "env_var": "TELEGRAM_TASKS_BOT_TOKEN",
-    "file": "tasks-roster.jpg"
-  },
-  {
-    "key": "weather",
-    "name": "Gale",
-    "role": "Weather Agent",
-    "env_var": "TELEGRAM_WEATHER_BOT_TOKEN",
-    "file": "weather-gale.jpg"
-  },
-  {
     "key": "calendar",
     "name": "Cadence",
-    "role": "Calendar & Scheduler Agent",
+    "role": "Executive Assistant - calendar, scheduling & weather",
     "env_var": "TELEGRAM_CALENDAR_BOT_TOKEN",
     "file": "calendar-cadence.jpg"
   },
   {
     "key": "gmail",
     "name": "Piper",
-    "role": "Gmail Agent",
+    "role": "Communications & Support Lead",
     "env_var": "TELEGRAM_GMAIL_BOT_TOKEN",
     "file": "gmail-piper.jpg"
   }

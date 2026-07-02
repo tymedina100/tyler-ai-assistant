@@ -29,8 +29,13 @@ DEFAULT_ASSIGN_TASKS = [
     ("research", "Validate demand, competitors, and buyer pain for this goal."),
     ("code", "Identify the smallest buildable asset or PR that moves this goal forward."),
     ("write", "Draft the offer, positioning, landing-page copy, or sales collateral."),
-    ("tasks", "Turn the plan into an operational checklist and keep follow-up tasks tidy."),
+    ("editor", "Review the deliverables against the goal: approve, or list the required revisions before shipping."),
 ]
+
+# Owners retired in the roster reorg -> the agents that absorbed their duties.
+# Applied in normalize_state so tasks stored before the reorg re-route to the
+# merged agents instead of falling back to Miles.
+LEGACY_OWNER_MAP = {"news": "research", "tasks": "task", "weather": "task"}
 
 COMPANY_COMMANDS = {
     "/company",
@@ -84,6 +89,10 @@ def normalize_state(state):
     normalized = deepcopy(base)
     normalized.update({k: state.get(k, normalized[k]) for k in ("projects", "tasks", "events", "products")})
     normalized["company"].update(state.get("company", {}))
+
+    for task in normalized["tasks"]:
+        if isinstance(task, dict) and task.get("owner") in LEGACY_OWNER_MAP:
+            task["owner"] = LEGACY_OWNER_MAP[task["owner"]]
 
     if normalized["company"].get("budget_date") != today_key():
         normalized["company"]["budget_date"] = today_key()
