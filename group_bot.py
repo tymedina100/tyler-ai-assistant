@@ -674,6 +674,8 @@ async def _run_one_task(project, task):
     await asyncio.to_thread(
         company_mode.update_task_status, task["id"], "done", answer[:1000], artifacts, spent
     )
+    if owner == "editor":
+        await asyncio.to_thread(company_mode.set_project_revision_flag, project["id"], answer)
     state = await asyncio.to_thread(company_mode.load_state)
     await post_to_group(company_mode.render_money(state), "manager")
     return "done"
@@ -707,10 +709,26 @@ async def run_company_plan(project_id):
 
             task = company_mode.next_planned_task(state, project_id)
             if task is None:
+                if project.get("needs_revision"):
+                    created, note = await asyncio.to_thread(
+                        company_mode.start_revision_round, project_id, BOT_KEYS
+                    )
+                    if created:
+                        await post_to_group(f"{note} Continuing the work plan.", "manager")
+                        continue  # loop picks up the freshly queued revision tasks
+                    await post_to_group(f"Not starting another revision round: {note}.", "manager")
+
                 await asyncio.to_thread(_complete_project, project_id)
+                state = await asyncio.to_thread(company_mode.load_state)
+                finished = next((p for p in state["projects"] if p["id"] == project_id), project)
+                note = (
+                    "The Managing Editor flagged required revisions - this is NOT ready to ship. "
+                    "See /dailyreport for the list."
+                    if finished.get("needs_revision")
+                    else "See /dailyreport for the deliverables."
+                )
                 await post_to_group(
-                    f"Work plan complete for {project['title']}. {company_mode.render_money(state)}. "
-                    "See /dailyreport for the deliverables.",
+                    f"Work plan complete for {project['title']}. {company_mode.render_money(state)}. {note}",
                     "manager",
                 )
                 return
