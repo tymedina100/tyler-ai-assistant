@@ -7,13 +7,35 @@ Positioning guardrails (keep every message inside these lines):
 - Practical AI governance readiness report and template set — not an "implementation kit."
 - Not legal advice. Not an audit. Not a certification. No compliance/approval guarantee.
 
+## Account constraint: 107 connections
+
+At 107 connections, LinkedIn will not let you free-message most of the 15 targets below — they're 2nd/3rd-degree, not 1st-degree connections. Free messaging only works on 1st-degree connections or open profiles; everyone else needs a **connection request** (which allows a short note, no link) or a paid InMail credit. So outreach is two steps, not one:
+
+1. Send a short, link-free connection request note (templates below, one per outreach template T1-T5).
+2. Only after they accept, send the fuller pitch message (already drafted per target in the table) as a normal DM.
+
+Pacing: a lower-activity/lower-connection account is more likely to hit LinkedIn's weekly invite cap or a "too many invites" soft block than an established one. Send **5-8 connection requests per day**, not all 15 at once — spread the 15 across today and tomorrow rather than firing all of them in one sitting.
+
+Optional, not required: your profile headline currently reads "Computer Science Graduate | Software Engineer... Open to Work," which frames you as a job-seeker rather than a governance-report builder. Worth a one-line addition (e.g. "Building the 2026 AI Governance Buyer Readiness Report") before these requests go out, since recipients often glance at the profile before accepting — happy to draft that if you want it.
+
 ## Today's execution queue (in order)
 
 1. Comment under your own LinkedIn launch post (script below).
-2. DM 3-5 friendly/warm contacts asking them to reshare or forward (script below).
-3. Send the 15 targeted LinkedIn outreach messages below (role-based search, no invented names).
-4. Log any replies/interest in your CRM or tracker of choice.
-5. Run `/revenue` tomorrow to check sales tracking against launch-day outreach.
+2. DM 3-5 friendly/warm contacts asking them to reshare or forward (script below) — these should already be 1st-degree connections, so this can go out as a normal DM today.
+3. Send connection requests (Step 1 notes below) to the first 5-8 targets in the table. Send the remaining 7-10 tomorrow.
+4. As each target accepts, send the Step 2 pitch message from their table row.
+5. Log any replies/interest/acceptances in your CRM or tracker of choice.
+6. Run `/revenue` tomorrow to check sales tracking against launch-day outreach.
+
+## Step 1: connection request notes (send first, no link — LinkedIn connect notes are capped ~300 characters)
+
+- **T1 — SaaS founders:** "Hi [First name] — I'm building AI governance readiness resources for B2B/SaaS teams and would love to connect. Really respect what [Company] is building in the space."
+- **T2 — Compliance/legal leads:** "Hi [First name] — I'm building AI governance readiness resources for GRC/compliance teams and would love to connect given [Company]'s work in the space."
+- **T3 — Revenue leaders:** "Hi [First name] — I'm building AI governance readiness resources for B2B revenue teams and would love to connect given [Company]'s work in the space."
+- **T4 — HR tech / fintech / health tech founders:** "Hi [First name] — I'm building AI governance readiness resources for HR tech/fintech teams and would love to connect given [Company]'s work in the space."
+- **T5 — Security / procurement / ops buyers:** "Hi [First name] — I'm building AI governance readiness resources for vendor-risk/procurement teams and would love to connect given [Company]'s work in the space."
+
+## Step 2: pitch message (send only after they accept the connection request)
 
 ## Own-post LinkedIn comment (post this yourself, as a reply to your own post)
 
@@ -36,7 +58,7 @@ Outreach templates referenced (from the approved launch package):
 - **T4 — HR tech / fintech / health tech founders**
 - **T5 — Security / procurement / ops buyers**
 
-| # | Company | Segment | Exact LinkedIn role/persona to search | Why they're a fit | Template | Lightly personalized first message |
+| # | Company | Segment | Exact LinkedIn role/persona to search | Why they're a fit | Template | Step 2 pitch message (after they accept) |
 |---|---|---|---|---|---|---|
 | 1 | Fairmarkit | Vendor-risk / procurement SaaS | Product Marketing Lead, Marketing Lead, Partnerships Lead | Procurement automation platform — their own customers are living inside vendor review workflows every day | T5 | Hi [First name] — thought this might be relevant given Fairmarkit's procurement automation focus. I launched a practical AI governance readiness report + template set for teams dealing with vendor review and buyer diligence questions. $149: https://tymedina.gumroad.com/l/fndpv |
 | 2 | Zip | Vendor-risk / procurement SaaS | Product Marketing Lead, Demand Gen Lead, Partnerships Lead | Procurement/intake platform — vendor risk and buyer diligence are core to their audience's daily work | T5 | Hi [First name] — sharing a resource that may fit Zip's procurement and vendor review world. It's a practical AI governance readiness report + template set for B2B teams preparing for buyer diligence, priced at $149: https://tymedina.gumroad.com/l/fndpv |
@@ -60,3 +82,4 @@ Outreach templates referenced (from the approved launch package):
 - Search LinkedIn by role/title, not by guessed individual names — pick whoever holds the closest live title at each company.
 - Reordered from Patch's original queue to front-load the more reachable, mid-market-scale companies (Fairmarkit, Zip, Hyperproof, Secureframe, Persona, Ironclad, Writer) and push the largest/most enterprise-scale names (Justworks, Gusto, Ramp, Brex) toward the end, per the instruction to prioritize reachable mid-market targets over huge enterprise ones absent a warm path.
 - Keep every message inside the positioning guardrails at the top of this doc.
+- Connection request notes intentionally omit the Gumroad link — LinkedIn is more likely to flag/limit link-bearing cold invites, especially from a lower-connection-count account. Send the link only in the Step 2 message, after they've accepted.
