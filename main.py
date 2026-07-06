@@ -20,6 +20,8 @@ from tavily import TavilyClient
 
 import github_helpers
 import google_helpers
+import linear_helpers
+import projects
 
 
 # Windows consoles default to a limited encoding (cp1252) that can't print
@@ -368,6 +370,27 @@ TOOLS = [
     {"type": "function", "name": "code_edit_file", "strict": False,
      "description": "Make a targeted edit to an EXISTING file in the assistant's own code repository: replaces old_snippet with new_snippet (old_snippet must appear exactly once in the file), commits to a branch, and opens/updates a pull request. Preferred for editing existing files - you supply only the small snippet that changes, not the whole file. Read the file first to copy an exact snippet. Reuse the same branch for related edits.",
      "parameters": {"type": "object", "properties": {"branch": {"type": "string"}, "path": {"type": "string"}, "old_snippet": {"type": "string"}, "new_snippet": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["branch", "path", "old_snippet", "new_snippet", "title"]}},
+    {"type": "function", "name": "project_list", "strict": False,
+     "description": "List the configured projects (keys, names, repos) the assistant can work on, and show which one is active.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "project_current", "strict": False,
+     "description": "Show the currently active project and which GitHub repo the code tools are targeting.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "project_use", "strict": False,
+     "description": "Set the active project by its key (e.g. 'vantage', 'card-tracker', 'assistant'). Afterwards the code repo tools target that project's repo. Reading/listing is safe; nothing is written.",
+     "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}},
+    {"type": "function", "name": "linear_list_issues", "strict": False,
+     "description": "List recent Linear issues. Safe read-only action.",
+     "parameters": {"type": "object", "properties": {"limit": {"type": "integer"}}, "required": []}},
+    {"type": "function", "name": "linear_search_issues", "strict": False,
+     "description": "Search Linear issues by text. Safe read-only action.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
+    {"type": "function", "name": "linear_create_issue", "strict": False,
+     "description": "Create a Linear issue with a title and optional description. Creates immediately - only call when the user clearly wants a new issue. When several issues would be created at once, ask the user first.",
+     "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}}, "required": ["title"]}},
+    {"type": "function", "name": "linear_create_project_issue", "strict": False,
+     "description": "Create a Linear issue tied to one of the assistant's projects (by project key, e.g. 'card-tracker'). The issue is tagged with the project key and GitHub repo. Creates immediately - only call on clear user intent; ask first before creating several at once.",
+     "parameters": {"type": "object", "properties": {"project_key": {"type": "string"}, "title": {"type": "string"}, "description": {"type": "string"}}, "required": ["project_key", "title"]}},
     {"type": "function", "name": "get_company_status", "strict": False,
      "description": "Read Company Mode's current status: operating mode, today's budget/reserved/spent ledger, and the active project's open tasks.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
@@ -403,6 +426,9 @@ DELEGATION_TOOLS = [
      "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
     {"type": "function", "name": "delegate_to_gmail_agent", "strict": False,
      "description": "Delegate reading, searching, drafting, or sending email in the user's Gmail - including triaging and answering customer-support email - to the Communications & Support Lead.",
+     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
+    {"type": "function", "name": "delegate_to_linear_agent", "strict": False,
+     "description": "Delegate project-management work to the Linear Agent: turning ideas, bugs, sprint plans, or PRD tasks into clean Linear issues, and reading/searching/organizing Linear issues. Use this for anything about Linear or tracking project tasks.",
      "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
     {"type": "function", "name": "delegate_to_general_assistant", "strict": False,
      "description": "Delegate anything that doesn't clearly fit a specialist to the General Assistant.",
@@ -458,6 +484,8 @@ agents using tool calls - never answer the user directly yourself:
   setting time-based reminders/nudges, and current weather lookups
 - delegate_to_gmail_agent: reading, searching, drafting, or sending email,
   including triaging and answering customer-support email
+- delegate_to_linear_agent: project management in Linear - turning ideas, bugs,
+  sprint plans, or PRD tasks into clean issues, and reading/searching issues
 - delegate_to_general_assistant: anything else, or simple questions that don't
   fit a specialist
 
@@ -688,6 +716,19 @@ Available commands:
 /research <topic>           - Ask Scout, the Head of Research
 /write <prompt>             - Ask Quill, the Content Lead
 /task <request>             - Ask Sage, the Operations Manager
+/project list               - List configured projects and the active one
+/project use <key>          - Set the active project (code tools target its repo)
+/project current            - Show the active project and repo target
+/project status             - Show the active project + code-repo target
+/project commands           - Show the active project's configured commands
+/project brainstorm [<key>|current] <idea> - 10 ranked ideas + top 3
+/project sprint [<key>|current] <goal>      - 1-week sprint plan (3-7 tasks)
+/project prd [<key>|current] <feature>      - Draft a PRD for a feature
+/linear teams|projects|issues               - List Linear teams/projects/issues
+/linear search <query>      - Search Linear issues by text
+/linear create <title>      - Create a Linear issue (tied to active project)
+/linear create-project-issue <key> <title>  - Create an issue for a project
+/linear from-sprint <key> <goal>            - Generate + create a sprint's issues
 /quit                       - Exit the assistant
 
 Anything else is routed by the Manager Agent to whichever specialist (or the
@@ -1360,6 +1401,266 @@ def redact_tool_arguments(arguments):
     return redacted
 
 
+# --------------------------------------------------------------------------- #
+# Multi-project + Linear formatting helpers and planning generator.
+# --------------------------------------------------------------------------- #
+
+def format_project_list():
+    """Human-readable list of configured projects, marking the active one."""
+    pairs = projects.list_projects()
+    if not pairs:
+        return "No projects configured (projects.json is missing or empty)."
+    active_key, _ = projects.get_active_project()
+    lines = ["Projects:"]
+    for key, profile in pairs:
+        marker = " (active)" if key == active_key else ""
+        lines.append(f"- {key}{marker}: {profile.get('name', key)} -> {profile.get('repo', '(no repo)')}")
+    if not active_key:
+        lines.append("\nNo active project selected (code tools use env-var config).")
+    return "\n".join(lines)
+
+
+def format_project_commands():
+    """Show the configured commands for the active project."""
+    key, profile = projects.get_active_project()
+    if not profile:
+        return "No active project selected. Use /project use <key> first."
+    commands = profile.get("commands", {})
+    if not commands:
+        return f"{profile.get('name', key)} has no commands configured."
+    lines = [f"Commands for {profile.get('name', key)} ({key}):"]
+    for label, cmd in commands.items():
+        lines.append(f"- {label}: {cmd}")
+    return "\n".join(lines)
+
+
+def format_linear_issues(issues):
+    if not issues:
+        return "No Linear issues found."
+    lines = ["Linear issues:"]
+    for it in issues:
+        state = (it.get("state") or {}).get("name", "?")
+        lines.append(f"- [{it.get('identifier', '?')}] {it.get('title', '(untitled)')} ({state}) {it.get('url', '')}".rstrip())
+    return "\n".join(lines)
+
+
+def format_linear_created(issue):
+    ident = issue.get("identifier", "?")
+    return f"Created Linear issue {ident}: {issue.get('title', '')}\n{issue.get('url', '')}".rstrip()
+
+
+# System prompts for /project planning commands. Each asks for a specific,
+# scannable structure so a sprint plan can feed /linear from-sprint.
+_PLAN_INSTRUCTIONS = {
+    "brainstorm": (
+        "You are a sharp product strategist. Given a project and an idea, return:\n"
+        "1) 10 concrete ideas, 2) a ranking by impact, difficulty, and demo value,\n"
+        "3) the recommended top 3, and 4) which of them should become Linear issues.\n"
+        "Be concise and specific to the project."
+    ),
+    "sprint": (
+        "You are a pragmatic engineering lead. Given a project and a goal, return a\n"
+        "1-week sprint plan with 3-7 tasks. For EACH task give: a short title, acceptance\n"
+        "criteria, a suggested Linear issue title, and a suggested branch name in the form\n"
+        "ai/<project-key>/<short-task>. Number the tasks. Keep it tight and buildable."
+    ),
+    "prd": (
+        "You are a product manager. Given a project and a feature idea, write a short PRD\n"
+        "with these sections: Problem, Target user, Proposed solution, User stories, Scope,\n"
+        "Non-goals, Acceptance criteria, Technical notes, and a Linear issue breakdown\n"
+        "(3-7 issues with titles)."
+    ),
+}
+
+
+def generate_plan(kind, project_key, text):
+    """Generate a brainstorm/sprint/prd plan for a project. Returns plan text.
+    Does not create anything - planning only."""
+    instructions = _PLAN_INSTRUCTIONS.get(kind)
+    if not instructions:
+        return f"Unknown planning kind: {kind}."
+
+    profile = projects.get_project(project_key) if project_key else None
+    if profile:
+        context = (f"Project: {profile.get('name', project_key)} ({project_key})\n"
+                   f"Repo: {profile.get('repo', 'unknown')}\n"
+                   f"Type: {profile.get('type', 'unknown')}")
+    else:
+        context = f"Project key: {project_key or 'current'} (no profile found; use general judgment)."
+
+    prompt = f"{context}\n\n{kind.capitalize()} request:\n{text}"
+    return get_ai_response(
+        [{"role": "user", "content": prompt}],
+        model=PREMIUM_MODEL,
+        instructions=instructions,
+    )
+
+
+def _resolve_project_and_text(rest):
+    """Split '<key|current> <text>' where the leading key is optional. Returns
+    (project_key_or_None, text). If the first word is a known project key it's
+    used; 'current' (or a missing/unknown key) falls back to the active project."""
+    rest = (rest or "").strip()
+    if not rest:
+        return None, ""
+    first, _, remainder = rest.partition(" ")
+    if projects.get_project(first):
+        return first, remainder.strip()
+    if first.lower() == "current":
+        key, _ = projects.get_active_project()
+        return key, remainder.strip()
+    # No explicit key - use the active project (may be None) and the whole text.
+    key, _ = projects.get_active_project()
+    return key, rest
+
+
+def sprint_issue_specs(project_key, goal, max_issues=7):
+    """Ask the model for a small set of issues (title + one-line description) for a
+    sprint goal, in a parseable format. Returns a list of (title, description)."""
+    instructions = (
+        "You are an engineering lead. Turn the sprint goal into 3-7 small, buildable "
+        "Linear issues. Output ONLY the issues, one per line, in the exact format:\n"
+        "TITLE :: one-line description with acceptance criteria\n"
+        "No numbering, no headers, no extra prose."
+    )
+    profile = projects.get_project(project_key) if project_key else None
+    context = ""
+    if profile:
+        context = (f"Project: {profile.get('name', project_key)} ({project_key}), "
+                   f"repo {profile.get('repo')}, {profile.get('type', '')}\n")
+    raw = get_ai_response(
+        [{"role": "user", "content": f"{context}Sprint goal: {goal}"}],
+        model=PREMIUM_MODEL,
+        instructions=instructions,
+    )
+    specs = []
+    for line in (raw or "").splitlines():
+        line = line.strip().lstrip("-*0123456789. ").strip()
+        if not line or "::" not in line:
+            continue
+        title, _, desc = line.partition("::")
+        title = title.strip()
+        if title:
+            specs.append((title, desc.strip()))
+        if len(specs) >= max_issues:
+            break
+    return specs
+
+
+def _format_named_nodes(nodes, label):
+    if not nodes:
+        return f"No Linear {label} found."
+    lines = [f"Linear {label}:"]
+    for n in nodes:
+        extra = f" [{n['key']}]" if n.get("key") else ""
+        lines.append(f"- {n.get('name', '(unnamed)')}{extra} ({n.get('id', '')})")
+    return "\n".join(lines)
+
+
+def handle_project_command(rest):
+    """Handle '/project ...' subcommands. Returns a status string to print."""
+    rest = (rest or "").strip()
+    if not rest:
+        return format_project_list()
+    sub, _, arg = rest.partition(" ")
+    sub = sub.lower()
+    arg = arg.strip()
+
+    if sub == "list":
+        return format_project_list()
+    if sub == "current":
+        return projects.describe_active()
+    if sub == "status":
+        target = projects.active_code_target()
+        target_line = (f"Code tools target: {target[0]} (branch {target[1]})"
+                       if target else "Code tools target: env-var config (no active project).")
+        return projects.describe_active() + "\n" + target_line
+    if sub == "commands":
+        return format_project_commands()
+    if sub == "use":
+        if not arg:
+            return "Usage: /project use <key>"
+        profile, err = projects.set_active_project(arg)
+        if err:
+            return err
+        return (f"Active project set to {profile.get('name', arg)} ({arg}). "
+                f"Code tools now target {profile.get('repo')} "
+                f"(branch {profile.get('default_branch', 'main')}).")
+    if sub in ("brainstorm", "sprint", "prd"):
+        if not arg:
+            return f"Usage: /project {sub} <project-key or current> <text>"
+        key, text = _resolve_project_and_text(arg)
+        if not text:
+            return f"Usage: /project {sub} <project-key or current> <text>"
+        return generate_plan(sub, key, text)
+
+    return ("Unknown /project subcommand. Try: list, current, status, commands, "
+            "use <key>, brainstorm <text>, sprint <goal>, prd <feature>.")
+
+
+def handle_linear_command(rest):
+    """Handle '/linear ...' subcommands. Returns a status string to print."""
+    rest = (rest or "").strip()
+    if not rest:
+        return ("Usage: /linear teams|projects|issues|search <q>|create <title>|"
+                "create-project-issue <key> <title>|from-sprint <key> <goal>")
+    sub, _, arg = rest.partition(" ")
+    sub = sub.lower()
+    arg = arg.strip()
+
+    if sub == "teams":
+        nodes, err = linear_helpers.list_teams()
+        return err if err else _format_named_nodes(nodes, "teams")
+    if sub == "projects":
+        nodes, err = linear_helpers.list_projects()
+        return err if err else _format_named_nodes(nodes, "projects")
+    if sub == "issues":
+        issues, err = linear_helpers.list_issues()
+        return err if err else format_linear_issues(issues)
+    if sub == "search":
+        if not arg:
+            return "Usage: /linear search <query>"
+        issues, err = linear_helpers.search_issues(arg)
+        return err if err else format_linear_issues(issues)
+    if sub == "create":
+        if not arg:
+            return "Usage: /linear create <title>"
+        # Explicit command = intent. If a project is active, tie the issue to it.
+        key, _ = projects.get_active_project()
+        if key:
+            issue, err = linear_helpers.create_project_issue(key, arg)
+        else:
+            issue, err = linear_helpers.create_issue(arg)
+        return err if err else format_linear_created(issue)
+    if sub == "create-project-issue":
+        key, _, title = arg.partition(" ")
+        if not key or not title.strip():
+            return "Usage: /linear create-project-issue <project-key> <title>"
+        if not projects.get_project(key):
+            return f"Unknown project '{key}'. Try /project list."
+        issue, err = linear_helpers.create_project_issue(key, title.strip())
+        return err if err else format_linear_created(issue)
+    if sub == "from-sprint":
+        key, _, goal = arg.partition(" ")
+        if not key or not goal.strip():
+            return "Usage: /linear from-sprint <project-key> <sprint goal>"
+        if not projects.get_project(key):
+            return f"Unknown project '{key}'. Try /project list."
+        if not linear_helpers.is_configured():
+            return linear_helpers.NOT_CONFIGURED
+        specs = sprint_issue_specs(key, goal.strip())
+        if not specs:
+            return "Couldn't derive any issues from that sprint goal - try rephrasing."
+        results = [f"Creating {len(specs)} Linear issues for {key} from: {goal.strip()}"]
+        for title, desc in specs:
+            issue, err = linear_helpers.create_project_issue(key, title, desc)
+            results.append(f"- {title}: " + (err if err else format_linear_created(issue).replace(chr(10), " ")))
+        return "\n".join(results)
+
+    return ("Unknown /linear subcommand. Try: teams, projects, issues, search <q>, "
+            "create <title>, create-project-issue <key> <title>, from-sprint <key> <goal>.")
+
+
 def execute_tool(name, arguments):
     print(f"\n[tool] {name}({arguments})")
     logger.info(f"Tool call: {name}({redact_tool_arguments(arguments)})")
@@ -1534,6 +1835,39 @@ def execute_tool(name, arguments):
             _record_artifact(result)
             return result
 
+        if name == "project_list":
+            return format_project_list()
+
+        if name == "project_current":
+            return projects.describe_active()
+
+        if name == "project_use":
+            profile, err = projects.set_active_project(arguments["key"].strip())
+            if err:
+                return err
+            return (f"Active project set to {profile.get('name', arguments['key'])} "
+                    f"({arguments['key'].strip()}). Code tools now target repo "
+                    f"{profile.get('repo')} (branch {profile.get('default_branch', 'main')}).")
+
+        if name == "linear_list_issues":
+            issues, err = linear_helpers.list_issues(arguments.get("limit", 20))
+            return err if err else format_linear_issues(issues)
+
+        if name == "linear_search_issues":
+            issues, err = linear_helpers.search_issues(arguments["query"], arguments.get("limit", 20))
+            return err if err else format_linear_issues(issues)
+
+        if name == "linear_create_issue":
+            issue, err = linear_helpers.create_issue(
+                arguments["title"], arguments.get("description", ""))
+            return err if err else format_linear_created(issue)
+
+        if name == "linear_create_project_issue":
+            issue, err = linear_helpers.create_project_issue(
+                arguments["project_key"].strip(), arguments["title"],
+                arguments.get("description", ""))
+            return err if err else format_linear_created(issue)
+
         if name == "write_file":
             # During supervised Company Mode execution, writing a file is a *produce*
             # action (a deliverable, reversible, sandboxed) so it runs without a
@@ -1628,6 +1962,12 @@ def execute_tool(name, arguments):
             answer = ask_specialist("gmail", arguments["request"], record_history=False)
             if on_delegation:
                 on_delegation("gmail", arguments["request"], answer)
+            return answer
+
+        if name == "delegate_to_linear_agent":
+            answer = ask_specialist("linear", arguments["request"], record_history=False)
+            if on_delegation:
+                on_delegation("linear", arguments["request"], answer)
             return answer
 
         if name == "delegate_to_general_assistant":
@@ -1886,6 +2226,34 @@ decisions worth keeping and recall_memories to check them.
         "persona": """
 You are Ledger, the team's CFO. Voice: dry, numerate, unhurried. Lead with the
 number, then the one-sentence takeaway. Sign off with "- Ledger".
+"""
+    },
+    "linear": {
+        "name": "Linear",
+        "label": "Linear (Project Management Agent)",
+        "model": PREMIUM_MODEL,
+        "tool_names": ["linear_list_issues", "linear_search_issues", "linear_create_issue",
+                       "linear_create_project_issue", "project_list", "project_current",
+                       "code_read_file", "recall_memories"],
+        "role": """
+You turn rough ideas, bugs, sprint plans, and PRD tasks into clean, well-scoped
+Linear issues. Each issue you create should have a clear title, acceptance
+criteria, brief implementation notes, and (when relevant) the GitHub repo/project
+context. Use linear_list_issues / linear_search_issues to check what already
+exists before creating duplicates. Break a feature into 3-7 issues - not more.
+Use linear_create_project_issue when a project key is known (it tags the issue
+with the project and repo); use linear_create_issue otherwise.
+
+SAFETY: creating issues is a real write. Create a single issue when the user
+clearly asks for one. Before creating MORE than a couple issues at once (e.g. a
+whole sprint), first show the user the proposed titles and ask them to confirm.
+Reading and searching is always fine. If Linear isn't configured, say which env
+var is missing rather than pretending it worked.
+""",
+        "persona": """
+You are Linear, the team's project-management specialist. Voice: crisp, organized,
+outcome-focused - you think in scopes and acceptance criteria. You never spam the
+board; you confirm before creating a batch. Sign off with "- Linear".
 """
     },
 }
@@ -2226,6 +2594,14 @@ def handle_command(user_prompt):
             return True
 
         ask_specialist("task", request)
+        return True
+
+    if command == "/project" or command.startswith("/project "):
+        print(handle_project_command(user_prompt[len("/project"):]))
+        return True
+
+    if command == "/linear" or command.startswith("/linear "):
+        print(handle_linear_command(user_prompt[len("/linear"):]))
         return True
 
     ask_manager(user_prompt)

@@ -93,6 +93,13 @@ main.CONFIRMATION_MODE = "requires_confirmation"
 # "task", "marketing", "editor", "finance", "calendar", "gmail"].
 BOT_KEYS = ["manager", "code", "research", "write", "task", "marketing", "editor", "finance"]
 
+# Optional bots: enabled only if their token env var (TELEGRAM_<KEY>_BOT_TOKEN) is
+# set - never required, so a missing token can't hard-exit startup. When disabled
+# the agent still works via Miles's delegation; it just isn't @mentionable.
+OPTIONAL_BOT_KEYS = ["linear"]
+BOT_KEYS += [key for key in OPTIONAL_BOT_KEYS
+             if os.environ.get(f"TELEGRAM_{key.upper()}_BOT_TOKEN")]
+
 SPECIALIST_KEYS = [key for key in BOT_KEYS if key != "manager"]
 
 # The Manager isn't a main.SPECIALISTS entry (it's the router persona defined by
@@ -123,6 +130,7 @@ AGENT_INFO = {
     "finance": {"env_var": "TELEGRAM_FINANCE_BOT_TOKEN", "tagline": "@mention me for budget, P&L, or revenue questions."},
     "calendar": {"env_var": "TELEGRAM_CALENDAR_BOT_TOKEN", "tagline": "@mention me about your calendar, a reminder, or the weather."},
     "gmail": {"env_var": "TELEGRAM_GMAIL_BOT_TOKEN", "tagline": "@mention me to check or send email, or handle a customer message."},
+    "linear": {"env_var": "TELEGRAM_LINEAR_BOT_TOKEN", "tagline": "@mention me to turn ideas into Linear issues."},
 }
 
 # Fill in each specialist's label + welcome from main.SPECIALISTS (the single
