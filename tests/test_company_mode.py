@@ -24,14 +24,22 @@ class CompanyModeTests(unittest.TestCase):
 
     def test_data_dir_honors_env_override(self):
         original = os.environ.pop("DATA_DIR", None)
+        original_rv = os.environ.pop("RAILWAY_VOLUME_MOUNT_PATH", None)
         try:
             self.assertEqual(company_mode._data_dir(), company_mode.BASE_DIR)
             os.environ["DATA_DIR"] = self.tmpdir.name
             self.assertEqual(company_mode._data_dir(), Path(self.tmpdir.name))
+            # With DATA_DIR unset, it falls back to the Railway volume mount path.
+            os.environ.pop("DATA_DIR", None)
+            os.environ["RAILWAY_VOLUME_MOUNT_PATH"] = self.tmpdir.name
+            self.assertEqual(company_mode._data_dir(), Path(self.tmpdir.name))
         finally:
             os.environ.pop("DATA_DIR", None)
+            os.environ.pop("RAILWAY_VOLUME_MOUNT_PATH", None)
             if original is not None:
                 os.environ["DATA_DIR"] = original
+            if original_rv is not None:
+                os.environ["RAILWAY_VOLUME_MOUNT_PATH"] = original_rv
 
     def test_set_budget_and_assign_goal_reserves_budget(self):
         result = company_mode.set_daily_budget(20, self.state_path)
@@ -40,7 +48,7 @@ class CompanyModeTests(unittest.TestCase):
         assigned = company_mode.assign_goal(
             "Build a tiny paid landing page product",
             configured_agent_keys=["manager", "code", "research"],
-            specialist_keys=["code", "research", "write", "tasks"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
             path=self.state_path,
         )
         state = company_mode.load_state(self.state_path)
@@ -56,7 +64,7 @@ class CompanyModeTests(unittest.TestCase):
         result = company_mode.assign_goal(
             "Build a marketplace",
             configured_agent_keys=["manager"],
-            specialist_keys=["code", "research", "write", "tasks"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
             path=self.state_path,
         )
 
@@ -68,7 +76,7 @@ class CompanyModeTests(unittest.TestCase):
         company_mode.assign_goal(
             "Ship a sellable artifact",
             configured_agent_keys=["manager", "code"],
-            specialist_keys=["code", "research", "write", "tasks"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
             path=self.state_path,
         )
         state = company_mode.load_state(self.state_path)
@@ -147,7 +155,7 @@ class CompanyModeTests(unittest.TestCase):
         company_mode.assign_goal(
             goal,
             configured_agent_keys=list(configured),
-            specialist_keys=["code", "research", "write", "tasks"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
             path=self.state_path,
         )
 
@@ -295,6 +303,125 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(state["company"]["reserved_today_usd"], 0.0)
         self.assertIsNone(state["company"]["active_project_id"])
 
+    def test_assign_blocks_while_a_project_is_still_open(self):
+        self._assign()
+        result = company_mode.assign_goal(
+            "A second goal", ["manager", "code"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
+            path=self.state_path,
+        )
+        self.assertIn("Blocked", result)
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(len(state["projects"]), 1)  # the second goal was never created
+
+    def test_assign_allowed_again_after_cancel(self):
+        self._assign()
+        company_mode.cancel_project(self.state_path)
+        result = company_mode.assign_goal(
+            "A second goal", ["manager", "code"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
+            path=self.state_path,
+        )
+        self.assertIn("Company goal accepted", result)
+
+    def test_cancel_by_id_reaches_a_project_no_longer_tracked_as_active(self):
+        # Simulate the orphaning bug this guards against: an old open project whose
+        # id has fallen out of active_project_id (e.g. a pre-guard state file).
+        self._assign(goal="Old orphaned goal")
+        state = company_mode.load_state(self.state_path)
+        orphan_id = state["company"]["active_project_id"]
+        state["company"]["active_project_id"] = None  # simulate it being superseded
+        company_mode.save_state(state, self.state_path)
+
+        result = company_mode.cancel_project(self.state_path, project_id=orphan_id)
+        self.assertIn("Cancelled", result)
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(state["company"]["reserved_today_usd"], 0.0)
+        self.assertEqual(company_mode.open_projects(state), [])
+
+    def test_render_company_status_surfaces_stray_open_projects(self):
+        self._assign(goal="Old orphaned goal")
+        state = company_mode.load_state(self.state_path)
+        state["company"]["active_project_id"] = None
+        company_mode.save_state(state, self.state_path)
+
+        status = company_mode.render_company_status(self.state_path)
+        self.assertIn("older open project(s)", status)
+        self.assertIn("/cancel proj_", status)
+
+    def test_editor_revision_flag_surfaces_in_status_and_report(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project_id = state["company"]["active_project_id"]
+
+        company_mode.set_project_revision_flag(project_id, "APPROVED - looks solid.", self.state_path)
+        self.assertNotIn("REVISIONS REQUIRED", company_mode.render_company_status(self.state_path))
+
+        company_mode.set_project_revision_flag(project_id, "REVISIONS REQUIRED\n1. Fix X.", self.state_path)
+        self.assertIn("REVISIONS REQUIRED", company_mode.render_company_status(self.state_path))
+        self.assertIn("REVISIONS REQUIRED", company_mode.build_daily_report(self.state_path))
+
+    def test_start_revision_round_queues_owners_plus_editor(self):
+        self._assign()  # default plan: research, code, write, editor
+        state = company_mode.load_state(self.state_path)
+        project_id = state["company"]["active_project_id"]
+        for task in company_mode.project_tasks(state, project_id):
+            company_mode.update_task_status(task["id"], "done", spent_usd=0.1, path=self.state_path)
+        company_mode.set_project_revision_flag(project_id, "REVISIONS REQUIRED\n1. Fix it.", self.state_path)
+
+        created, note = company_mode.start_revision_round(project_id, ["manager", "code"], self.state_path)
+        self.assertTrue(created)
+        self.assertIn("round 1", note)
+
+        state = company_mode.load_state(self.state_path)
+        new_tasks = [t for t in company_mode.project_tasks(state, project_id) if t["status"] == "planned"]
+        owners = [t["owner"] for t in new_tasks]
+        # one task per original non-editor owner, replayed in order, then a fresh editor pass
+        self.assertEqual(owners, ["research", "code", "write", "editor"])
+        self.assertEqual(state["company"]["reserved_today_usd"], 4.0)  # 4 new tasks x $1
+
+    def test_start_revision_round_blocked_when_budget_too_small(self):
+        # $5 covers the initial 4-task plan ($4) but leaves only $1 - not enough
+        # for a second round (also 4 tasks: the 3 non-editor owners + a re-review).
+        company_mode.set_daily_budget(5, self.state_path)
+        self._assign_no_budget_reset()
+        state = company_mode.load_state(self.state_path)
+        project_id = state["company"]["active_project_id"]
+        company_mode.set_project_revision_flag(project_id, "REVISIONS REQUIRED", self.state_path)
+
+        created, note = company_mode.start_revision_round(project_id, ["manager", "code"], self.state_path)
+        self.assertFalse(created)
+        self.assertIn("not enough budget", note)
+
+    def _assign_no_budget_reset(self):
+        company_mode.assign_goal(
+            "Ship a sellable artifact", ["manager", "code"],
+            specialist_keys=["code", "research", "write", "task", "editor"],
+            path=self.state_path,
+        )
+
+    def test_prior_work_summary_carries_full_editor_feedback_not_truncated_result(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project_id = state["company"]["active_project_id"]
+        tasks = company_mode.project_tasks(state, project_id)
+        editor_task = next(t for t in tasks if t["owner"] == "editor")
+        other_task = next(t for t in tasks if t["owner"] != "editor")
+
+        long_feedback = "REVISIONS REQUIRED\n" + "\n".join(
+            f"{i}. Fix item {i} because the copy is inaccurate and needs a citation." for i in range(1, 40)
+        )
+        self.assertGreater(len(long_feedback), 1000)  # longer than the stored task result would allow
+
+        # Simulate what _run_one_task does: the task result is clipped to 1000 chars,
+        # but set_project_revision_flag keeps the full text separately.
+        company_mode.update_task_status(editor_task["id"], "done", long_feedback[:1000], path=self.state_path)
+        company_mode.set_project_revision_flag(project_id, long_feedback, self.state_path)
+
+        state = company_mode.load_state(self.state_path)
+        summary = company_mode.prior_work_summary(state, project_id, other_task["id"])
+        self.assertIn("Fix item 39", summary)  # only present in the untruncated feedback
+
     def test_record_adhoc_spend_counts_against_budget(self):
         self._assign()
         company_mode.record_adhoc_spend(1.5, artifacts=["file: files/n.txt"], path=self.state_path)
@@ -339,6 +466,22 @@ class CompanyModeTests(unittest.TestCase):
 
     def test_publish_command_is_recognized(self):
         self.assertEqual(company_mode.parse_company_command("/publish"), ("/publish", ""))
+
+    def test_normalize_state_migrates_retired_task_owners(self):
+        state = company_mode.new_state()
+        state["tasks"] = [
+            {"id": "t1", "owner": "news"},
+            {"id": "t2", "owner": "tasks"},
+            {"id": "t3", "owner": "weather"},
+            {"id": "t4", "owner": "code"},
+        ]
+
+        normalized = company_mode.normalize_state(state)
+
+        self.assertEqual(
+            [t["owner"] for t in normalized["tasks"]],
+            ["research", "task", "task", "code"],
+        )
 
     def test_record_delegation_can_meter_spend(self):
         self._assign(configured=("manager", "research"))

@@ -40,7 +40,7 @@ class TelegramProfileTests(unittest.TestCase):
 
         self.assertEqual(
             keys,
-            {"manager", "code", "research", "news", "write", "task", "tasks", "weather", "calendar", "gmail"},
+            {"manager", "code", "research", "write", "task", "calendar", "gmail"},
         )
 
         for entry in entries:

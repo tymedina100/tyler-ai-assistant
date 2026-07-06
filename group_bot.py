@@ -89,9 +89,9 @@ main.CONFIRMATION_MODE = "requires_confirmation"
 # Build-order staging: only the agents listed here get a live Telegram bot. Agents
 # NOT listed still work via Miles's delegation (their answers post under Miles) -
 # they just can't be @mentioned directly until you create their bot and add its key
-# here. Full set once every bot exists: ["manager", "code", "research", "news",
-# "write", "task", "tasks", "weather", "calendar", "gmail"].
-BOT_KEYS = ["manager", "weather", "code", "research", "write", "tasks", "task", "news"]
+# here. Full set once every bot exists: ["manager", "code", "research", "write",
+# "task", "marketing", "editor", "finance", "calendar", "gmail"].
+BOT_KEYS = ["manager", "code", "research", "write", "task", "marketing", "editor", "finance"]
 
 # Optional bots: enabled only if their token env var (TELEGRAM_<KEY>_BOT_TOKEN) is
 # set - never required, so a missing token can't hard-exit startup. When disabled
@@ -122,14 +122,14 @@ AGENT_INFO = {
         ),
     },
     "code": {"env_var": "TELEGRAM_CODE_BOT_TOKEN", "tagline": "@mention me with a coding task."},
-    "research": {"env_var": "TELEGRAM_RESEARCH_BOT_TOKEN", "tagline": "@mention me with something to look up."},
-    "news": {"env_var": "TELEGRAM_NEWS_BOT_TOKEN", "tagline": "@mention me for headline roundups or source-cited news briefs."},
+    "research": {"env_var": "TELEGRAM_RESEARCH_BOT_TOKEN", "tagline": "@mention me with something to look up or for a news brief."},
     "write": {"env_var": "TELEGRAM_WRITE_BOT_TOKEN", "tagline": "@mention me with something to draft."},
-    "task": {"env_var": "TELEGRAM_TASK_BOT_TOKEN", "tagline": "@mention me to remember something."},
-    "tasks": {"env_var": "TELEGRAM_TASKS_BOT_TOKEN", "tagline": "@mention me to manage your real Todoist tasks."},
-    "weather": {"env_var": "TELEGRAM_WEATHER_BOT_TOKEN", "tagline": "@mention me for the forecast."},
-    "calendar": {"env_var": "TELEGRAM_CALENDAR_BOT_TOKEN", "tagline": "@mention me about your calendar or to set a reminder."},
-    "gmail": {"env_var": "TELEGRAM_GMAIL_BOT_TOKEN", "tagline": "@mention me to check or send email."},
+    "task": {"env_var": "TELEGRAM_TASK_BOT_TOKEN", "tagline": "@mention me to remember something or manage your Todoist tasks."},
+    "marketing": {"env_var": "TELEGRAM_MARKETING_BOT_TOKEN", "tagline": "@mention me for positioning, launch posts, SEO, or growth ideas."},
+    "editor": {"env_var": "TELEGRAM_EDITOR_BOT_TOKEN", "tagline": "@mention me to review a deliverable before it ships."},
+    "finance": {"env_var": "TELEGRAM_FINANCE_BOT_TOKEN", "tagline": "@mention me for budget, P&L, or revenue questions."},
+    "calendar": {"env_var": "TELEGRAM_CALENDAR_BOT_TOKEN", "tagline": "@mention me about your calendar, a reminder, or the weather."},
+    "gmail": {"env_var": "TELEGRAM_GMAIL_BOT_TOKEN", "tagline": "@mention me to check or send email, or handle a customer message."},
     "linear": {"env_var": "TELEGRAM_LINEAR_BOT_TOKEN", "tagline": "@mention me to turn ideas into Linear issues."},
 }
 
@@ -682,6 +682,8 @@ async def _run_one_task(project, task):
     await asyncio.to_thread(
         company_mode.update_task_status, task["id"], "done", answer[:1000], artifacts, spent
     )
+    if owner == "editor":
+        await asyncio.to_thread(company_mode.set_project_revision_flag, project["id"], answer)
     state = await asyncio.to_thread(company_mode.load_state)
     await post_to_group(company_mode.render_money(state), "manager")
     return "done"
@@ -715,10 +717,26 @@ async def run_company_plan(project_id):
 
             task = company_mode.next_planned_task(state, project_id)
             if task is None:
+                if project.get("needs_revision"):
+                    created, note = await asyncio.to_thread(
+                        company_mode.start_revision_round, project_id, BOT_KEYS
+                    )
+                    if created:
+                        await post_to_group(f"{note} Continuing the work plan.", "manager")
+                        continue  # loop picks up the freshly queued revision tasks
+                    await post_to_group(f"Not starting another revision round: {note}.", "manager")
+
                 await asyncio.to_thread(_complete_project, project_id)
+                state = await asyncio.to_thread(company_mode.load_state)
+                finished = next((p for p in state["projects"] if p["id"] == project_id), project)
+                note = (
+                    "The Managing Editor flagged required revisions - this is NOT ready to ship. "
+                    "See /dailyreport for the list."
+                    if finished.get("needs_revision")
+                    else "See /dailyreport for the deliverables."
+                )
                 await post_to_group(
-                    f"Work plan complete for {project['title']}. {company_mode.render_money(state)}. "
-                    "See /dailyreport for the deliverables.",
+                    f"Work plan complete for {project['title']}. {company_mode.render_money(state)}. {note}",
                     "manager",
                 )
                 return

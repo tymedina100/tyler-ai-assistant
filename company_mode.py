@@ -11,9 +11,10 @@ BASE_DIR = Path(__file__).parent
 
 
 def _data_dir():
-    """Directory for persistent state. Set DATA_DIR (e.g. a mounted volume on Railway)
-    so company_state.json survives redeploys; defaults to the project dir locally."""
-    return Path(os.environ.get("DATA_DIR") or BASE_DIR)
+    """Directory for persistent state. Uses DATA_DIR if set, else Railway's
+    RAILWAY_VOLUME_MOUNT_PATH (auto-set when a volume is attached), else the project
+    dir - so company_state.json survives redeploys whenever a volume is present."""
+    return Path(os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or BASE_DIR)
 
 
 COMPANY_STATE_FILE = _data_dir() / "company_state.json"
@@ -28,8 +29,13 @@ DEFAULT_ASSIGN_TASKS = [
     ("research", "Validate demand, competitors, and buyer pain for this goal."),
     ("code", "Identify the smallest buildable asset or PR that moves this goal forward."),
     ("write", "Draft the offer, positioning, landing-page copy, or sales collateral."),
-    ("tasks", "Turn the plan into an operational checklist and keep follow-up tasks tidy."),
+    ("editor", "Review the deliverables against the goal: approve, or list the required revisions before shipping."),
 ]
+
+# Owners retired in the roster reorg -> the agents that absorbed their duties.
+# Applied in normalize_state so tasks stored before the reorg re-route to the
+# merged agents instead of falling back to Miles.
+LEGACY_OWNER_MAP = {"news": "research", "tasks": "task", "weather": "task"}
 
 COMPANY_COMMANDS = {
     "/company",
@@ -83,6 +89,10 @@ def normalize_state(state):
     normalized = deepcopy(base)
     normalized.update({k: state.get(k, normalized[k]) for k in ("projects", "tasks", "events", "products")})
     normalized["company"].update(state.get("company", {}))
+
+    for task in normalized["tasks"]:
+        if isinstance(task, dict) and task.get("owner") in LEGACY_OWNER_MAP:
+            task["owner"] = LEGACY_OWNER_MAP[task["owner"]]
 
     if normalized["company"].get("budget_date") != today_key():
         normalized["company"]["budget_date"] = today_key()
@@ -183,6 +193,25 @@ def _owner_for(preferred_owner, configured_agent_keys):
     return preferred_owner, "via_miles"
 
 
+def _new_task(project_id, owner, delivery, title, estimate=DEFAULT_TASK_ESTIMATE_USD):
+    return {
+        "id": f"task_{uuid.uuid4().hex[:8]}",
+        "project_id": project_id,
+        "title": title,
+        "owner": owner,
+        "delivery": delivery,
+        "status": "planned",
+        "estimate_usd": _money(estimate),
+        "reserved_usd": _money(estimate),
+        "spent_usd": 0.0,
+        "created_at": _now().isoformat(),
+        "updated_at": _now().isoformat(),
+        "result": "",
+        "artifacts": [],
+        "notes": [],
+    }
+
+
 def assign_goal(goal, configured_agent_keys, specialist_keys=None, path=COMPANY_STATE_FILE, tasks=None):
     # `tasks` is an optional dynamic work plan: a list of (owner, title) tuples chosen
     # for THIS goal (see main.plan_company_goal). When None, fall back to the fixed
@@ -194,6 +223,14 @@ def assign_goal(goal, configured_agent_keys, specialist_keys=None, path=COMPANY_
     state = load_state(path)
     if state["company"]["mode"] == "paused":
         return "Company Mode is paused. Use /resumecompany before assigning new work."
+
+    existing = active_project(state)
+    if existing and existing["status"] in {"proposed", "active"}:
+        return (
+            f"Blocked: '{existing['title']}' ({existing['id']}) is still {existing['status']}. "
+            f"/approve or /cancel it before assigning something new - otherwise its reserved "
+            f"budget would be orphaned."
+        )
 
     tasks_to_create = []
     total_estimate = 0.0
@@ -227,25 +264,9 @@ def assign_goal(goal, configured_agent_keys, specialist_keys=None, path=COMPANY_
     state["company"]["active_project_id"] = project_id
 
     for owner, delivery, title, estimate in tasks_to_create:
-        task_id = f"task_{uuid.uuid4().hex[:8]}"
-        task = {
-            "id": task_id,
-            "project_id": project_id,
-            "title": title,
-            "owner": owner,
-            "delivery": delivery,
-            "status": "planned",
-            "estimate_usd": _money(estimate),
-            "reserved_usd": _money(estimate),
-            "spent_usd": 0.0,
-            "created_at": _now().isoformat(),
-            "updated_at": _now().isoformat(),
-            "result": "",
-            "artifacts": [],
-            "notes": [],
-        }
+        task = _new_task(project_id, owner, delivery, title, estimate)
         state["tasks"].append(task)
-        project["task_ids"].append(task_id)
+        project["task_ids"].append(task["id"])
 
     state["company"]["reserved_today_usd"] = _money(state["company"]["reserved_today_usd"] + total_estimate)
     add_event(state, "goal_assigned", f"Assigned company goal: {goal}", project_id=project_id, amount_usd=total_estimate)
@@ -318,13 +339,22 @@ def approve_project(path=COMPANY_STATE_FILE):
     return f"Approved: {project['title']}. Starting the work plan now.", project["id"]
 
 
-def cancel_project(path=COMPANY_STATE_FILE):
-    """Cancel the active project and release any budget still reserved for its open
-    tasks. Returns a status message."""
+def cancel_project(path=COMPANY_STATE_FILE, project_id=None):
+    """Cancel a project and release any budget still reserved for its open tasks.
+    Defaults to the active project; pass project_id to reach one that's no longer
+    tracked as active (e.g. an older project a later /assign superseded without
+    ever being approved or cancelled - see open_projects)."""
     state = load_state(path)
-    project = active_project(state)
-    if not project:
-        return "No active project to cancel."
+    if project_id:
+        project = next((p for p in state["projects"] if p["id"] == project_id), None)
+        if not project:
+            return f"No project found with id {project_id}."
+        if project["status"] not in {"proposed", "active"}:
+            return f"{project['title']} is already {project['status']} - nothing to cancel."
+    else:
+        project = active_project(state)
+        if not project:
+            return "No active project to cancel."
 
     released = 0.0
     for task in project_tasks(state, project["id"]):
@@ -335,11 +365,98 @@ def cancel_project(path=COMPANY_STATE_FILE):
 
     project["status"] = "cancelled"
     state["company"]["reserved_today_usd"] = _money(max(0.0, state["company"]["reserved_today_usd"] - released))
-    state["company"]["active_project_id"] = None
+    if state["company"].get("active_project_id") == project["id"]:
+        state["company"]["active_project_id"] = None
     add_event(state, "project_cancelled", f"Cancelled project: {project['title']}",
               project_id=project["id"], amount_usd=released)
     save_state(state, path)
     return f"Cancelled {project['title']} and released ${released:.2f} of reserved budget."
+
+
+def open_projects(state):
+    """All not-yet-terminal projects (proposed or active), including ones no longer
+    referenced by active_project_id (e.g. superseded by a later /assign). Used to
+    surface budget an orphaned project is still holding."""
+    return [p for p in state.get("projects", []) if p["status"] in {"proposed", "active"}]
+
+
+def _stray_project_lines(state, exclude_id=None):
+    strays = [p for p in open_projects(state) if p["id"] != exclude_id]
+    if not strays:
+        return []
+    lines = [f"Note: {len(strays)} older open project(s) not tracked as active:"]
+    for p in strays:
+        held = _money(sum(t["reserved_usd"] for t in project_tasks(state, p["id"])))
+        lines.append(f"- {p['title']} ({p['id']}), ${held:.2f} still reserved - /cancel {p['id']} to release it")
+    return lines
+
+
+def set_project_revision_flag(project_id, editor_answer, path=COMPANY_STATE_FILE):
+    """Record whether the Managing Editor approved a project's deliverables. Looked
+    for explicitly (an "APPROVED" prefix) rather than assumed, so a missing or
+    garbled verdict is treated as NOT approved rather than silently passing. Keeps
+    her full feedback (unlike the 1000-char task result) so a revision round can
+    hand her exact required changes back to the agents who need to act on them."""
+    state = load_state(path)
+    approved = editor_answer.strip().upper().startswith("APPROVED")
+    for project in state["projects"]:
+        if project["id"] == project_id:
+            project["needs_revision"] = not approved
+            project["last_editor_feedback"] = editor_answer.strip()
+            break
+    save_state(state, path)
+
+
+def start_revision_round(project_id, configured_agent_keys, path=COMPANY_STATE_FILE):
+    """Queue another pass at a project the Managing Editor rejected: one task per
+    original non-editor owner (in their first-appearance order) to address her
+    feedback, followed by a fresh editor re-review. Called in a loop by the
+    runner until she approves or the budget can't cover another round. Returns
+    (created, message) - created=False means the caller should complete the
+    project as-is instead of looping."""
+    state = load_state(path)
+    project = next((p for p in state["projects"] if p["id"] == project_id), None)
+    if not project:
+        return False, "Project not found."
+
+    owners_in_order = []
+    for task in project_tasks(state, project_id):
+        if task["owner"] != "editor" and task["owner"] not in owners_in_order:
+            owners_in_order.append(task["owner"])
+    if not owners_in_order:
+        return False, "No revisable owners found in this project."
+
+    round_number = project.get("revision_round", 0) + 1
+    specs = [
+        (owner, f"Revision round {round_number}: address the Managing Editor's required "
+                f"changes in your part of the shared deliverable.")
+        for owner in owners_in_order
+    ]
+    specs.append((
+        "editor",
+        f"Re-review the round {round_number} revisions against the original goal; approve, "
+        f"or list any remaining required changes.",
+    ))
+
+    total_estimate = DEFAULT_TASK_ESTIMATE_USD * len(specs)
+    if remaining_budget(state) < total_estimate:
+        return False, (
+            f"not enough budget left for another revision round "
+            f"(needs ~${total_estimate:.2f}, ${remaining_budget(state):.2f} remaining)"
+        )
+
+    for preferred_owner, title in specs:
+        owner, delivery = _owner_for(preferred_owner, configured_agent_keys)
+        task = _new_task(project_id, owner, delivery, title)
+        state["tasks"].append(task)
+        project["task_ids"].append(task["id"])
+
+    project["revision_round"] = round_number
+    state["company"]["reserved_today_usd"] = _money(state["company"]["reserved_today_usd"] + total_estimate)
+    add_event(state, "revision_round_started", f"Started revision round {round_number} for {project['title']}",
+              project_id=project_id, amount_usd=total_estimate)
+    save_state(state, path)
+    return True, f"Editor requires revisions - starting round {round_number} (${total_estimate:.2f} reserved)."
 
 
 def record_delegation(owner, request_text, answer_text, path=COMPANY_STATE_FILE,
@@ -569,14 +686,23 @@ def prior_work_summary(state, project_id, current_task_id, limit_chars=1500):
     """A compact summary of what earlier tasks in this project already produced, so
     the next agent can build on it instead of duplicating it. Includes each completed
     task's owner, title, result (truncated), and any deliverables. Excludes the task
-    being run now. Returns "" when nothing is done yet."""
+    being run now. Returns "" when nothing is done yet.
+
+    The editor's own task result is stored truncated to 1000 chars (see
+    _run_one_task), which can cut off her numbered revision list - so for her task
+    specifically, this pulls the untruncated last_editor_feedback the project keeps
+    instead, with a larger cap, so a revision round gets her complete feedback."""
+    project = next((p for p in state.get("projects", []) if p["id"] == project_id), None)
     lines = []
     for task in project_tasks(state, project_id):
         if task["id"] == current_task_id or task["status"] not in {"done", "shipped"}:
             continue
-        result = (task.get("result") or "").strip()
-        if len(result) > limit_chars:
-            result = result[:limit_chars] + " ...[truncated]"
+        if task["owner"] == "editor" and project and project.get("last_editor_feedback"):
+            result, block_limit = project["last_editor_feedback"], max(limit_chars, 3000)
+        else:
+            result, block_limit = (task.get("result") or "").strip(), limit_chars
+        if len(result) > block_limit:
+            result = result[:block_limit] + " ...[truncated]"
         block = f"- {task['owner']} ({task['title']})"
         if result:
             block += f":\n  Result: {result}"
@@ -643,11 +769,14 @@ def render_company_status(path=COMPANY_STATE_FILE):
     if not project:
         lines.append("Active project: none")
         lines.append("Next move: set /setbudget, then /assign a sellable product goal.")
+        lines.extend(_stray_project_lines(state))
         return "\n".join(lines)
 
     tasks = project_tasks(state, project["id"])
     open_tasks = [task for task in tasks if task["status"] not in {"done", "shipped", "cancelled"}]
     lines.append(f"Active project: {project['title']} ({project['id']}) - {project['status']}")
+    if project.get("needs_revision"):
+        lines.append("Editor verdict: REVISIONS REQUIRED - not ready to ship.")
     lines.append(f"Open tasks: {len(open_tasks)}/{len(tasks)}")
     for task in open_tasks[:6]:
         suffix = " via Miles" if task["delivery"] == "via_miles" else ""
@@ -658,6 +787,7 @@ def render_company_status(path=COMPANY_STATE_FILE):
         lines.append(f"Artifacts so far: {len(artifacts)} (see /dailyreport)")
     if project["status"] == "proposed":
         lines.append("Reply /approve to start the work plan, or /cancel to drop it.")
+    lines.extend(_stray_project_lines(state, exclude_id=project["id"]))
     return "\n".join(lines)
 
 
@@ -694,6 +824,8 @@ def build_daily_report(path=COMPANY_STATE_FILE):
     open_tasks = [task for task in tasks if task["status"] not in {"done", "shipped", "blocked", "cancelled"}]
 
     lines.append(f"Project: {project['title']}")
+    if project.get("needs_revision"):
+        lines.append("Editor verdict: REVISIONS REQUIRED - not ready to ship.")
     lines.append(f"Shipped/done: {len(done)} | Open: {len(open_tasks)} | Blocked: {len(blocked)}")
     if done:
         lines.append("Completed:")
@@ -710,7 +842,10 @@ def build_daily_report(path=COMPANY_STATE_FILE):
         lines.append("Artifacts (deliverables produced):")
         lines.extend(f"- {a}" for a in artifacts[:10])
 
-    lines.append("Recommendation: keep scope tight, finish one artifact, then decide whether to sell, validate, or build tomorrow.")
+    if project.get("needs_revision"):
+        lines.append("Recommendation: address the editor's required revisions before publishing or launching this.")
+    else:
+        lines.append("Recommendation: keep scope tight, finish one artifact, then decide whether to sell, validate, or build tomorrow.")
     return "\n".join(lines)
 
 
@@ -744,7 +879,7 @@ def handle_company_command(text, configured_agent_keys, specialist_keys=None, pa
     if command == "/resumecompany":
         return resume_company(path)
     if command == "/cancel":
-        return cancel_project(path)
+        return cancel_project(path, project_id=arg or None)
     if command == "/link":
         return link_product(arg, path)
     if command == "/products":
