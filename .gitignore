@@ -6,5 +6,6 @@ assistant.log
 sandbox/
 reminders.json
 company_state.json
+active_project.json
 token.json
 credentials.json

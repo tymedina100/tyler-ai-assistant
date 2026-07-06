@@ -200,11 +200,60 @@ def delete_file(path):
 # Pull requests: Read and write.
 # --------------------------------------------------------------------------- #
 
+# When a project is selected (see projects.py), the code-repo tools target that
+# project's repo/branch instead of the env vars. These are set via
+# set_active_code_repo() and cleared via clear_active_code_repo(); when both are
+# None the resolution falls back to the original env-var behavior so nothing
+# breaks when no project is selected.
+_ACTIVE_CODE_REPO = None
+_ACTIVE_CODE_BASE = None
+
+
+def set_active_code_repo(repo, base):
+    """Point the code-repo tools (code_list/read/propose/edit) at `repo`@`base`.
+    Called by projects.set_active_project(). Pass a falsy repo to clear."""
+    global _ACTIVE_CODE_REPO, _ACTIVE_CODE_BASE
+    if not repo:
+        _ACTIVE_CODE_REPO = None
+        _ACTIVE_CODE_BASE = None
+        return
+    _ACTIVE_CODE_REPO = repo
+    _ACTIVE_CODE_BASE = base or "main"
+
+
+def clear_active_code_repo():
+    """Forget any active project override; fall back to env vars."""
+    set_active_code_repo(None, None)
+
+
+def active_code_repo():
+    """Return (repo, base) if a project override is active, else None."""
+    if _ACTIVE_CODE_REPO:
+        return _ACTIVE_CODE_REPO, _ACTIVE_CODE_BASE
+    return None
+
+
 def _code_config():
+    # An active project (if any) wins; otherwise the original env-var behavior.
+    if _ACTIVE_CODE_REPO:
+        token, _, _ = _config()
+        return token, _ACTIVE_CODE_REPO, _ACTIVE_CODE_BASE
     token, repo, _ = _config()
     code_repo = os.environ.get("GITHUB_CODE_REPO", "") or repo
     base = os.environ.get("GITHUB_CODE_BASE", "main")
     return token, code_repo, base
+
+
+def branch_name(project_key, task):
+    """Build a feature-branch name: ai/<project-key>/<short-task-slug>."""
+    def _slug(text, max_len):
+        slug = "".join(c if c.isalnum() else "-" for c in (text or "").lower())
+        slug = "-".join(part for part in slug.split("-") if part)  # collapse dashes
+        return slug[:max_len].strip("-")
+
+    key = _slug(project_key, 30) or "project"
+    name = _slug(task, 40) or "task"
+    return f"ai/{key}/{name}"
 
 
 def code_list_files(path=""):

@@ -407,6 +407,14 @@ loop: ask in Telegram ("add a Spotify agent"), Patch opens a PR, you review and 
 Because Patch is the Coding Agent, its internal tool-call budget is also a bit higher
 (`max_iterations: 8`) to fit a browse → read → propose flow in one turn.
 
+### Multiple projects + Linear
+
+The assistant can work across several repos (this one, `vantage`, `card-tracker`) and
+turn plans into **Linear** issues. Select an active project with `/project use <key>`
+and the `code_*` tools target that project's repo; add `LINEAR_API_KEY` and the
+`/linear` commands create and read issues. See **[PROJECT_WORKFLOWS.md](PROJECT_WORKFLOWS.md)**
+for the full guide, commands, and example workflows.
+
 ## Proactive & scheduling (Telegram group)
 
 When the multi-bot group (`group_bot.py`) is running, an `APScheduler` loop lets the

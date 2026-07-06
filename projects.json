@@ -1,0 +1,41 @@
+{
+  "assistant": {
+    "name": "Tyler AI Assistant",
+    "repo": "tymedina100/tyler-ai-assistant",
+    "type": "personal AI assistant / Telegram multi-agent system",
+    "default_branch": "main",
+    "commands": {
+      "test": "pytest",
+      "run": "python main.py",
+      "group": "python group_bot.py"
+    }
+  },
+  "vantage": {
+    "name": "Worthlane / Vantage",
+    "repo": "tymedina100/vantage",
+    "type": "psychology-driven personal finance app",
+    "default_branch": "main",
+    "commands": {
+      "install": "pnpm install",
+      "dev": "pnpm dev",
+      "build": "pnpm build",
+      "lint": "pnpm lint",
+      "typecheck": "pnpm typecheck",
+      "test": "pnpm test",
+      "db_generate": "pnpm db:generate",
+      "db_migrate": "pnpm db:migrate"
+    }
+  },
+  "card-tracker": {
+    "name": "Card Tracker",
+    "repo": "tymedina100/card-tracker",
+    "type": "sports and Pokemon card price comp tracker / flipping dashboard",
+    "default_branch": "main",
+    "commands": {
+      "install": "pip install -e \".[dev]\"",
+      "test": "pytest",
+      "lint": "ruff check .",
+      "dashboard": "cardtracker dashboard"
+    }
+  }
+}
