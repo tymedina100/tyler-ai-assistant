@@ -55,7 +55,7 @@ class TodayCommandTests(unittest.TestCase):
                 "url": "https://linear/VO-1",
                 "dueDate": "2026-07-01",
                 "priority": 4,
-                "priorityLabel": "Urgent",
+                "priorityLabel": "Low",
                 "updatedAt": "2026-07-06T11:00:00Z",
                 "state": {"name": "Todo", "type": "unstarted"},
                 "project": {"name": "Virtual Office"},
