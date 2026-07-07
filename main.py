@@ -1748,7 +1748,7 @@ def _today_sort_key(issue):
     # and 0 means "No priority". Sort urgent first and no-priority last.
     priority_rank = priority if priority in (1, 2, 3, 4) else 5
     due_value = due_date.isoformat() if hasattr(due_date, "isoformat") else "9999-12-31"
-    return (project_index, due_rank, mvp_rank, -priority, due_value, issue.get("updatedAt") or "")
+    return (project_index, due_rank, mvp_rank, priority_rank, due_value, issue.get("updatedAt") or "")
 
 
 def _today_due_note(issue):
