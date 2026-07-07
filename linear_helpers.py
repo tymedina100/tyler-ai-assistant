@@ -125,6 +125,27 @@ def search_issues(query, limit=20):
     return data.get("issueSearch", {}).get("nodes", []), None
 
 
+def get_issue(query):
+    """Fetch a single issue's full details (including the description/acceptance
+    criteria) by identifier (e.g. 'VAN-46') or by text. Uses issueSearch and returns
+    the best match. Returns (issue_dict, None) or (None, error). Unlike list/search,
+    this includes the full `description` so a coding agent can read the whole issue."""
+    gql = """
+    query One($term: String!) {
+      issueSearch(query: $term, first: 1) {
+        nodes { id identifier title description url state { name } }
+      }
+    }
+    """
+    data, err = _graphql(gql, {"term": query})
+    if err:
+        return None, err
+    nodes = data.get("issueSearch", {}).get("nodes", [])
+    if not nodes:
+        return None, f"No Linear issue found matching '{query}'."
+    return nodes[0], None
+
+
 # --------------------------------------------------------------------------- #
 # Writes (explicit intent only)
 # --------------------------------------------------------------------------- #

@@ -44,6 +44,7 @@ import main
 import company_mode
 import company_linear
 import gumroad_helpers
+import linear_helpers
 
 
 load_dotenv()
@@ -343,6 +344,14 @@ async def _maybe_handle_project_linear_command(update, text):
     if lowered == "/project" or lowered.startswith("/project "):
         response = await asyncio.to_thread(main.handle_project_command, stripped[len("/project"):])
         await reply_chunks(update.message, response)
+        return True
+
+    # `/linear do <issue>` is special: it seeds a supervised Company Mode project from
+    # an existing Linear issue (needs the engine + budget flow), so it's handled here
+    # rather than by main.handle_linear_command (which only does read/create).
+    if lowered.startswith("/linear do ") or lowered == "/linear do":
+        identifier = stripped[len("/linear do"):].strip()
+        await assign_from_linear(update, identifier)
         return True
 
     if lowered == "/linear" or lowered.startswith("/linear "):
@@ -649,6 +658,65 @@ async def assign_with_dynamic_plan(update, goal):
     await reply_chunks(update.message, result)
 
 
+async def assign_from_linear(update, identifier):
+    """Handle /linear do <issue>: fetch the Linear issue and seed a supervised Company
+    Mode project from it - routed to the best-fit owner plus an editor review - tagging
+    the project with the source issue so the engine syncs status back to THAT issue.
+    Then it's the normal flow: reply /approve to start."""
+    identifier = (identifier or "").strip()
+    if not identifier:
+        await update.message.reply_text(
+            "Usage: /linear do <issue id or text>  (e.g. /linear do VAN-46)"
+        )
+        return
+    if not company_linear.is_enabled():
+        await update.message.reply_text(linear_helpers.NOT_CONFIGURED)
+        return
+
+    issue, err = await asyncio.to_thread(linear_helpers.get_issue, identifier)
+    if err or not issue:
+        await update.message.reply_text(err or f"Couldn't find a Linear issue for '{identifier}'.")
+        return
+
+    ident = issue.get("identifier", identifier)
+    title = (issue.get("title") or "").strip() or ident
+    description = (issue.get("description") or "").strip()
+
+    # Route the implementation to the best-fit owner (default to Patch/code).
+    try:
+        responders = await asyncio.to_thread(main.select_group_responders, f"{title}\n\n{description}")
+    except Exception:
+        responders = ["code"]
+    owner = next((r for r in responders if r in main.SPECIALISTS), "code")
+
+    goal = f"Complete Linear issue {ident}: {title}"
+    if description:
+        goal += f"\n\nIssue details / acceptance criteria:\n{description}"
+    review_title = (f"Review the deliverable for {ident} against the issue's acceptance "
+                    f"criteria; approve, or list the required changes.")
+    tasks = [(owner, title), ("editor", review_title)]
+
+    result = await asyncio.to_thread(
+        company_mode.assign_goal,
+        goal, BOT_KEYS, list(main.SPECIALISTS.keys()), company_mode.COMPANY_STATE_FILE, tasks,
+    )
+
+    # assign_goal only creates a project on success; on a block/pause it returns a
+    # message and leaves the (old) active project untouched - so don't tag in that case.
+    created = not result.startswith(("Blocked:", "Company Mode is paused", "Usage:"))
+    linked_note = ""
+    if created:
+        state = await asyncio.to_thread(company_mode.load_state)
+        project = company_mode.active_project(state)
+        if project:
+            await asyncio.to_thread(company_mode.set_project_source_issue, project["id"], issue)
+            linked_note = (
+                f"\n\nLinked to {ident}: it moves to In Progress on /approve and to Done "
+                f"once the editor approves.\n{issue.get('url', '')}"
+            )
+    await reply_chunks(update.message, f"{result}{linked_note}")
+
+
 async def sync_and_report_revenue(update):
     """Handle /revenue: pull live sales from Gumroad (I/O off the loop), update the
     product registry, and show the P&L. If the live pull fails (e.g. no token), still
@@ -800,6 +868,9 @@ async def run_company_plan(project_id):
                     await post_to_group(f"Not starting another revision round: {note}.", "manager")
 
                 await asyncio.to_thread(_complete_project, project_id)
+                # If this was a /linear do project, close out its source Linear issue
+                # (Done if approved, else comment the editor's required changes).
+                await asyncio.to_thread(company_linear.finalize_source_issue, project_id)
                 state = await asyncio.to_thread(company_mode.load_state)
                 finished = next((p for p in state["projects"] if p["id"] == project_id), project)
                 note = (

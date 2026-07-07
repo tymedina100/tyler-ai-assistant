@@ -123,6 +123,60 @@ class CompanyLinearBridgeTests(unittest.TestCase):
 
         self.assertTrue(any(c[0] == task["id"] and c[1] == "in_progress" for c in calls))
 
+    # --- /linear do: source-issue tracking ---
+
+    def test_source_issue_skips_per_task_mirror_and_moves_in_progress(self):
+        project = _seed_project(self.path)
+        company_mode.set_project_source_issue(
+            project["id"], {"id": "iSRC", "identifier": "VAN-9", "url": "u"}, self.path
+        )
+        create_mock = MagicMock()
+        update_mock = MagicMock(return_value=({}, None))
+        comment_mock = MagicMock(return_value=({}, None))
+        with patch.object(company_linear.linear_helpers, "is_configured", lambda: True), \
+                patch.object(company_linear, "_active_project_key", lambda: None), \
+                patch.object(company_linear.linear_helpers, "create_issue", create_mock), \
+                patch.object(company_linear.linear_helpers, "update_issue_status", update_mock), \
+                patch.object(company_linear.linear_helpers, "add_comment", comment_mock):
+            created = company_linear.ensure_issues_for_project(project["id"], path=self.path)
+
+        self.assertEqual(created, [])
+        create_mock.assert_not_called()  # no per-task issues for a /linear do project
+        self.assertEqual(update_mock.call_args.args, ("iSRC", "In Progress"))
+        tasks = company_mode.project_tasks(company_mode.load_state(self.path), project["id"])
+        self.assertTrue(all(not t["linear_issue_id"] for t in tasks))
+
+    def test_finalize_source_issue_done_when_approved(self):
+        project = _seed_project(self.path)
+        company_mode.set_project_source_issue(
+            project["id"], {"id": "iSRC", "identifier": "VAN-9", "url": "u"}, self.path
+        )
+        update_mock = MagicMock(return_value=({}, None))
+        comment_mock = MagicMock(return_value=({}, None))
+        with patch.object(company_linear.linear_helpers, "is_configured", lambda: True), \
+                patch.object(company_linear.linear_helpers, "update_issue_status", update_mock), \
+                patch.object(company_linear.linear_helpers, "add_comment", comment_mock):
+            company_linear.finalize_source_issue(project["id"], path=self.path)
+
+        self.assertEqual(update_mock.call_args.args, ("iSRC", "Done"))
+        self.assertTrue(comment_mock.called)
+
+    def test_finalize_source_issue_comments_when_revision_required(self):
+        project = _seed_project(self.path)
+        company_mode.set_project_source_issue(
+            project["id"], {"id": "iSRC", "identifier": "VAN-9", "url": "u"}, self.path
+        )
+        company_mode.set_project_revision_flag(project["id"], "Please fix X and Y.", self.path)
+        update_mock = MagicMock(return_value=({}, None))
+        comment_mock = MagicMock(return_value=({}, None))
+        with patch.object(company_linear.linear_helpers, "is_configured", lambda: True), \
+                patch.object(company_linear.linear_helpers, "update_issue_status", update_mock), \
+                patch.object(company_linear.linear_helpers, "add_comment", comment_mock):
+            company_linear.finalize_source_issue(project["id"], path=self.path)
+
+        update_mock.assert_not_called()  # not moved to Done while revisions are pending
+        self.assertIn("fix X", comment_mock.call_args.args[1])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -345,6 +345,32 @@ def set_task_linear(task_id, issue_id, identifier, url, path=COMPANY_STATE_FILE)
     return False
 
 
+def set_project_source_issue(project_id, issue, path=COMPANY_STATE_FILE):
+    """Tag a project with the Linear issue it was created from (via /linear do). The
+    company_linear bridge then tracks THAT issue as the project's umbrella - moving it
+    to In Progress on start and Done/revisions on completion - instead of creating a
+    new issue per task. `issue` is a dict with id/identifier/url."""
+    state = load_state(path)
+    for project in state["projects"]:
+        if project["id"] == project_id:
+            project["source_linear_issue"] = {
+                "id": issue.get("id", ""),
+                "identifier": issue.get("identifier", ""),
+                "url": issue.get("url", ""),
+            }
+            save_state(state, path)
+            return True
+    return False
+
+
+def project_source_issue(state, project_id):
+    """Return a project's source Linear issue dict, or None."""
+    for project in state.get("projects", []):
+        if project["id"] == project_id:
+            return project.get("source_linear_issue")
+    return None
+
+
 def mark_task_blocked(task_id, reason, spent_usd=None, artifacts=None, path=COMPANY_STATE_FILE):
     """Park a task that needs your approval to proceed (a gated action was staged).
     Records any real spend/artifacts produced so far and releases its reserve."""
