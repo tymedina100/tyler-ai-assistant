@@ -14,6 +14,7 @@ is a silent no-op and the explicit tools return a friendly "not configured" mess
 """
 import base64
 import os
+import re
 
 import requests
 
@@ -276,6 +277,41 @@ def code_read_file(path):
         return _read(repo, base, token, path)
     except Exception as e:
         return f"Sorry, couldn't read {path} from the code repo ({e})."
+
+
+def _parse_pr_number(pr_ref):
+    """Pull a PR number out of an int, a string like '#32', or a PR URL."""
+    if pr_ref is None:
+        return None
+    text = str(pr_ref).strip()
+    match = re.search(r"/pull/(\d+)", text) or re.search(r"#?(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+def code_pr_diff(pr_ref):
+    """Return the unified diff of a pull request in the code repo, by PR number or URL,
+    so a reviewer can read the ACTUAL change instead of trusting a summary. Truncated to
+    MAX_READ_CHARS."""
+    token, repo, _ = _code_config()
+    if not (token and repo):
+        return NOT_CONFIGURED
+    number = _parse_pr_number(pr_ref)
+    if not number:
+        return f"Couldn't read a PR number from '{pr_ref}'. Pass a number (e.g. 32) or a PR URL."
+    try:
+        headers = _headers(token)
+        headers["Accept"] = "application/vnd.github.v3.diff"  # raw unified diff body
+        resp = requests.get(f"{API_ROOT}/repos/{repo}/pulls/{number}", headers=headers, timeout=15)
+        if resp.status_code == 404:
+            return f"PR #{number} not found in {repo}."
+        if resp.status_code != 200:
+            return f"Couldn't read PR #{number}: {resp.status_code} {resp.text[:200]}"
+        diff = resp.text
+        if not diff.strip():
+            return f"PR #{number} in {repo} has an empty diff."
+        return diff[:MAX_READ_CHARS]
+    except Exception as e:
+        return f"Sorry, couldn't read PR #{number} ({e})."
 
 
 def _branch_sha(repo, branch, token):
