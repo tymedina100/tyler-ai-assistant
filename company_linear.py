@@ -76,6 +76,18 @@ def ensure_issues_for_project(project_id, path=company_mode.COMPANY_STATE_FILE):
     if not project:
         return []
 
+    # A /linear do project tracks an EXISTING source issue as its umbrella instead of
+    # creating one issue per task. Move that issue to In Progress and skip per-task
+    # mirroring entirely (avoids cluttering Linear with sub-issues for one issue's work).
+    source = project.get("source_linear_issue")
+    if source and source.get("id"):
+        _, err = _safe(linear_helpers.update_issue_status, source["id"], "In Progress")
+        if err:
+            logger.info(f"company_linear: source issue In Progress skipped: {err}")
+        _safe(linear_helpers.add_comment, source["id"],
+              f"🏭 Company project {project_id} started working this issue.")
+        return []
+
     project_key = _active_project_key()
     created = []
     for task in company_mode.project_tasks(state, project_id):
@@ -138,6 +150,41 @@ def sync_task_status(task_id, status, previous_status, path=company_mode.COMPANY
         _, err = _safe(linear_helpers.add_comment, issue_id, comment)
         if err:
             logger.info(f"company_linear: comment failed for {task_id}: {err}")
+
+
+def finalize_source_issue(project_id, path=company_mode.COMPANY_STATE_FILE):
+    """Close out a /linear do project's source issue when the project finishes. If the
+    Managing Editor approved (project not flagged needs_revision), move the issue to
+    Done with a summary of the deliverables; if revisions are required, leave it In
+    Progress and comment the editor's required changes. Safe no-op when disabled or the
+    project has no source issue."""
+    if not is_enabled():
+        return
+
+    state = company_mode.load_state(path)
+    project = next((p for p in state.get("projects", []) if p["id"] == project_id), None)
+    if not project:
+        return
+    source = project.get("source_linear_issue")
+    if not source or not source.get("id"):
+        return
+    issue_id = source["id"]
+
+    artifacts = [a for t in company_mode.project_tasks(state, project_id) for a in t.get("artifacts", [])]
+
+    if project.get("needs_revision"):
+        feedback = (project.get("last_editor_feedback") or "Revisions required.").strip()
+        _safe(linear_helpers.add_comment, issue_id,
+              f"📝 Editor requires revisions before this ships:\n\n{feedback[:1500]}")
+        return
+
+    parts = ["✅ Company project complete and approved by the editor."]
+    if artifacts:
+        parts.append("Deliverables:\n" + "\n".join(f"- {a}" for a in artifacts))
+    _safe(linear_helpers.add_comment, issue_id, "\n\n".join(parts))
+    _, err = _safe(linear_helpers.update_issue_status, issue_id, "Done")
+    if err:
+        logger.info(f"company_linear: source issue Done skipped: {err}")
 
 
 def _completion_comment(task):

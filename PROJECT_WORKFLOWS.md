@@ -173,6 +173,24 @@ Typical flow:
 /status             # see progress + Linear ids
 ```
 
+### Ask the company to complete an existing Linear issue
+
+`/linear do <issue>` turns an issue you already have (e.g. one from a sprint) into a
+supervised Company Mode project:
+
+```
+/linear do VAN-46
+/approve
+```
+
+- Reads the full issue (title + acceptance criteria), routes the build to the best-fit
+  agent (usually Patch), and adds a Managing Editor review task.
+- The **source issue itself** is the tracker — no duplicate per-task issues. It moves to
+  **In Progress** on `/approve` and to **Done** once the editor approves; if the editor
+  requires changes, it stays In Progress and the required changes are posted as a comment.
+- Same budget + `/approve` gate as any Company Mode project. `/cancel` before approving
+  touches nothing.
+
 ## 7. Telegram: optional Linear bot
 
 The group interface (`group_bot.py`) can run a dedicated **Linear** bot. Set

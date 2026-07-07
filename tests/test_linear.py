@@ -111,6 +111,29 @@ class LinearHelpersTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(projects_list[0]["name"], "Watchlist")
 
+    def test_get_issue_returns_full_description(self):
+        payload = {"data": {"issueSearch": {"nodes": [
+            {"id": "i1", "identifier": "VAN-46", "title": "Watchlist model",
+             "description": "AC: owner-scoped table\nlinks to cards.id",
+             "url": "https://l/VAN-46", "state": {"name": "Backlog"}},
+        ]}}}
+        with patch.dict(os.environ, {"LINEAR_API_KEY": "k"}, clear=True), \
+                patch.object(linear_helpers.requests, "post",
+                             MagicMock(return_value=FakeResp(200, payload))):
+            issue, err = linear_helpers.get_issue("VAN-46")
+        self.assertIsNone(err)
+        self.assertEqual(issue["identifier"], "VAN-46")
+        self.assertIn("owner-scoped", issue["description"])
+
+    def test_get_issue_not_found(self):
+        payload = {"data": {"issueSearch": {"nodes": []}}}
+        with patch.dict(os.environ, {"LINEAR_API_KEY": "k"}, clear=True), \
+                patch.object(linear_helpers.requests, "post",
+                             MagicMock(return_value=FakeResp(200, payload))):
+            issue, err = linear_helpers.get_issue("VAN-999")
+        self.assertIsNone(issue)
+        self.assertIn("No Linear issue found", err)
+
 
 if __name__ == "__main__":
     unittest.main()

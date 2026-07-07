@@ -385,6 +385,9 @@ TOOLS = [
     {"type": "function", "name": "linear_search_issues", "strict": False,
      "description": "Search Linear issues by text. Safe read-only action.",
      "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
+    {"type": "function", "name": "linear_get_issue", "strict": False,
+     "description": "Read one Linear issue's FULL details, including its description/acceptance criteria, by identifier (e.g. 'VAN-46') or by text. Safe read-only action. Use this to read the full requirements of an issue before implementing it.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"type": "function", "name": "linear_list_teams", "strict": False,
      "description": "List the Linear teams (name, key, and id). Safe read-only action. Useful for finding the team id to configure or create issues in.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
@@ -1455,6 +1458,13 @@ def format_linear_created(issue):
     return f"Created Linear issue {ident}: {issue.get('title', '')}\n{issue.get('url', '')}".rstrip()
 
 
+def format_linear_issue_detail(issue):
+    state = (issue.get("state") or {}).get("name", "?")
+    description = issue.get("description") or "(no description)"
+    return (f"[{issue.get('identifier', '?')}] {issue.get('title', '(untitled)')} ({state})\n"
+            f"{issue.get('url', '')}\n\n{description}").strip()
+
+
 # System prompts for /project planning commands. Each asks for a specific,
 # scannable structure so a sprint plan can feed /linear from-sprint.
 _PLAN_INSTRUCTIONS = {
@@ -1863,6 +1873,10 @@ def execute_tool(name, arguments):
             issues, err = linear_helpers.search_issues(arguments["query"], arguments.get("limit", 20))
             return err if err else format_linear_issues(issues)
 
+        if name == "linear_get_issue":
+            issue, err = linear_helpers.get_issue(arguments["query"])
+            return err if err else format_linear_issue_detail(issue)
+
         if name == "linear_list_teams":
             nodes, err = linear_helpers.list_teams()
             return err if err else _format_named_nodes(nodes, "teams")
@@ -2021,7 +2035,8 @@ SPECIALISTS = {
         "max_iterations": 25,
         "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories", "run_python",
                        "github_list_files", "github_read_file", "github_save_file", "github_delete_file",
-                       "code_list_files", "code_read_file", "code_propose_change", "code_edit_file"],
+                       "code_list_files", "code_read_file", "code_propose_change", "code_edit_file",
+                       "linear_get_issue", "linear_search_issues", "linear_list_issues"],
         "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
@@ -2059,6 +2074,12 @@ keep each pull request small and focused, use a clear branch name (e.g.
 land in a single PR. Remind the user a change only ships after they merge the PR and
 redeploy. Explain your reasoning briefly and prefer simple, correct solutions over
 clever ones.
+
+When a task references a Linear issue (e.g. "VAN-46"), read it first with
+linear_get_issue to get the full description and acceptance criteria, then implement
+exactly that scope. linear_search_issues / linear_list_issues are available too.
+These are read-only; you don't create or edit Linear issues (that's the Linear agent's
+job).
 """,
         "persona": """
 You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior
@@ -2246,8 +2267,8 @@ number, then the one-sentence takeaway. Sign off with "- Ledger".
         "name": "Linear",
         "label": "Linear (Project Management Agent)",
         "model": PREMIUM_MODEL,
-        "tool_names": ["linear_list_issues", "linear_search_issues", "linear_list_teams",
-                       "linear_list_projects", "linear_create_issue",
+        "tool_names": ["linear_list_issues", "linear_search_issues", "linear_get_issue",
+                       "linear_list_teams", "linear_list_projects", "linear_create_issue",
                        "linear_create_project_issue", "project_list", "project_current",
                        "code_read_file", "recall_memories"],
         "role": """
