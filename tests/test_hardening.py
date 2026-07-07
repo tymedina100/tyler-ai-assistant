@@ -338,6 +338,51 @@ class HardeningTests(unittest.TestCase):
             self.main.set_execution_sink(None)
             self.main.CONFIRMATION_MODE = previous_mode
 
+    # --- Vercel deploy: preview free, production gated ---
+
+    def test_deploy_site_production_stages_for_confirm(self):
+        previous_mode = self.main.CONFIRMATION_MODE
+        self.main.CONFIRMATION_MODE = "requires_confirmation"
+        self.main.set_conversation("test:deployprod")
+        try:
+            result = self.main.execute_tool(
+                "deploy_site", {"project": "landing", "ref": "main", "target": "production"}
+            )
+            self.assertIn("staged", result.lower())
+            pending = self.main.get_pending_action()
+            self.assertEqual(pending["type"], "deploy")
+            self.assertEqual(pending["project"], "landing")
+            self.assertEqual(pending["target"], "production")
+        finally:
+            self.main.clear_pending_action()
+            self.main.CONFIRMATION_MODE = previous_mode
+
+    def test_deploy_site_preview_runs_without_staging(self):
+        previous_mode = self.main.CONFIRMATION_MODE
+        self.main.CONFIRMATION_MODE = "requires_confirmation"
+        self.main.set_conversation("test:deploypreview")
+
+        def fake_deploy(project, ref, target):
+            return {"url": "https://x.vercel.app", "id": "d1", "readyState": "QUEUED",
+                    "target": "preview"}, None
+
+        try:
+            with patch.object(self.main.deploy_helpers, "deploy", fake_deploy):
+                result = self.main.execute_tool(
+                    "deploy_site", {"project": "landing", "target": "preview"}
+                )
+            self.assertIn("x.vercel.app", result)
+            self.assertIsNone(self.main.get_pending_action())  # preview never stages
+        finally:
+            self.main.clear_pending_action()
+            self.main.CONFIRMATION_MODE = previous_mode
+
+    def test_describe_pending_action_covers_deploy(self):
+        desc = self.main.describe_pending_action(
+            {"type": "deploy", "project": "landing", "ref": "main"}
+        )
+        self.assertIn("production deploy of landing", desc)
+
 
 if __name__ == "__main__":
     unittest.main()

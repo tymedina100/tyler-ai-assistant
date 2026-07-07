@@ -196,6 +196,35 @@ supervised Company Mode project:
 - Same budget + `/approve` gate as any Company Mode project. `/cancel` before approving
   touches nothing.
 
+## 6c. Deploying a site live (Vercel)
+
+Patch and Sway can put a landing page live with the `deploy_site` tool (Vercel).
+
+Setup:
+- Create a Vercel token (**Vercel → Settings → Tokens**) and set `VERCEL_TOKEN`
+  (`VERCEL_TEAM_ID` too if the project belongs to a team).
+- The Vercel **project must be linked to its GitHub repo** — that's what a deploy builds
+  from. (One-time, in the Vercel dashboard.)
+
+Behavior (safety):
+- **Preview** deploys are throwaway URLs that don't touch your live domain — they run
+  **immediately**, so the company can iterate and show work.
+- **Production** deploys touch the live domain and are **gated behind `/confirm`** (the
+  same staging flow as sending email). During a Company Mode run a production deploy
+  blocks the task until you `/confirm`.
+- `list_deploy_projects` (read-only) finds the exact project name; `check_deploy <id>`
+  polls build status.
+
+Example — the full loop, live:
+
+```
+/linear do VAN-XX          # "ship the card-flipping landing page"
+/approve                   # Patch builds the page (PR) + deploys a PREVIEW URL
+# you review the preview, then when it's ready:
+@Patch deploy <project> to production
+/confirm                   # goes live on the real domain
+```
+
 ## 7. Telegram: optional Linear bot
 
 The group interface (`group_bot.py`) can run a dedicated **Linear** bot. Set
