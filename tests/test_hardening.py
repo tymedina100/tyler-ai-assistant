@@ -172,24 +172,24 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, FakeUsage()), 0.0)
 
     def test_usage_to_usd_discounts_cached_input(self):
-        # 800 of 1000 input tokens are cache hits, billed at 25% of the input rate.
+        # 800 of 1000 input tokens are cache hits, billed at 10% of the input rate.
         usage = FakeUsage(
             input_tokens=1000, output_tokens=1000,
             input_tokens_details=types.SimpleNamespace(cached_tokens=800),
         )
-        # fresh 200 @ .005 + cached 800 @ .005*.25 + output 1000 @ .030
-        #   = 0.001 + 0.001 + 0.030 = 0.032  (vs 0.035 charging cache at full rate)
+        # fresh 200 @ .005 + cached 800 @ .005*.10 + output 1000 @ .030
+        #   = 0.001 + 0.0004 + 0.030 = 0.0314  (vs 0.035 charging cache at full rate)
         self.assertAlmostEqual(
-            self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.032, places=6
+            self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.0314, places=6
         )
 
     def test_usage_to_usd_dict_shaped_cache_details(self):
         # Some SDK versions expose the details as a dict rather than an object.
         usage = FakeUsage(input_tokens=1000, output_tokens=0,
                           input_tokens_details={"cached_tokens": 1000})
-        # all input cached: 1000 @ .005*.25 = 0.00125
+        # all input cached: 1000 @ .005*.10 = 0.0005
         self.assertAlmostEqual(
-            self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.00125, places=6
+            self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.0005, places=6
         )
 
     def test_plan_company_goal_parses_and_falls_back(self):

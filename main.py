@@ -220,10 +220,12 @@ DEFAULT_MODEL_PRICE = (0.01, 0.03)
 # Cached input tokens (prompt caching) are billed at a fraction of the input rate. In a
 # tool loop the model re-sends a large, mostly-stable prefix every iteration, so most of
 # those input tokens are cache hits - charging them at the full rate is what made the
-# Company Mode ledger over-count real spend ~2x. OpenAI's cached-input discount is model
-# dependent; 0.25 is the common recent rate. One constant to tune if the real model
-# differs.
-CACHED_INPUT_RATE_MULTIPLIER = 0.25
+# Company Mode ledger over-count real spend ~2x. OpenAI lists cached input at 10% of the
+# regular input rate for the configured models (gpt-5.5 $0.50 vs $5.00, gpt-5.4 $0.25 vs
+# $2.50, gpt-5.4-mini $0.075 vs $0.75 per 1M; see
+# https://developers.openai.com/api/docs/pricing). One constant to tune if a model uses
+# a different cached ratio.
+CACHED_INPUT_RATE_MULTIPLIER = 0.10
 MODEL_PRICING = {
     PREMIUM_MODEL: (0.005, 0.030),         # gpt-5.5:      $5.00 / $30.00 per 1M
     FAST_MODEL: (0.00075, 0.0045),         # gpt-5.4-mini: $0.75 / $4.50 per 1M
