@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tavily import TavilyClient
 
+import deploy_helpers
 import github_helpers
 import google_helpers
 import linear_helpers
@@ -442,6 +443,15 @@ TOOLS = [
     {"type": "function", "name": "get_revenue_report", "strict": False,
      "description": "Pull live Gumroad sales, sync the product registry, and return the company P&L (spend vs revenue per product, plus totals). Reports last-synced numbers with a note if Gumroad isn't configured.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "list_deploy_projects", "strict": False,
+     "description": "List the Vercel projects available to deploy (name + id). Safe read-only action. Use it to find the exact project name before deploying.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "deploy_site", "strict": False,
+     "description": "Deploy a Vercel project's branch to a live URL. target 'preview' (default) is a throwaway URL that runs immediately; target 'production' touches the live domain and requires the user's /confirm. ref is the git branch (default 'main').",
+     "parameters": {"type": "object", "properties": {"project": {"type": "string"}, "ref": {"type": "string"}, "target": {"type": "string", "enum": ["preview", "production"]}}, "required": ["project"]}},
+    {"type": "function", "name": "check_deploy", "strict": False,
+     "description": "Check the build/ready status of a Vercel deployment by its id. Safe read-only action.",
+     "parameters": {"type": "object", "properties": {"deployment_id": {"type": "string"}}, "required": ["deployment_id"]}},
 ]
 
 DELEGATION_TOOLS = [
@@ -1405,6 +1415,9 @@ def confirm_pending_action(pending):
         return google_helpers.send_email(pending["to"], pending["subject"], pending["body"])
     if pending["type"] == "github_delete":
         return github_helpers.delete_file(pending["path"])
+    if pending["type"] == "deploy":
+        result, err = deploy_helpers.deploy(pending["project"], pending.get("ref", "main"), "production")
+        return err if err else format_deploy_result(result)
     return "Nothing to confirm."
 
 
@@ -1422,6 +1435,9 @@ def describe_pending_action(pending):
         return f"{description} ({context})" if context else description
     if pending["type"] == "publish":
         description = f"publishing of {pending.get('title', 'the product')}"
+        return f"{description} ({context})" if context else description
+    if pending["type"] == "deploy":
+        description = f"production deploy of {pending.get('project', '?')} @ {pending.get('ref', 'main')}"
         return f"{description} ({context})" if context else description
     return "the staged action"
 
@@ -1500,6 +1516,26 @@ def format_linear_issue_detail(issue):
     description = issue.get("description") or "(no description)"
     return (f"[{issue.get('identifier', '?')}] {issue.get('title', '(untitled)')} ({state})\n"
             f"{issue.get('url', '')}\n\n{description}").strip()
+
+
+def format_deploy_result(result):
+    """Human-readable line for a triggered Vercel deploy."""
+    target = result.get("target", "preview")
+    url = result.get("url", "")
+    state = result.get("readyState", "QUEUED")
+    return (f"{target.capitalize()} deploy triggered ({state} - it builds in the "
+            f"background):\n{url}\nCheck status with check_deploy id {result.get('id', '')}.").rstrip()
+
+
+def format_deploy_projects(projects_list):
+    if not projects_list:
+        return "No Vercel projects found."
+    lines = ["Vercel projects:"]
+    for p in projects_list:
+        link = p.get("link") or {}
+        repo = link.get("repo", "not git-linked")
+        lines.append(f"- {p.get('name', '?')} ({repo})")
+    return "\n".join(lines)
 
 
 # System prompts for /project planning commands. Each asks for a specific,
@@ -1888,6 +1924,62 @@ def execute_tool(name, arguments):
         if name == "get_revenue_report":
             return get_revenue_report()
 
+        if name == "list_deploy_projects":
+            projects_list, err = deploy_helpers.list_projects()
+            return err if err else format_deploy_projects(projects_list)
+
+        if name == "check_deploy":
+            status, err = deploy_helpers.deployment_status(arguments["deployment_id"])
+            if err:
+                return err
+            return (f"Deployment {status.get('id', '')}: {status.get('readyState', '?')}\n"
+                    f"{status.get('url', '')}").rstrip()
+
+        if name == "deploy_site":
+            project = arguments["project"]
+            ref = arguments.get("ref", "main") or "main"
+            target = "production" if str(arguments.get("target", "preview")).lower() == "production" else "preview"
+
+            # Preview deploys are throwaway URLs - run them freely. Production touches the
+            # live domain, so it's gated exactly like send_email.
+            if target == "preview":
+                result, err = deploy_helpers.deploy(project, ref, "preview")
+                if err:
+                    return err
+                _record_artifact(f"deploy: {result.get('url', '')}")
+                return format_deploy_result(result)
+
+            # target == "production" (gated)
+            if CONFIRMATION_MODE == "disabled":
+                return "Production deploys are disabled in this interface."
+
+            if CONFIRMATION_MODE == "requires_confirmation":
+                sink = current_execution_sink()
+                set_pending_action({
+                    "type": "deploy",
+                    "project": project,
+                    "ref": ref,
+                    "target": "production",
+                    "company_context": sink.get("context", "") if sink else "",
+                })
+                logger.info(f"Staged production deploy of {project}@{ref}, awaiting confirmation")
+                return (
+                    f"Production deploy of {project} @ {ref} is staged and waiting for your "
+                    f"confirmation - this goes to the LIVE domain. Reply /confirm to deploy it, "
+                    f"or anything else to cancel."
+                )
+
+            # CONFIRMATION_MODE == "enabled" - CLI path
+            answer = input(f"The AI wants to deploy {project} @ {ref} to PRODUCTION (live). Allow? (y/n): ")
+            if answer.strip().lower() != "y":
+                logger.info(f"User denied production deploy of {project}@{ref}")
+                return "The user declined the production deploy."
+            result, err = deploy_helpers.deploy(project, ref, "production")
+            if err:
+                return err
+            _record_artifact(f"deploy: {result.get('url', '')}")
+            return format_deploy_result(result)
+
         if name == "run_python":
             return run_python(arguments["code"])
 
@@ -2199,7 +2291,8 @@ SPECIALISTS = {
         "tool_names": ["read_file", "write_file", "search_the_web", "recall_memories", "run_python",
                        "github_list_files", "github_read_file", "github_save_file", "github_delete_file",
                        "code_list_files", "code_read_file", "code_propose_change", "code_edit_file",
-                       "linear_get_issue", "linear_search_issues", "linear_list_issues"],
+                       "linear_get_issue", "linear_search_issues", "linear_list_issues",
+                       "list_deploy_projects", "deploy_site", "check_deploy"],
         "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
@@ -2243,6 +2336,11 @@ linear_get_issue to get the full description and acceptance criteria, then imple
 exactly that scope. linear_search_issues / linear_list_issues are available too.
 These are read-only; you don't create or edit Linear issues (that's the Linear agent's
 job).
+
+To put a site live, use deploy_site (Vercel). Use list_deploy_projects to find the exact
+project name first. A "preview" deploy is a throwaway URL and runs immediately - use it
+freely to show work. A "production" deploy touches the live domain and will ask the user
+to /confirm, so only request it when the change is truly ready to go live.
 """,
         "persona": """
 You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior
@@ -2369,7 +2467,8 @@ heard. Sign off with "- Piper".
         "name": "Sway",
         "label": "Sway (Head of Marketing & Growth)",
         "model": PREMIUM_MODEL,
-        "tool_names": ["search_the_web", "read_file", "write_file", "recall_memories", "remember_fact"],
+        "tool_names": ["search_the_web", "read_file", "write_file", "recall_memories", "remember_fact",
+                       "list_deploy_projects", "deploy_site", "check_deploy"],
         "role": """
 You own the company's marketing: positioning, landing-page copy, SEO and keyword
 research, launch posts, and content calendars. Use search_the_web for keyword and
@@ -2378,6 +2477,10 @@ you market it, and write_file to save finished marketing assets. Use remember_fa
 to keep positioning, audience, and brand-voice decisions consistent over time, and
 recall_memories to check them before writing. Ground every claim in what the
 product actually does - never invent features or results.
+
+To get a landing page live for a launch, use deploy_site (Vercel): a "preview" deploy
+gives a shareable throwaway URL immediately; a "production" deploy goes to the live
+domain and asks the user to /confirm. Use list_deploy_projects to find the project name.
 """,
         "persona": """
 You are Sway, the team's head of marketing and growth. Voice: sharp and benefit-led,
