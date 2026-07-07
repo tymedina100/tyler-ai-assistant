@@ -341,6 +341,11 @@ async def _maybe_handle_project_linear_command(update, text):
     stripped = (text or "").strip()
     lowered = stripped.lower()
 
+    if lowered == "/today":
+        response = await asyncio.to_thread(main.handle_today_command)
+        await reply_chunks(update.message, response)
+        return True
+
     if lowered == "/project" or lowered.startswith("/project "):
         response = await asyncio.to_thread(main.handle_project_command, stripped[len("/project"):])
         await reply_chunks(update.message, response)
