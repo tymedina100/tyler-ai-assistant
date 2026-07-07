@@ -1722,17 +1722,17 @@ def _today_is_open(issue):
 def _today_due_rank(issue, today=None):
     due = issue.get("dueDate")
     if not due:
-        return 2, None
+        return 3, None
     try:
         due_date = datetime.fromisoformat(due[:10]).date()
     except ValueError:
-        return 2, due
+        return 3, due
     today = today or _now_local().date()
     if due_date < today:
         return 0, due_date
     if due_date == today:
         return 1, due_date
-    return 3, due_date
+    return 2, due_date
 
 
 def _today_has_mvp_label(issue):
