@@ -728,6 +728,7 @@ Available commands:
 /research <topic>           - Ask Scout, the Head of Research
 /write <prompt>             - Ask Quill, the Content Lead
 /task <request>             - Ask Sage, the Operations Manager
+/today                      - Show the current main project and the single best first action
 /project list               - List configured projects and the active one
 /project use <key>          - Set the active project (code tools target its repo)
 /project current            - Show the active project and repo target
