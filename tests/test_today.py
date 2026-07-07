@@ -31,7 +31,7 @@ class TodayCommandTests(unittest.TestCase):
                 "url": "https://linear/WOR-2",
                 "dueDate": "2026-07-06",
                 "priority": 4,
-                "priorityLabel": "Urgent",
+                "priorityLabel": "Low",
                 "updatedAt": "2026-07-06T10:00:00Z",
                 "state": {"name": "Todo", "type": "unstarted"},
                 "project": {"name": "Worthlane"},
