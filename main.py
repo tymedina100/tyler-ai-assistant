@@ -2784,5 +2784,15 @@ def main():
             break
 
 
+_original_handle_command = handle_command
+
+
+def handle_command(command):
+    if (command or "").strip().lower() == "/today":
+        print(handle_today_command())
+        return True
+    return _original_handle_command(command)
+
+
 if __name__ == "__main__":
     main()
