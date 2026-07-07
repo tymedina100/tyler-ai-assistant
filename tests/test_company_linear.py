@@ -203,6 +203,51 @@ class CompanyLinearBridgeTests(unittest.TestCase):
         update_mock.assert_not_called()  # not moved to Done while revisions are pending
         self.assertIn("fix X", comment_mock.call_args.args[1])
 
+    # --- editor BLOCKED verdict escalates instead of completing ---
+
+    def test_classify_editor_verdict(self):
+        self.assertEqual(company_mode.classify_editor_verdict("APPROVED - looks good"), "approved")
+        self.assertEqual(
+            company_mode.classify_editor_verdict("BLOCKED - NEEDS HUMAN REVIEW\n- need Railway access"),
+            "blocked",
+        )
+        self.assertEqual(
+            company_mode.classify_editor_verdict("Some notes, needs your review to proceed"), "blocked")
+        self.assertEqual(company_mode.classify_editor_verdict("REVISIONS REQUIRED\n1. fix"), "revise")
+        self.assertEqual(company_mode.classify_editor_verdict(""), "revise")  # never a silent pass
+
+    def test_set_verdict_stores_editor_verdict(self):
+        project = _seed_project(self.path)
+        company_mode.set_project_revision_flag(
+            project["id"], "BLOCKED - NEEDS HUMAN REVIEW: provide Railway env", self.path)
+        p = next(x for x in company_mode.load_state(self.path)["projects"] if x["id"] == project["id"])
+        self.assertEqual(p["editor_verdict"], "blocked")
+        self.assertFalse(p["needs_revision"])  # blocked is not a revise-loop
+
+    def test_finalize_source_issue_blocked_escalates_not_done(self):
+        project = _seed_project(self.path)
+        company_mode.set_project_source_issue(
+            project["id"], {"id": "iSRC", "identifier": "VAN-9", "url": "u"}, self.path)
+        company_mode.set_project_revision_flag(
+            project["id"], "BLOCKED - NEEDS HUMAN REVIEW\n- provide Railway env vars", self.path)
+
+        update_mock = MagicMock(return_value=({}, None))
+        comment_mock = MagicMock(return_value=({}, None))
+        with patch.object(company_linear.linear_helpers, "is_configured", lambda: True), \
+                patch.object(company_linear.linear_helpers, "update_issue_status", update_mock), \
+                patch.object(company_linear.linear_helpers, "add_comment", comment_mock):
+            company_linear.finalize_source_issue(project["id"], path=self.path)
+
+        update_mock.assert_not_called()  # BLOCKED never marks the issue Done
+        self.assertIn("Paused for your review", comment_mock.call_args.args[1])
+        self.assertIn("Railway", comment_mock.call_args.args[1])
+
+    def test_block_project_sets_status_blocked(self):
+        project = _seed_project(self.path)
+        company_mode.block_project(project["id"], self.path)
+        p = next(x for x in company_mode.load_state(self.path)["projects"] if x["id"] == project["id"])
+        self.assertEqual(p["status"], "blocked")
+
 
 if __name__ == "__main__":
     unittest.main()

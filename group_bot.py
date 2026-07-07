@@ -771,6 +771,39 @@ def _complete_project(project_id):
     company_mode.save_state(state)
 
 
+async def _escalate_for_review(project, project_id, verdict, rounds, note=""):
+    """Stop production on a project the team can't finish alone and hand it to the user.
+    Marks it 'blocked' (not complete), escalates the source Linear issue (not Done), and
+    posts the editor's requirements to the group so the user knows exactly what's needed."""
+    await asyncio.to_thread(company_mode.block_project, project_id)
+    await asyncio.to_thread(company_linear.finalize_source_issue, project_id)
+    state = await asyncio.to_thread(company_mode.load_state)
+    blocked = next((p for p in state["projects"] if p["id"] == project_id), project)
+    feedback = (blocked.get("last_editor_feedback") or "").strip()
+    source = blocked.get("source_linear_issue") or {}
+    ident = source.get("identifier", "")
+
+    if verdict == "blocked":
+        reason = "the editor flagged it as blocked and needing your input"
+    elif note:
+        reason = f"it isn't approved and can't start another revision round ({note})"
+    else:
+        reason = f"the editor still requires changes after {rounds} revision round(s)"
+
+    # A blocked project can't be resumed with /approve (that only starts a proposed
+    # project), so tell the user the real next step: provide what's needed, then re-run.
+    resume = f"re-run /linear do {ident}" if ident else "re-assign the goal"
+    message = (
+        f"⚠️ Paused for your review: {project['title']} — {reason}. The team can't finish this "
+        f"without your input; nothing was marked complete."
+    )
+    if feedback:
+        message += f"\n\nWhat's needed:\n{feedback[:1500]}"
+    message += (f"\n\nProvide what's needed (fix access, or paste the info here), then {resume} "
+                f"to try again. {company_mode.render_money(state)}")
+    await post_to_group(message, "manager")
+
+
 async def _run_one_task(project, task):
     """Execute a single task through its owner agent under company-execution rules.
     Returns "done" or "blocked" (a gated action needs the user's /confirm)."""
@@ -874,6 +907,16 @@ async def run_company_plan(project_id):
 
             task = company_mode.next_planned_task(state, project_id)
             if task is None:
+                verdict = project.get("editor_verdict")
+                rounds = project.get("revision_round", 0)
+
+                # The editor escalated (BLOCKED - needs human input), or we've revised too
+                # many times without approval: STOP production and hand it to the user.
+                # Do NOT mark it complete/Done - it's escalated, not finished.
+                if verdict == "blocked" or (verdict == "revise" and rounds >= company_mode.MAX_REVISION_ROUNDS):
+                    await _escalate_for_review(project, project_id, verdict, rounds)
+                    return
+
                 if project.get("needs_revision"):
                     created, note = await asyncio.to_thread(
                         company_mode.start_revision_round, project_id, BOT_KEYS
@@ -881,22 +924,18 @@ async def run_company_plan(project_id):
                     if created:
                         await post_to_group(f"{note} Continuing the work plan.", "manager")
                         continue  # loop picks up the freshly queued revision tasks
-                    await post_to_group(f"Not starting another revision round: {note}.", "manager")
+                    # Couldn't start another round (e.g. budget) and it's not approved ->
+                    # escalate rather than silently marking it complete.
+                    await _escalate_for_review(project, project_id, "revise", rounds, note=note)
+                    return
 
+                # Approved (or no editor task) -> complete and mark the issue Done.
                 await asyncio.to_thread(_complete_project, project_id)
-                # If this was a /linear do project, close out its source Linear issue
-                # (Done if approved, else comment the editor's required changes).
                 await asyncio.to_thread(company_linear.finalize_source_issue, project_id)
                 state = await asyncio.to_thread(company_mode.load_state)
-                finished = next((p for p in state["projects"] if p["id"] == project_id), project)
-                note = (
-                    "The Managing Editor flagged required revisions - this is NOT ready to ship. "
-                    "See /dailyreport for the list."
-                    if finished.get("needs_revision")
-                    else "See /dailyreport for the deliverables."
-                )
                 await post_to_group(
-                    f"Work plan complete for {project['title']}. {company_mode.render_money(state)}. {note}",
+                    f"✅ Work plan complete for {project['title']}. {company_mode.render_money(state)}. "
+                    "See /dailyreport for the deliverables.",
                     "manager",
                 )
                 return
