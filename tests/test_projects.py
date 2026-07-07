@@ -37,13 +37,13 @@ class ProjectRegistryTests(unittest.TestCase):
         self.assertIn("assistant", reg)
         self.assertIn("vantage", reg)
         self.assertIn("card-tracker", reg)
-        self.assertEqual(reg["vantage"]["repo"], "tymedina100/finance-app")
+        self.assertEqual(reg["vantage"]["repo"], "tymedina100/vantage")
 
     def test_set_active_project_selects_and_persists(self):
         with patch.dict(os.environ, self._env(), clear=False):
             profile, err = projects.set_active_project("vantage")
             self.assertIsNone(err)
-            self.assertEqual(profile["repo"], "tymedina100/finance-app")
+            self.assertEqual(profile["repo"], "tymedina100/vantage")
 
             key, prof = projects.get_active_project()
             self.assertEqual(key, "vantage")

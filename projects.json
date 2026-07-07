@@ -12,7 +12,7 @@
   },
   "vantage": {
     "name": "Worthlane / Vantage",
-    "repo": "tymedina100/finance-app",
+    "repo": "tymedina100/vantage",
     "type": "psychology-driven personal finance app",
     "default_branch": "main",
     "commands": {
