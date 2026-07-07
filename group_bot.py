@@ -42,6 +42,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 
 import main
 import company_mode
+import company_linear
 import gumroad_helpers
 
 
@@ -587,7 +588,28 @@ async def start_company_plan(update):
     message, project_id = await asyncio.to_thread(company_mode.approve_project)
     await update.message.reply_text(message)
     if project_id:
+        # approve_project already mirrored the tasks into Linear (via the hook);
+        # surface the created issues so you get the tracker links up front.
+        await _post_linear_mirror_summary(project_id)
         company_runner_task = asyncio.create_task(run_company_plan(project_id))
+
+
+async def _post_linear_mirror_summary(project_id):
+    """If Company Mode mirrored this project's tasks into Linear, post the issue list."""
+    if not company_linear.is_enabled():
+        return
+    try:
+        state = await asyncio.to_thread(company_mode.load_state)
+    except Exception:
+        return
+    tasks = company_mode.project_tasks(state, project_id)
+    mirrored = [t for t in tasks if t.get("linear_identifier")]
+    if not mirrored:
+        return
+    lines = [f"Linear: mirrored {len(mirrored)} task(s) as issues you can track:"]
+    for task in mirrored:
+        lines.append(f"- {task['linear_identifier']}: {task['title']}\n  {task.get('linear_url', '')}".rstrip())
+    await post_to_group("\n".join(lines), "manager")
 
 
 async def assign_with_dynamic_plan(update, goal):
@@ -1202,6 +1224,8 @@ async def run_all():
         print(f"{AGENT_INFO[key]['label']}: @{bot_usernames[key]}")
 
     main.on_delegation = on_delegation
+    # Mirror Company Mode work into Linear (no-op unless LINEAR_API_KEY is set).
+    company_linear.register()
 
     for key, app in applications.items():
         if key == "manager":
