@@ -30,6 +30,10 @@ Add a project by adding another key. To override the bundled registry on a cloud
 deploy, drop a `projects.json` into your `DATA_DIR` — it's preferred over the
 bundled one.
 
+Worthlane uses the `vantage` project key and intentionally targets the
+`tymedina100/vantage` GitHub repo. Local folder names may differ and should not
+be treated as the canonical repo name.
+
 ## 2. Switching the active project
 
 ```
