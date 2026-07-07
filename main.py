@@ -385,6 +385,12 @@ TOOLS = [
     {"type": "function", "name": "linear_search_issues", "strict": False,
      "description": "Search Linear issues by text. Safe read-only action.",
      "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
+    {"type": "function", "name": "linear_list_teams", "strict": False,
+     "description": "List the Linear teams (name, key, and id). Safe read-only action. Useful for finding the team id to configure or create issues in.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "linear_list_projects", "strict": False,
+     "description": "List the Linear projects (name and id). Safe read-only action.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
     {"type": "function", "name": "linear_create_issue", "strict": False,
      "description": "Create a Linear issue with a title and optional description. Creates immediately - only call when the user clearly wants a new issue. When several issues would be created at once, ask the user first.",
      "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}}, "required": ["title"]}},
@@ -1857,6 +1863,14 @@ def execute_tool(name, arguments):
             issues, err = linear_helpers.search_issues(arguments["query"], arguments.get("limit", 20))
             return err if err else format_linear_issues(issues)
 
+        if name == "linear_list_teams":
+            nodes, err = linear_helpers.list_teams()
+            return err if err else _format_named_nodes(nodes, "teams")
+
+        if name == "linear_list_projects":
+            nodes, err = linear_helpers.list_projects()
+            return err if err else _format_named_nodes(nodes, "projects")
+
         if name == "linear_create_issue":
             issue, err = linear_helpers.create_issue(
                 arguments["title"], arguments.get("description", ""))
@@ -2232,7 +2246,8 @@ number, then the one-sentence takeaway. Sign off with "- Ledger".
         "name": "Linear",
         "label": "Linear (Project Management Agent)",
         "model": PREMIUM_MODEL,
-        "tool_names": ["linear_list_issues", "linear_search_issues", "linear_create_issue",
+        "tool_names": ["linear_list_issues", "linear_search_issues", "linear_list_teams",
+                       "linear_list_projects", "linear_create_issue",
                        "linear_create_project_issue", "project_list", "project_current",
                        "code_read_file", "recall_memories"],
         "role": """

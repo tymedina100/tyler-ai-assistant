@@ -88,6 +88,29 @@ class LinearHelpersTests(unittest.TestCase):
         self.assertIsNone(teams)
         self.assertIn("500", err)
 
+    def test_list_teams_parses_nodes(self):
+        payload = {"data": {"teams": {"nodes": [
+            {"id": "t1", "name": "Product Lab", "key": "VAN"},
+        ]}}}
+        with patch.dict(os.environ, {"LINEAR_API_KEY": "k"}, clear=True), \
+                patch.object(linear_helpers.requests, "post",
+                             MagicMock(return_value=FakeResp(200, payload))):
+            teams, err = linear_helpers.list_teams()
+        self.assertIsNone(err)
+        self.assertEqual(teams[0]["key"], "VAN")
+        self.assertEqual(teams[0]["id"], "t1")
+
+    def test_list_projects_parses_nodes(self):
+        payload = {"data": {"projects": {"nodes": [
+            {"id": "p1", "name": "Watchlist", "state": "started"},
+        ]}}}
+        with patch.dict(os.environ, {"LINEAR_API_KEY": "k"}, clear=True), \
+                patch.object(linear_helpers.requests, "post",
+                             MagicMock(return_value=FakeResp(200, payload))):
+            projects_list, err = linear_helpers.list_projects()
+        self.assertIsNone(err)
+        self.assertEqual(projects_list[0]["name"], "Watchlist")
+
 
 if __name__ == "__main__":
     unittest.main()
