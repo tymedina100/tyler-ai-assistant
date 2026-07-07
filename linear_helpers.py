@@ -19,10 +19,15 @@ Per-assistant-project Linear project ids can be set with
   LINEAR_PROJECT_ID_<KEY>    - e.g. LINEAR_PROJECT_ID_VANTAGE
 """
 import os
+import re
 
 import requests
 
 API_URL = "https://api.linear.app/graphql"
+
+# "VAN-46" -> team key + issue number. Linear deprecated the issueSearch query, so we
+# resolve an identifier precisely via the issues(filter:) query instead.
+_IDENTIFIER_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*)-(\d+)\s*$")
 
 NOT_CONFIGURED = "Linear isn't configured (set LINEAR_API_KEY)."
 
@@ -111,10 +116,14 @@ def list_issues(limit=20):
 
 
 def search_issues(query, limit=20):
-    """Full-text search issues by text. Returns (list, None) or (None, error)."""
+    """Search issues by a title substring. Returns (list, None) or (None, error).
+
+    Note: Linear deprecated the full-text issueSearch GraphQL query, so this uses the
+    standard issues(filter:) query with a case-insensitive title match - reliable, but
+    it matches titles rather than issue bodies."""
     gql = """
     query Search($term: String!, $first: Int!) {
-      issueSearch(query: $term, first: $first) {
+      issues(filter: { title: { containsIgnoreCase: $term } }, first: $first, orderBy: updatedAt) {
         nodes { id identifier title url state { name } }
       }
     }
@@ -122,25 +131,40 @@ def search_issues(query, limit=20):
     data, err = _graphql(gql, {"term": query, "first": limit})
     if err:
         return None, err
-    return data.get("issueSearch", {}).get("nodes", []), None
+    return data.get("issues", {}).get("nodes", []), None
 
 
 def get_issue(query):
     """Fetch a single issue's full details (including the description/acceptance
-    criteria) by identifier (e.g. 'VAN-46') or by text. Uses issueSearch and returns
-    the best match. Returns (issue_dict, None) or (None, error). Unlike list/search,
-    this includes the full `description` so a coding agent can read the whole issue."""
-    gql = """
-    query One($term: String!) {
-      issueSearch(query: $term, first: 1) {
-        nodes { id identifier title description url state { name } }
-      }
-    }
-    """
-    data, err = _graphql(gql, {"term": query})
+    criteria) by identifier (e.g. 'VAN-46') or by a title substring. Returns
+    (issue_dict, None) or (None, error). Includes the full `description` so a coding
+    agent can read the whole issue.
+
+    An identifier is resolved precisely via team-key + number; other text falls back to
+    a case-insensitive title match. (issueSearch is deprecated, so neither uses it.)"""
+    match = _IDENTIFIER_RE.match(query or "")
+    if match:
+        team_key, number = match.group(1).upper(), int(match.group(2))
+        gql = """
+        query One($key: String!, $number: Float!) {
+          issues(filter: { team: { key: { eq: $key } }, number: { eq: $number } }, first: 1) {
+            nodes { id identifier title description url state { name } }
+          }
+        }
+        """
+        data, err = _graphql(gql, {"key": team_key, "number": float(number)})
+    else:
+        gql = """
+        query One($term: String!) {
+          issues(filter: { title: { containsIgnoreCase: $term } }, first: 1, orderBy: updatedAt) {
+            nodes { id identifier title description url state { name } }
+          }
+        }
+        """
+        data, err = _graphql(gql, {"term": query})
     if err:
         return None, err
-    nodes = data.get("issueSearch", {}).get("nodes", [])
+    nodes = data.get("issues", {}).get("nodes", [])
     if not nodes:
         return None, f"No Linear issue found matching '{query}'."
     return nodes[0], None

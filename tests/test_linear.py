@@ -111,22 +111,26 @@ class LinearHelpersTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(projects_list[0]["name"], "Watchlist")
 
-    def test_get_issue_returns_full_description(self):
-        payload = {"data": {"issueSearch": {"nodes": [
+    def test_get_issue_by_identifier_filters_by_team_and_number(self):
+        payload = {"data": {"issues": {"nodes": [
             {"id": "i1", "identifier": "VAN-46", "title": "Watchlist model",
              "description": "AC: owner-scoped table\nlinks to cards.id",
              "url": "https://l/VAN-46", "state": {"name": "Backlog"}},
         ]}}}
+        mock_post = MagicMock(return_value=FakeResp(200, payload))
         with patch.dict(os.environ, {"LINEAR_API_KEY": "k"}, clear=True), \
-                patch.object(linear_helpers.requests, "post",
-                             MagicMock(return_value=FakeResp(200, payload))):
+                patch.object(linear_helpers.requests, "post", mock_post):
             issue, err = linear_helpers.get_issue("VAN-46")
         self.assertIsNone(err)
         self.assertEqual(issue["identifier"], "VAN-46")
         self.assertIn("owner-scoped", issue["description"])
+        # Identifier resolved via team key + number, not the deprecated issueSearch.
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertNotIn("issueSearch", sent["query"])
+        self.assertEqual(sent["variables"], {"key": "VAN", "number": 46.0})
 
     def test_get_issue_not_found(self):
-        payload = {"data": {"issueSearch": {"nodes": []}}}
+        payload = {"data": {"issues": {"nodes": []}}}
         with patch.dict(os.environ, {"LINEAR_API_KEY": "k"}, clear=True), \
                 patch.object(linear_helpers.requests, "post",
                              MagicMock(return_value=FakeResp(200, payload))):
