@@ -123,6 +123,32 @@ class CompanyLinearBridgeTests(unittest.TestCase):
 
         self.assertTrue(any(c[0] == task["id"] and c[1] == "in_progress" for c in calls))
 
+    # --- editor gate must be the FINAL task ---
+
+    def test_ensure_editor_gate_appends_when_not_last(self):
+        self.assertEqual(
+            company_mode.ensure_editor_gate([("code", "c")], "R"),
+            [("code", "c"), ("editor", "R")],
+        )
+
+    def test_ensure_editor_gate_adds_final_gate_even_with_mid_plan_editor(self):
+        # An editor in the middle is NOT the gate - a final review is still appended so
+        # later production work can't ship unreviewed.
+        self.assertEqual(
+            company_mode.ensure_editor_gate(
+                [("code", "c"), ("editor", "mid"), ("write", "w")], "R"),
+            [("code", "c"), ("editor", "mid"), ("write", "w"), ("editor", "R")],
+        )
+
+    def test_ensure_editor_gate_unchanged_when_editor_already_last(self):
+        self.assertEqual(
+            company_mode.ensure_editor_gate([("code", "c"), ("editor", "e")], "R"),
+            [("code", "c"), ("editor", "e")],
+        )
+
+    def test_ensure_editor_gate_handles_empty(self):
+        self.assertEqual(company_mode.ensure_editor_gate([], "R"), [("editor", "R")])
+
     # --- /linear do: source-issue tracking ---
 
     def test_source_issue_skips_per_task_mirror_and_moves_in_progress(self):

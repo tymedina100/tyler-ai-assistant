@@ -708,8 +708,9 @@ async def assign_from_linear(update, identifier):
             responders = ["code"]
         owner = next((r for r in responders if r in main.SPECIALISTS), "code")
         tasks = [(owner, title)]
-    if not any(o == "editor" for o, _ in tasks):
-        tasks.append(("editor", review_title))
+    # The editor must be the LAST task so it reviews the FINAL deliverable (see
+    # company_mode.ensure_editor_gate for why a mid-plan editor isn't enough).
+    tasks = company_mode.ensure_editor_gate(tasks, review_title)
 
     result = await asyncio.to_thread(
         company_mode.assign_goal,
