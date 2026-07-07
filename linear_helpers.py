@@ -115,6 +115,39 @@ def list_issues(limit=20):
     return data.get("issues", {}).get("nodes", []), None
 
 
+def list_command_center_issues(limit=50):
+    """Return richer recent issue data for the /today command.
+
+    This stays read-only. It intentionally pulls a bounded recent slice instead of
+    trying to build a whole planning system. The command center should point Tyler
+    at today's first move, not invite him to alphabetize the universe.
+    """
+    query = """
+    query CommandCenter($first: Int!) {
+      issues(first: $first, orderBy: updatedAt) {
+        nodes {
+          id
+          identifier
+          title
+          url
+          createdAt
+          updatedAt
+          dueDate
+          priority
+          priorityLabel
+          state { name type }
+          project { name }
+          labels { nodes { name } }
+        }
+      }
+    }
+    """
+    data, err = _graphql(query, {"first": limit})
+    if err:
+        return None, err
+    return data.get("issues", {}).get("nodes", []), None
+
+
 def search_issues(query, limit=20):
     """Search issues by a title substring. Returns (list, None) or (None, error).
 
