@@ -309,6 +309,31 @@ def build_specialist_handler(key):
     return handle
 
 
+async def _maybe_handle_project_linear_command(update, text):
+    """Intercept /project and /linear slash commands (multi-project + Linear) and run
+    them through main's handlers, which return a string to post. These are the same
+    handlers the CLI uses; without this, the group/DM interface would route them to
+    Miles as plain chat instead. Returns True if it handled the message.
+
+    The handlers may hit the Linear API or the model (planning commands), so run them
+    off the event loop in a thread. Not company-metered - same as the CLI slash
+    commands."""
+    stripped = (text or "").strip()
+    lowered = stripped.lower()
+
+    if lowered == "/project" or lowered.startswith("/project "):
+        response = await asyncio.to_thread(main.handle_project_command, stripped[len("/project"):])
+        await reply_chunks(update.message, response)
+        return True
+
+    if lowered == "/linear" or lowered.startswith("/linear "):
+        response = await asyncio.to_thread(main.handle_linear_command, stripped[len("/linear"):])
+        await reply_chunks(update.message, response)
+        return True
+
+    return False
+
+
 async def handle_manager_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """The manager bot receives both the group's plain messages (which it now
     auto-routes to the right teammate instead of always answering itself) and its
@@ -346,6 +371,10 @@ async def handle_group_message(update: Update):
 
         # A /confirm (or cancel) for something staged in the group is resolved here.
         if await _handle_pending_confirmation(update, text):
+            return
+
+        # /project and /linear slash commands are handled directly (not routed to Miles).
+        if await _maybe_handle_project_linear_command(update, text):
             return
 
         # /approve and /cancel drive the background execution engine, so they're
@@ -432,6 +461,10 @@ async def handle_manager_dm(update: Update):
         main.set_reply_context({"kind": "manager_dm", "user_id": user_id, "chat_id": chat_id})
 
         if await _handle_pending_confirmation(update, text):
+            return
+
+        # /project and /linear slash commands are handled directly (not routed to Miles).
+        if await _maybe_handle_project_linear_command(update, text):
             return
 
         company_command = company_mode.parse_company_command(text)
