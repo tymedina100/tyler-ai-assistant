@@ -1,6 +1,18 @@
 # Tyler AI Assistant
 
-A beginner-friendly command-line AI assistant built with Python and the OpenAI API.
+A focused personal operating assistant for Tyler. The MVP is limited to three weekly-use workflows: Linear-driven planning, approval-based Career Ops support, and calendar/tasks/routine help that directly supports action.
+
+## MVP scope: three core workflows
+
+The assistant's V1 exists to help Tyler act, not to collect infinite agents. The core workflows are:
+
+1. **Project planning and daily priorities from Linear.** Read Linear, clarify what matters today, and turn project work into small approved next steps.
+2. **Job search support through Career Ops / approval-based workflows.** Help with resume/cover-letter/application/recruiter workflows, but keep external-facing actions approval-gated.
+3. **Calendar, tasks, and routine support only where it helps Tyler act.** Use Calendar, Todoist, reminders, and briefings to reduce friction around execution, not to become a general life dashboard.
+
+Everything else in this repo — extra specialist agents, Telegram modes, Company Mode, GitHub/Google/Gumroad helpers, product workflows, and other experiments — is **later** unless Tyler uses it weekly or it directly supports one of the three workflows above.
+
+The assistant is **not** trying to become a do-everything autonomous company, app platform, or agent marketplace right now. Boring focus. Radical concept.
 
 ## Features
 
