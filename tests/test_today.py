@@ -105,6 +105,67 @@ class TodayCommandTests(unittest.TestCase):
         self.assertNotIn("VAN-1", output)
         self.assertIn("ASSIST-1", output)
 
+    def test_same_project_same_due_date_picks_urgent_before_low_priority(self):
+        issues = [
+            {
+                "identifier": "VAN-LOW",
+                "title": "Low priority Card Tracker task",
+                "url": "https://linear/VAN-LOW",
+                "dueDate": "2999-01-01",
+                "priority": 4,
+                "priorityLabel": "Low",
+                "updatedAt": "2026-07-06T10:00:00Z",
+                "state": {"name": "Todo", "type": "unstarted"},
+                "project": {"name": "Card Tracker"},
+                "labels": {"nodes": []},
+            },
+            {
+                "identifier": "VAN-URGENT",
+                "title": "Urgent Card Tracker task",
+                "url": "https://linear/VAN-URGENT",
+                "dueDate": "2999-01-01",
+                "priority": 1,
+                "priorityLabel": "Urgent",
+                "updatedAt": "2026-07-06T09:00:00Z",
+                "state": {"name": "Todo", "type": "unstarted"},
+                "project": {"name": "Card Tracker"},
+                "labels": {"nodes": []},
+            },
+        ]
+        with patch.object(self.main.linear_helpers, "list_command_center_issues", return_value=(issues, None)):
+            output = self.main.handle_today_command()
+        self.assertIn("FIRST: [VAN-URGENT] Urgent Card Tracker task", output)
+
+    def test_future_due_date_beats_no_due_date_after_today_work(self):
+        issues = [
+            {
+                "identifier": "VAN-NODUE",
+                "title": "Undated Card Tracker task",
+                "url": "https://linear/VAN-NODUE",
+                "priority": 1,
+                "priorityLabel": "Urgent",
+                "updatedAt": "2026-07-06T10:00:00Z",
+                "state": {"name": "Todo", "type": "unstarted"},
+                "project": {"name": "Card Tracker"},
+                "labels": {"nodes": [{"name": "MVP"}]},
+            },
+            {
+                "identifier": "VAN-FUTURE",
+                "title": "Dated upcoming Card Tracker task",
+                "url": "https://linear/VAN-FUTURE",
+                "dueDate": "2999-01-01",
+                "priority": 1,
+                "priorityLabel": "Urgent",
+                "updatedAt": "2026-07-06T09:00:00Z",
+                "state": {"name": "Todo", "type": "unstarted"},
+                "project": {"name": "Card Tracker"},
+                "labels": {"nodes": []},
+            },
+        ]
+        with patch.object(self.main.linear_helpers, "list_command_center_issues", return_value=(issues, None)):
+            output = self.main.handle_today_command()
+        self.assertIn("FIRST: [VAN-FUTURE] Dated upcoming Card Tracker task", output)
+
     def test_group_bot_has_today_slash_intercept(self):
         group_bot = (ROOT / "group_bot.py").read_text(encoding="utf-8")
         self.assertIn('if lowered == "/today":', group_bot)
