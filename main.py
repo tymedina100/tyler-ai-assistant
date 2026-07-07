@@ -370,6 +370,9 @@ TOOLS = [
     {"type": "function", "name": "code_edit_file", "strict": False,
      "description": "Make a targeted edit to an EXISTING file in the assistant's own code repository: replaces old_snippet with new_snippet (old_snippet must appear exactly once in the file), commits to a branch, and opens/updates a pull request. Preferred for editing existing files - you supply only the small snippet that changes, not the whole file. Read the file first to copy an exact snippet. Reuse the same branch for related edits.",
      "parameters": {"type": "object", "properties": {"branch": {"type": "string"}, "path": {"type": "string"}, "old_snippet": {"type": "string"}, "new_snippet": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["branch", "path", "old_snippet", "new_snippet", "title"]}},
+    {"type": "function", "name": "code_read_pr", "strict": False,
+     "description": "Read the actual unified diff of a pull request in the code repository, by PR number or URL. Use this to review the REAL change before approving or judging it - never approve from a written summary alone.",
+     "parameters": {"type": "object", "properties": {"pr": {"type": "string"}}, "required": ["pr"]}},
     {"type": "function", "name": "project_list", "strict": False,
      "description": "List the configured projects (keys, names, repos) the assistant can work on, and show which one is active.",
      "parameters": {"type": "object", "properties": {}, "required": []}},
@@ -1833,6 +1836,9 @@ def execute_tool(name, arguments):
         if name == "code_read_file":
             return github_helpers.code_read_file(arguments["path"])
 
+        if name == "code_read_pr":
+            return github_helpers.code_pr_diff(arguments["pr"])
+
         if name == "code_propose_change":
             # No /confirm gate here: the pull request IS the review step - nothing
             # merges to the base branch (or ships) until the user approves it.
@@ -2226,17 +2232,22 @@ message that matters most. Sign off with "- Sway".
         "name": "Vera",
         "label": "Vera (Managing Editor)",
         "model": PREMIUM_MODEL,
-        "tool_names": ["read_file", "search_the_web", "recall_memories"],
+        "tool_names": ["read_file", "search_the_web", "recall_memories",
+                       "code_read_pr", "code_read_file", "code_list_files"],
         "role": """
 You are the team's final quality gate: you review finished deliverables before they
-ship to a customer. Always read the actual deliverable with read_file - never review
-from a description alone. Use search_the_web to spot-check factual claims and
-recall_memories for the project's context and requirements. Grade against this
-checklist: (1) are claims sourced or verifiable, (2) does the format match what was
-asked for, (3) is it complete and self-contained, (4) is it good enough for a paying
-customer. Your verdict is binary: "APPROVED" with a one-line reason, or "REVISIONS
-REQUIRED" with a numbered list of specific fixes. You never rewrite the work
-yourself - you say exactly what must change and who should change it.
+ship to a customer. Always read the actual deliverable - never review from a
+description or summary alone. If the deliverable is a code change / pull request
+(the result mentions a PR number or URL), read the ACTUAL diff with code_read_pr
+before judging it; use code_read_file / code_list_files to inspect the repo for
+context. For a saved file deliverable, read it with read_file. Use search_the_web to
+spot-check factual claims and recall_memories for the project's context and
+requirements. Grade against this checklist: (1) are claims sourced or verifiable,
+(2) does the format match what was asked for, (3) is it complete and self-contained,
+(4) is it good enough for a paying customer. Your verdict is binary: "APPROVED" with
+a one-line reason, or "REVISIONS REQUIRED" with a numbered list of specific fixes.
+You never rewrite the work yourself - you say exactly what must change and who should
+change it.
 """,
         "persona": """
 You are Vera, the team's managing editor. Voice: exacting but fair - every note
