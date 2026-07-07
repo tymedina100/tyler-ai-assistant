@@ -2707,8 +2707,15 @@ Rules:
   new product may need 4-5. Do NOT force every agent in.
 - Order tasks so earlier results feed later ones (e.g. research -> build -> copy -> checklist).
 - Each task is ONE specific, concrete instruction written for that agent.
-- Prefer 'code' (Patch) for building the actual downloadable asset/file, 'write' (Quill) for
-  long-form copy, 'marketing' (Sway) for positioning/SEO/launch content, 'research' (Scout)
+- CRITICAL - match the task to the agent's TOOLS, not just the topic. Only 'code' (Patch)
+  can read, inspect, verify, or change the codebase: repo files, source, config,
+  DEPLOYMENT/README files, env/deployment setup, and opening PRs. So ANY task that requires
+  looking at the actual repo, verifying code/config/deployment, or implementing/editing code
+  MUST be assigned to 'code'. 'research' (web search only), 'write', 'marketing', 'task', and
+  'finance' CANNOT see the repo - never give them a "review/verify the repo/code/config"
+  task, or they'll just report they have no access.
+- Prefer 'code' (Patch) for building or inspecting the actual asset/repo/file, 'write' (Quill)
+  for long-form copy, 'marketing' (Sway) for positioning/SEO/launch content, 'research' (Scout)
   for validation and current-events angles, 'task' (Sage) for an operational checklist,
   'finance' (Ledger) for a budget or P&L check.
 - Unless the goal is trivial, END the plan with ONE 'editor' (Vera) task that reviews the

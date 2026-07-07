@@ -181,7 +181,7 @@ def get_issue(query):
         gql = """
         query One($key: String!, $number: Float!) {
           issues(filter: { team: { key: { eq: $key } }, number: { eq: $number } }, first: 1) {
-            nodes { id identifier title description url state { name } }
+            nodes { id identifier title description url state { name } project { name } }
           }
         }
         """
@@ -190,7 +190,7 @@ def get_issue(query):
         gql = """
         query One($term: String!) {
           issues(filter: { title: { containsIgnoreCase: $term } }, first: 1, orderBy: updatedAt) {
-            nodes { id identifier title description url state { name } }
+            nodes { id identifier title description url state { name } project { name } }
           }
         }
         """

@@ -77,6 +77,16 @@ class ProjectRegistryTests(unittest.TestCase):
             "ai/vantage/add-safe-to-spend-card",
         )
 
+    def test_find_by_linear_project(self):
+        self.assertEqual(projects.find_by_linear_project("Worthlane"), "vantage")
+        self.assertEqual(projects.find_by_linear_project("worthlane"), "vantage")  # case-insensitive
+        self.assertEqual(projects.find_by_linear_project("Tyler AI Assistant"), "assistant")
+        self.assertEqual(projects.find_by_linear_project("Card Tracker"), "card-tracker")
+        # Name fallback: an alias that isn't the exact linear_project still maps.
+        self.assertEqual(projects.find_by_linear_project("Vantage"), "vantage")
+        self.assertIsNone(projects.find_by_linear_project("Some Unrelated Project"))
+        self.assertIsNone(projects.find_by_linear_project(""))
+
 
 class CommandParsingTests(unittest.TestCase):
     @classmethod
