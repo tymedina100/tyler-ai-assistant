@@ -43,7 +43,7 @@ class TodayCommandTests(unittest.TestCase):
                 "url": "https://linear/VAN-46",
                 "dueDate": "2026-07-07",
                 "priority": 1,
-                "priorityLabel": "Low",
+                "priorityLabel": "Urgent",
                 "updatedAt": "2026-07-06T09:00:00Z",
                 "state": {"name": "Todo", "type": "unstarted"},
                 "project": {"name": "Card Tracker"},
