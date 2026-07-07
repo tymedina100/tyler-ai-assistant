@@ -216,6 +216,20 @@ def _owner_for(preferred_owner, configured_agent_keys):
     return preferred_owner, "via_miles"
 
 
+def ensure_editor_gate(tasks, review_title):
+    """Guarantee the editor is the FINAL task in a plan so it reviews the FINAL
+    deliverable. The runner only sets needs_revision when an editor task runs and
+    finalizes after all tasks are done, so an editor in the MIDDLE would let later
+    production tasks change the work after approval yet still finalize off a stale
+    verdict. A mid-plan editor is left in place (it just isn't the gate); a review is
+    appended whenever the last task isn't already the editor. Returns a new list of
+    (owner, title) tuples."""
+    tasks = list(tasks or [])
+    if not tasks or tasks[-1][0] != "editor":
+        tasks.append(("editor", review_title))
+    return tasks
+
+
 def _new_task(project_id, owner, delivery, title, estimate=DEFAULT_TASK_ESTIMATE_USD):
     return {
         "id": f"task_{uuid.uuid4().hex[:8]}",
