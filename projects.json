@@ -4,6 +4,7 @@
     "repo": "tymedina100/tyler-ai-assistant",
     "type": "personal AI assistant / Telegram multi-agent system",
     "default_branch": "main",
+    "linear_project": "Tyler AI Assistant",
     "commands": {
       "test": "pytest",
       "run": "python main.py",
@@ -15,6 +16,7 @@
     "repo": "tymedina100/vantage",
     "type": "psychology-driven personal finance app",
     "default_branch": "main",
+    "linear_project": "Worthlane",
     "commands": {
       "install": "pnpm install",
       "dev": "pnpm dev",
@@ -31,6 +33,7 @@
     "repo": "tymedina100/card-tracker",
     "type": "sports and Pokemon card price comp tracker / flipping dashboard",
     "default_branch": "main",
+    "linear_project": "Card Tracker",
     "commands": {
       "install": "pip install -e \".[dev]\"",
       "test": "pytest",

@@ -190,6 +190,11 @@ supervised Company Mode project:
 - Reads the full issue (title + acceptance criteria), **plans a tailored team** for it
   (the same dynamic planner `/assign` uses — e.g. research + code + write as the issue
   needs, not just one builder), and always adds a Managing Editor review task.
+- **Auto-targets the right repo:** it maps the issue's Linear project (e.g. "Worthlane")
+  to the matching assistant project (`vantage`) via the `linear_project` field in
+  `projects.json` and makes it active, so the code tools read that repo — no need to
+  `/project use` first. Only Patch (code) can read/verify a repo, so the planner routes
+  any "review the repo / verify config / implement" work to Patch (not research/task).
 - The **source issue itself** is the tracker — no duplicate per-task issues. It moves to
   **In Progress** on `/approve` and to **Done** once the editor approves; if the editor
   requires changes, it stays In Progress and the required changes are posted as a comment.

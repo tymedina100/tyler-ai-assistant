@@ -69,6 +69,26 @@ def project_repo(key):
     return profile.get("repo") or None
 
 
+def find_by_linear_project(linear_project_name):
+    """Map a Linear project name (e.g. 'Worthlane') to the assistant project key that
+    owns it, so /linear do can target the right repo automatically. Matches on the
+    profile's `linear_project` field first, then falls back to the profile `name`.
+    Case-insensitive. Returns the key or None."""
+    name = (linear_project_name or "").strip().lower()
+    if not name:
+        return None
+    for key, profile in load_registry().items():
+        linked = (profile.get("linear_project") or "").strip().lower()
+        if linked and linked == name:
+            return key
+    # Fallback: match against the human name (handles "Worthlane / Vantage" vs "Worthlane").
+    for key, profile in load_registry().items():
+        human = (profile.get("name") or "").strip().lower()
+        if human and (name in human or human in name):
+            return key
+    return None
+
+
 def _read_active_key():
     path = _active_file()
     if not path.exists():

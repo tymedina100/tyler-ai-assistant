@@ -688,6 +688,19 @@ async def assign_from_linear(update, identifier):
     title = (issue.get("title") or "").strip() or ident
     description = (issue.get("description") or "").strip()
 
+    # Point the code tools at the repo this issue actually belongs to: map the issue's
+    # Linear project (e.g. "Worthlane") to the matching assistant project and make it
+    # active. Otherwise a Worthlane issue would be worked against whatever repo happened
+    # to be active. No match -> leave the current active project as-is.
+    linear_project = (issue.get("project") or {}).get("name", "")
+    matched_key = await asyncio.to_thread(main.projects.find_by_linear_project, linear_project)
+    if matched_key:
+        profile, perr = await asyncio.to_thread(main.projects.set_active_project, matched_key)
+        if profile and not perr:
+            await post_to_group(
+                f"Targeting the {profile.get('name', matched_key)} repo "
+                f"({profile.get('repo')}) for {ident}.", "manager")
+
     goal = f"Complete Linear issue {ident}: {title}"
     if description:
         goal += f"\n\nIssue details / acceptance criteria:\n{description}"
