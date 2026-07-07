@@ -1744,6 +1744,9 @@ def _today_sort_key(issue):
     due_rank, due_date = _today_due_rank(issue)
     mvp_rank = 0 if _today_has_mvp_label(issue) else 1
     priority = issue.get("priority") or 0
+    # Linear priorities are inverse severity: 1=Urgent, 2=High, 3=Medium, 4=Low,
+    # and 0 means "No priority". Sort urgent first and no-priority last.
+    priority_rank = priority if priority in (1, 2, 3, 4) else 5
     due_value = due_date.isoformat() if hasattr(due_date, "isoformat") else "9999-12-31"
     return (project_index, due_rank, mvp_rank, -priority, due_value, issue.get("updatedAt") or "")
 
