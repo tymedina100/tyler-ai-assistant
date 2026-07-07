@@ -97,7 +97,7 @@ BOT_KEYS = ["manager", "code", "research", "write", "task", "marketing", "editor
 # Optional bots: enabled only if their token env var (TELEGRAM_<KEY>_BOT_TOKEN) is
 # set - never required, so a missing token can't hard-exit startup. When disabled
 # the agent still works via Miles's delegation; it just isn't @mentionable.
-OPTIONAL_BOT_KEYS = ["linear"]
+OPTIONAL_BOT_KEYS = ["linear", "calendar", "gmail", "general"]
 BOT_KEYS += [key for key in OPTIONAL_BOT_KEYS
              if os.environ.get(f"TELEGRAM_{key.upper()}_BOT_TOKEN")]
 
@@ -132,14 +132,27 @@ AGENT_INFO = {
     "calendar": {"env_var": "TELEGRAM_CALENDAR_BOT_TOKEN", "tagline": "@mention me about your calendar, a reminder, or the weather."},
     "gmail": {"env_var": "TELEGRAM_GMAIL_BOT_TOKEN", "tagline": "@mention me to check or send email, or handle a customer message."},
     "linear": {"env_var": "TELEGRAM_LINEAR_BOT_TOKEN", "tagline": "@mention me to turn ideas into Linear issues."},
+    # Robin (the general assistant) isn't a main.SPECIALISTS entry - it's the
+    # all-rounder fallback that runs through main.ask_ai with the full toolset. So,
+    # like the manager, it carries its own label/welcome here and is skipped in the
+    # SPECIALISTS label loop below.
+    "general": {
+        "env_var": "TELEGRAM_GENERAL_BOT_TOKEN",
+        "label": "Robin (General Assistant)",
+        "welcome": (
+            "Robin here - the team's all-rounder. @mention me for anything that "
+            "doesn't clearly belong to a specialist and I'll take a crack at it."
+        ),
+    },
 }
 
 # Fill in each specialist's label + welcome from main.SPECIALISTS (the single
 # source of truth for persona names). A label looks like "Scout (Researcher
 # Agent)"; the part in parentheses is the human-readable role, which we reuse to
 # build a greeting like "Scout here - the Researcher Agent. <tagline>".
+# manager and general aren't SPECIALISTS entries, so they keep their own labels.
 for _key, _info in AGENT_INFO.items():
-    if _key == "manager":
+    if _key in ("manager", "general"):
         continue
 
     _profile = main.SPECIALISTS[_key]
@@ -297,7 +310,12 @@ def build_specialist_handler(key):
                 if await _handle_pending_confirmation(update, request):
                     return
 
-                answer = await _run_metered(main.ask_specialist, key, request)
+                # Robin (general) isn't a SPECIALISTS entry; it runs through ask_ai
+                # (all-rounder, full toolset) rather than ask_specialist.
+                if key == "general":
+                    answer = await _run_metered(main.ask_ai, request)
+                else:
+                    answer = await _run_metered(main.ask_specialist, key, request)
         except Exception as e:
             main.logger.error(f"Unhandled error in {key} specialist handler: {e}")
             await update.message.reply_text("Sorry, something went wrong processing that.")
