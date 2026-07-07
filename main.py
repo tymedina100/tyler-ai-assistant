@@ -2797,5 +2797,33 @@ def handle_command(command):
     return _original_handle_command(command)
 
 
+# Revision fix for /today ranking. Keep this override at module end so it replaces
+# the earlier helper definitions added by the command implementation.
+def _today_due_rank(issue, today=None):
+    due = issue.get("dueDate")
+    if not due:
+        return 3, None
+    try:
+        due_date = datetime.fromisoformat(due[:10]).date()
+    except ValueError:
+        return 3, due
+    today = today or _now_local().date()
+    if due_date < today:
+        return 0, due_date
+    if due_date == today:
+        return 1, due_date
+    return 2, due_date
+
+
+def _today_sort_key(issue):
+    project_index, _project_name = _today_project(issue)
+    due_rank, due_date = _today_due_rank(issue)
+    mvp_rank = 0 if _today_has_mvp_label(issue) else 1
+    priority = issue.get("priority") or 0
+    priority_rank = priority if priority in (1, 2, 3, 4) else 5
+    due_value = due_date.isoformat() if hasattr(due_date, "isoformat") else "9999-12-31"
+    return (project_index, due_rank, mvp_rank, priority_rank, due_value, issue.get("updatedAt") or "")
+
+
 if __name__ == "__main__":
     main()
