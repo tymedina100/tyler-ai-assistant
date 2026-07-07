@@ -217,6 +217,13 @@ EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 # a model swap can never silently meter $0 and hide runaway cost - the fallback is
 # deliberately on the high side so an unpriced model over-counts rather than under.
 DEFAULT_MODEL_PRICE = (0.01, 0.03)
+# Cached input tokens (prompt caching) are billed at a fraction of the input rate. In a
+# tool loop the model re-sends a large, mostly-stable prefix every iteration, so most of
+# those input tokens are cache hits - charging them at the full rate is what made the
+# Company Mode ledger over-count real spend ~2x. OpenAI's cached-input discount is model
+# dependent; 0.25 is the common recent rate. One constant to tune if the real model
+# differs.
+CACHED_INPUT_RATE_MULTIPLIER = 0.25
 MODEL_PRICING = {
     PREMIUM_MODEL: (0.005, 0.030),         # gpt-5.5:      $5.00 / $30.00 per 1M
     FAST_MODEL: (0.00075, 0.0045),         # gpt-5.4-mini: $0.75 / $4.50 per 1M
@@ -252,7 +259,31 @@ def usage_to_usd(model, usage):
         total = getattr(usage, "total_tokens", 0) or 0
         output_tokens = max(0, total - input_tokens)
 
-    return round((input_tokens / 1000.0) * in_rate + (output_tokens / 1000.0) * out_rate, 6)
+    # Split input into cache hits (billed at a fraction) and fresh tokens (full rate).
+    cached_tokens = min(_cached_input_tokens(usage), input_tokens)
+    fresh_input = max(0, input_tokens - cached_tokens)
+
+    cost = (
+        (fresh_input / 1000.0) * in_rate
+        + (cached_tokens / 1000.0) * in_rate * CACHED_INPUT_RATE_MULTIPLIER
+        + (output_tokens / 1000.0) * out_rate
+    )
+    return round(cost, 6)
+
+
+def _cached_input_tokens(usage):
+    """Cached (prompt-cache-hit) input tokens from a usage object, across the Responses
+    API (input_tokens_details.cached_tokens) and Chat Completions
+    (prompt_tokens_details.cached_tokens) shapes. 0 when absent."""
+    details = getattr(usage, "input_tokens_details", None)
+    if details is None:
+        details = getattr(usage, "prompt_tokens_details", None)
+    if details is None:
+        return 0
+    # details may be an object or a dict depending on SDK/version.
+    if isinstance(details, dict):
+        return details.get("cached_tokens", 0) or 0
+    return getattr(details, "cached_tokens", 0) or 0
 
 
 def _accrue_cost(model, usage):
