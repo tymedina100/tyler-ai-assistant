@@ -187,8 +187,9 @@ supervised Company Mode project:
 /approve
 ```
 
-- Reads the full issue (title + acceptance criteria), routes the build to the best-fit
-  agent (usually Patch), and adds a Managing Editor review task.
+- Reads the full issue (title + acceptance criteria), **plans a tailored team** for it
+  (the same dynamic planner `/assign` uses — e.g. research + code + write as the issue
+  needs, not just one builder), and always adds a Managing Editor review task.
 - The **source issue itself** is the tracker — no duplicate per-task issues. It moves to
   **In Progress** on `/approve` and to **Done** once the editor approves; if the editor
   requires changes, it stays In Progress and the required changes are posted as a comment.

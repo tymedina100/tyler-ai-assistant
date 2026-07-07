@@ -665,9 +665,10 @@ async def assign_with_dynamic_plan(update, goal):
 
 async def assign_from_linear(update, identifier):
     """Handle /linear do <issue>: fetch the Linear issue and seed a supervised Company
-    Mode project from it - routed to the best-fit owner plus an editor review - tagging
-    the project with the source issue so the engine syncs status back to THAT issue.
-    Then it's the normal flow: reply /approve to start."""
+    Mode project from it - planning a tailored team for the issue (the same dynamic
+    planner /assign uses) plus a guaranteed editor review - and tagging the project with
+    the source issue so the engine syncs status back to THAT issue. Then it's the normal
+    flow: reply /approve to start."""
     identifier = (identifier or "").strip()
     if not identifier:
         await update.message.reply_text(
@@ -687,19 +688,28 @@ async def assign_from_linear(update, identifier):
     title = (issue.get("title") or "").strip() or ident
     description = (issue.get("description") or "").strip()
 
-    # Route the implementation to the best-fit owner (default to Patch/code).
-    try:
-        responders = await asyncio.to_thread(main.select_group_responders, f"{title}\n\n{description}")
-    except Exception:
-        responders = ["code"]
-    owner = next((r for r in responders if r in main.SPECIALISTS), "code")
-
     goal = f"Complete Linear issue {ident}: {title}"
     if description:
         goal += f"\n\nIssue details / acceptance criteria:\n{description}"
     review_title = (f"Review the deliverable for {ident} against the issue's acceptance "
                     f"criteria; approve, or list the required changes.")
-    tasks = [(owner, title), ("editor", review_title)]
+
+    # Plan a tailored team for the issue (research/code/write/... as it needs) with the
+    # SAME dynamic planner /assign uses - not just one builder. Fall back to a single
+    # routed owner if planning fails. Either way, guarantee an editor review gates it.
+    await post_to_group(f"Planning the work for {ident}...", "manager")
+    plan = await _run_metered(main.plan_company_goal, goal, SPECIALIST_KEYS)
+    if plan:
+        tasks = list(plan)
+    else:
+        try:
+            responders = await asyncio.to_thread(main.select_group_responders, f"{title}\n\n{description}")
+        except Exception:
+            responders = ["code"]
+        owner = next((r for r in responders if r in main.SPECIALISTS), "code")
+        tasks = [(owner, title)]
+    if not any(o == "editor" for o, _ in tasks):
+        tasks.append(("editor", review_title))
 
     result = await asyncio.to_thread(
         company_mode.assign_goal,
