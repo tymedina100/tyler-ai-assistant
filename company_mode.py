@@ -476,19 +476,62 @@ def _stray_project_lines(state, exclude_id=None):
     return lines
 
 
+# How many revision rounds to allow before treating "still not approved" as blocked and
+# escalating to the user, so an unsatisfiable task can't loop forever (a real risk now
+# that metered spend per round is small).
+MAX_REVISION_ROUNDS = 2
+
+
+def classify_editor_verdict(editor_answer):
+    """Map the Managing Editor's reply to one of three outcomes:
+      - "approved": ship it.
+      - "blocked":  can't be finished by the team - it needs human/external input
+                    (access, credentials, a dashboard/runtime check, a decision). STOP
+                    and escalate rather than looping revisions.
+      - "revise":   the team can fix it themselves; run another revision round.
+    A missing/garbled verdict is "revise" (never a silent pass)."""
+    text = (editor_answer or "").strip().upper()
+    if text.startswith("APPROVED"):
+        return "approved"
+    if text.startswith("BLOCKED") or "NEEDS HUMAN REVIEW" in text or "NEEDS YOUR REVIEW" in text:
+        return "blocked"
+    return "revise"
+
+
 def set_project_revision_flag(project_id, editor_answer, path=COMPANY_STATE_FILE):
-    """Record whether the Managing Editor approved a project's deliverables. Looked
-    for explicitly (an "APPROVED" prefix) rather than assumed, so a missing or
-    garbled verdict is treated as NOT approved rather than silently passing. Keeps
-    her full feedback (unlike the 1000-char task result) so a revision round can
-    hand her exact required changes back to the agents who need to act on them."""
+    """Record the Managing Editor's verdict on a project's deliverables. Stores the
+    three-way verdict (see classify_editor_verdict), keeps needs_revision for the
+    'revise' case (the revision-round loop reads it), and keeps her full feedback
+    (unlike the 1000-char task result) so a revision round or an escalation can relay
+    her exact requirements."""
+    verdict = classify_editor_verdict(editor_answer)
     state = load_state(path)
-    approved = editor_answer.strip().upper().startswith("APPROVED")
     for project in state["projects"]:
         if project["id"] == project_id:
-            project["needs_revision"] = not approved
+            project["editor_verdict"] = verdict
+            project["needs_revision"] = (verdict == "revise")
             project["last_editor_feedback"] = editor_answer.strip()
             break
+    save_state(state, path)
+
+
+def block_project(project_id, path=COMPANY_STATE_FILE):
+    """Mark a project 'blocked' - production stopped, waiting on the user - without
+    marking it complete. Releases any budget still reserved for its open tasks."""
+    state = load_state(path)
+    project = next((p for p in state["projects"] if p["id"] == project_id), None)
+    if not project:
+        return
+    released = 0.0
+    for task in project_tasks(state, project_id):
+        if task["status"] in {"planned"} and task["reserved_usd"]:
+            released += task["reserved_usd"]
+            task["reserved_usd"] = 0.0
+            task["status"] = "blocked"
+    project["status"] = "blocked"
+    state["company"]["reserved_today_usd"] = _money(max(0.0, state["company"]["reserved_today_usd"] - released))
+    add_event(state, "project_blocked", f"Blocked (needs user review): {project['title']}",
+              project_id=project_id, amount_usd=released or None)
     save_state(state, path)
 
 

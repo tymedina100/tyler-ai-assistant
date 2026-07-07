@@ -153,11 +153,13 @@ def sync_task_status(task_id, status, previous_status, path=company_mode.COMPANY
 
 
 def finalize_source_issue(project_id, path=company_mode.COMPANY_STATE_FILE):
-    """Close out a /linear do project's source issue when the project finishes. If the
-    Managing Editor approved (project not flagged needs_revision), move the issue to
-    Done with a summary of the deliverables; if revisions are required, leave it In
-    Progress and comment the editor's required changes. Safe no-op when disabled or the
-    project has no source issue."""
+    """Close out a /linear do project's source issue when the project stops. Reads the
+    editor's verdict:
+      - approved -> move the issue to Done with a deliverables summary.
+      - blocked  -> comment that it needs the user's review + what's required; leave the
+                    issue NOT Done (it's escalated, not finished).
+      - revise   -> comment the editor's required changes; leave it In Progress.
+    Safe no-op when Linear is disabled or the project has no source issue."""
     if not is_enabled():
         return
 
@@ -169,15 +171,22 @@ def finalize_source_issue(project_id, path=company_mode.COMPANY_STATE_FILE):
     if not source or not source.get("id"):
         return
     issue_id = source["id"]
+    verdict = project.get("editor_verdict")
+    feedback = (project.get("last_editor_feedback") or "").strip()
 
-    artifacts = [a for t in company_mode.project_tasks(state, project_id) for a in t.get("artifacts", [])]
+    if verdict == "blocked" or project.get("status") == "blocked":
+        body = "⚠️ Paused for your review — the team can't finish this without your input."
+        if feedback:
+            body += f"\n\nWhat's needed:\n{feedback[:1500]}"
+        _safe(linear_helpers.add_comment, issue_id, body)
+        return  # NOT marked Done - it's escalated
 
-    if project.get("needs_revision"):
-        feedback = (project.get("last_editor_feedback") or "Revisions required.").strip()
+    if verdict == "revise" or project.get("needs_revision"):
         _safe(linear_helpers.add_comment, issue_id,
-              f"📝 Editor requires revisions before this ships:\n\n{feedback[:1500]}")
+              f"📝 Editor requires revisions before this ships:\n\n{feedback or 'Revisions required.'}"[:1600])
         return
 
+    artifacts = [a for t in company_mode.project_tasks(state, project_id) for a in t.get("artifacts", [])]
     parts = ["✅ Company project complete and approved by the editor."]
     if artifacts:
         parts.append("Deliverables:\n" + "\n".join(f"- {a}" for a in artifacts))

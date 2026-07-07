@@ -198,6 +198,12 @@ supervised Company Mode project:
 - The **source issue itself** is the tracker — no duplicate per-task issues. It moves to
   **In Progress** on `/approve` and to **Done** once the editor approves; if the editor
   requires changes, it stays In Progress and the required changes are posted as a comment.
+- **The editor can escalate instead of looping.** If a task can't be finished by the team
+  (it needs access/credentials/a dashboard-or-runtime check/a decision only you can make),
+  the Managing Editor returns **"BLOCKED — needs human review"**: production stops, the
+  issue is **not** marked Done, and the group posts exactly what you need to provide. Fix
+  it (or paste the info), then re-run `/linear do <ID>`. A hard cap of 2 revision rounds
+  also auto-escalates the same way, so an unsatisfiable task can't loop forever.
 - Same budget + `/approve` gate as any Company Mode project. `/cancel` before approving
   touches nothing.
 
