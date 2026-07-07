@@ -1681,6 +1681,126 @@ def handle_linear_command(rest):
             "create <title>, create-project-issue <key> <title>, from-sprint <key> <goal>.")
 
 
+TODAY_PROJECT_PRIORITY = [
+    ("card-tracker", "Card Tracker", ("card tracker", "card-tracker", "cardtracker", "cards")),
+    ("worthlane", "Worthlane", ("worthlane", "vantage")),
+    ("assistant", "Tyler AI Assistant", ("tyler ai assistant", "ai assistant", "assistant")),
+    ("career-ops", "Career Ops", ("career ops", "career", "job search", "resume")),
+    ("virtual-office", "Virtual Office", ("virtual office", "office")),
+]
+TODAY_DONE_STATE_TYPES = {"completed", "canceled"}
+TODAY_DONE_STATE_NAMES = {"done", "completed", "canceled", "cancelled", "closed"}
+
+
+def _today_labels(issue):
+    return [n.get("name", "") for n in (issue.get("labels") or {}).get("nodes", [])]
+
+
+def _today_text_blob(issue):
+    parts = [issue.get("title", "")]
+    project = issue.get("project") or {}
+    parts.append(project.get("name", ""))
+    parts.extend(_today_labels(issue))
+    return " ".join(parts).lower()
+
+
+def _today_project(issue):
+    blob = _today_text_blob(issue)
+    for index, (_key, name, aliases) in enumerate(TODAY_PROJECT_PRIORITY):
+        if any(alias in blob for alias in aliases):
+            return index, name
+    return len(TODAY_PROJECT_PRIORITY), "Other"
+
+
+def _today_is_open(issue):
+    state = issue.get("state") or {}
+    state_type = (state.get("type") or "").lower()
+    state_name = (state.get("name") or "").lower()
+    return state_type not in TODAY_DONE_STATE_TYPES and state_name not in TODAY_DONE_STATE_NAMES
+
+
+def _today_due_rank(issue, today=None):
+    due = issue.get("dueDate")
+    if not due:
+        return 2, None
+    try:
+        due_date = datetime.fromisoformat(due[:10]).date()
+    except ValueError:
+        return 2, due
+    today = today or _now_local().date()
+    if due_date < today:
+        return 0, due_date
+    if due_date == today:
+        return 1, due_date
+    return 3, due_date
+
+
+def _today_has_mvp_label(issue):
+    return any("mvp" in label.lower() for label in _today_labels(issue))
+
+
+def _today_sort_key(issue):
+    project_index, _project_name = _today_project(issue)
+    due_rank, due_date = _today_due_rank(issue)
+    mvp_rank = 0 if _today_has_mvp_label(issue) else 1
+    priority = issue.get("priority") or 0
+    due_value = due_date.isoformat() if hasattr(due_date, "isoformat") else "9999-12-31"
+    return (project_index, due_rank, mvp_rank, -priority, due_value, issue.get("updatedAt") or "")
+
+
+def _today_due_note(issue):
+    due_rank, due_date = _today_due_rank(issue)
+    if due_date is None:
+        return "no due date"
+    if due_rank == 0:
+        return f"overdue {due_date.isoformat()}"
+    if due_rank == 1:
+        return "due today"
+    return f"due {due_date.isoformat()}"
+
+
+def _today_issue_line(issue):
+    _index, project_name = _today_project(issue)
+    labels = ["MVP"] if _today_has_mvp_label(issue) else []
+    priority = issue.get("priorityLabel") or ""
+    if priority:
+        labels.append(priority)
+    meta = ", ".join([project_name, _today_due_note(issue)] + labels)
+    ident = issue.get("identifier", "?")
+    title = issue.get("title", "(untitled)")
+    url = issue.get("url", "")
+    return f"[{ident}] {title} — {meta}\n{url}".rstrip()
+
+
+def handle_today_command():
+    """Return the /today command center: one first action, plus at most one backup.
+
+    Built on linear_helpers.list_command_center_issues(). This is intentionally not a
+    planner. It picks from Linear and tells Tyler where to start. Novel idea: fewer
+    bullets.
+    """
+    issues, err = linear_helpers.list_command_center_issues()
+    if err:
+        return err
+
+    candidates = [issue for issue in (issues or []) if _today_is_open(issue)]
+    candidates.sort(key=_today_sort_key)
+    picks = candidates[:2]
+    if not picks:
+        return "Today\nCurrent main project: none found in open Linear issues.\nFIRST: pick one Card Tracker task and create/update its Linear issue."
+
+    _project_index, current_project = _today_project(picks[0])
+    lines = [
+        "Today",
+        f"Current main project: {current_project}",
+        f"FIRST: {_today_issue_line(picks[0])}",
+    ]
+    if len(picks) > 1:
+        lines.append(f"SECOND (only if the first is blocked): {_today_issue_line(picks[1])}")
+    lines.append("Stop after that. This is /today, not a tax audit.")
+    return "\n\n".join(lines)
+
+
 def execute_tool(name, arguments):
     print(f"\n[tool] {name}({arguments})")
     logger.info(f"Tool call: {name}({redact_tool_arguments(arguments)})")
