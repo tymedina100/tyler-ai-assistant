@@ -139,6 +139,40 @@ These generate structured plans; they don't create anything by themselves.
 /code propose a PR for the API/model changes only
 ```
 
+## 6b. Company Mode + Linear (the tracker for the autonomous company)
+
+Company Mode is the autonomous engine: `/assign <goal>` plans a project + tasks and
+reserves budget, `/approve` runs it (research → build → write → editor review),
+metering spend as it goes. When `LINEAR_API_KEY` is set, **Company Mode mirrors that
+work into Linear automatically** so Linear is your live board for the company:
+
+- **At `/approve`** (not `/assign` — a proposal you can still `/cancel` never touches
+  Linear), each task becomes its own Linear issue. The group posts the created issue
+  list with links.
+- **As the engine works** each task, its issue follows along:
+  `Todo → In Progress → Done`, and the agent's result + any PR/file deliverables are
+  posted as a comment on the issue when the task finishes. Blocked tasks get a
+  `⛔ Blocked: …` comment.
+- **Revision rounds** (when the Managing Editor requires changes) create issues for
+  the new tasks too.
+- `/status` shows each open task's Linear id (e.g. `[VAN-53]`).
+
+Configuration: it reuses `LINEAR_API_KEY` + `LINEAR_TEAM_ID` (the same ones the
+`/linear` commands use). If a project is active (`/project use …`), issues are tagged
+to that project/repo; otherwise they're tagged to the company project in the
+description. No Linear config → Company Mode runs exactly as before (no mirror, no
+errors). Nothing here changes the budget/approval gates — it only reflects the work
+onto the board.
+
+Typical flow:
+
+```
+/setbudget 20
+/assign launch a beta watchlist for card flippers
+/approve            # creates the Linear issues, starts the work
+/status             # see progress + Linear ids
+```
+
 ## 7. Telegram: optional Linear bot
 
 The group interface (`group_bot.py`) can run a dedicated **Linear** bot. Set
@@ -153,5 +187,8 @@ specialist is reachable through Miles's delegation.
   to `main`.
 - Linear issues are created only on explicit command/intent; batch creation asks
   first; no delete command is exposed.
+- Company Mode's Linear mirror is triggered by `/approve` (an explicit action);
+  `/assign` proposals and `/cancel` never write to Linear. A tracker error is
+  swallowed and logged — it can never stop or corrupt the company engine.
 - Missing Linear or GitHub config produces a friendly "not configured" message,
   never a crash.

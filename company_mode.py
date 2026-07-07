@@ -55,6 +55,29 @@ COMPANY_COMMANDS = {
 }
 
 
+# Optional sync hooks so a project tracker (Linear) can mirror company work without
+# coupling this pure state module to the network. The runtime (group_bot via
+# company_linear.register) sets these; when None they're no-ops, so company_mode
+# stays fully offline-testable. Mirrors the existing main.on_delegation pattern.
+#   on_project_activated(project_id)              - a project became active (approve or
+#                                                   a new revision round): mirror its
+#                                                   not-yet-mirrored tasks as issues.
+#   on_task_status_change(task_id, status, prev)  - a task changed status: sync the
+#                                                   mirrored issue's state / comment.
+on_project_activated = None
+on_task_status_change = None
+
+
+def _fire(hook, *args):
+    """Call a sync hook if set, never letting a hook error break a state operation."""
+    if hook is None:
+        return
+    try:
+        hook(*args)
+    except Exception:  # noqa: BLE001 - a tracker glitch must not corrupt company state
+        pass
+
+
 def _now():
     return datetime.now().replace(microsecond=0)
 
@@ -209,6 +232,11 @@ def _new_task(project_id, owner, delivery, title, estimate=DEFAULT_TASK_ESTIMATE
         "result": "",
         "artifacts": [],
         "notes": [],
+        # Linear mirror (populated by the company_linear bridge once the project is
+        # approved). Empty when Linear isn't configured or the task isn't mirrored yet.
+        "linear_issue_id": "",
+        "linear_identifier": "",
+        "linear_url": "",
     }
 
 
@@ -298,8 +326,23 @@ def update_task_status(task_id, status, result="", artifacts=None, spent_usd=Non
                 task["reserved_usd"] = 0.0
             add_event(state, "task_updated", f"{task_id} moved to {status}.", task_id=task_id, amount_usd=task["spent_usd"])
             save_state(state, path)
+            _fire(on_task_status_change, task_id, status, previous_status)
             return f"{task_id} updated to {status}."
     return f"Task not found: {task_id}"
+
+
+def set_task_linear(task_id, issue_id, identifier, url, path=COMPANY_STATE_FILE):
+    """Persist a mirrored Linear issue's ids onto a task. Used by the company_linear
+    bridge after it creates the issue. Does NOT fire hooks (avoids re-entrancy)."""
+    state = load_state(path)
+    for task in state["tasks"]:
+        if task["id"] == task_id:
+            task["linear_issue_id"] = issue_id or ""
+            task["linear_identifier"] = identifier or ""
+            task["linear_url"] = url or ""
+            save_state(state, path)
+            return True
+    return False
 
 
 def mark_task_blocked(task_id, reason, spent_usd=None, artifacts=None, path=COMPANY_STATE_FILE):
@@ -336,6 +379,8 @@ def approve_project(path=COMPANY_STATE_FILE):
     project["status"] = "active"
     add_event(state, "project_approved", f"Approved project: {project['title']}", project_id=project["id"])
     save_state(state, path)
+    # Now the project is really running: mirror its tasks into the tracker (Linear).
+    _fire(on_project_activated, project["id"])
     return f"Approved: {project['title']}. Starting the work plan now.", project["id"]
 
 
@@ -456,6 +501,8 @@ def start_revision_round(project_id, configured_agent_keys, path=COMPANY_STATE_F
     add_event(state, "revision_round_started", f"Started revision round {round_number} for {project['title']}",
               project_id=project_id, amount_usd=total_estimate)
     save_state(state, path)
+    # Mirror the freshly queued revision tasks into the tracker too (idempotent).
+    _fire(on_project_activated, project_id)
     return True, f"Editor requires revisions - starting round {round_number} (${total_estimate:.2f} reserved)."
 
 
@@ -780,7 +827,8 @@ def render_company_status(path=COMPANY_STATE_FILE):
     lines.append(f"Open tasks: {len(open_tasks)}/{len(tasks)}")
     for task in open_tasks[:6]:
         suffix = " via Miles" if task["delivery"] == "via_miles" else ""
-        lines.append(f"- {task['id']} [{task['status']}] {task['owner']}{suffix}: {task['title']} (${task['estimate_usd']:.2f})")
+        linear = f" [{task['linear_identifier']}]" if task.get("linear_identifier") else ""
+        lines.append(f"- {task['id']} [{task['status']}] {task['owner']}{suffix}: {task['title']} (${task['estimate_usd']:.2f}){linear}")
 
     artifacts = [a for task in tasks for a in task.get("artifacts", [])]
     if artifacts:
