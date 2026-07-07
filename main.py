@@ -2767,6 +2767,10 @@ def handle_command(user_prompt):
         ask_specialist("task", request)
         return True
 
+    if command == "/today":
+        print(handle_today_command())
+        return True
+
     if command == "/project" or command.startswith("/project "):
         print(handle_project_command(user_prompt[len("/project"):]))
         return True
