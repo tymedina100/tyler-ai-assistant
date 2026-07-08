@@ -70,6 +70,19 @@ class RailwayHelpersTests(unittest.TestCase):
         self.assertIn("variableUpsert", sent["query"])
         self.assertEqual(sent["variables"]["input"]["name"], "EXPO_PUBLIC_PLAID_ENABLED")
         self.assertEqual(sent["variables"]["input"]["value"], "false")
+        self.assertEqual(sent["variables"]["input"]["serviceId"], "s1")  # service-scoped
+
+    def test_set_variable_shared_omits_service_id(self):
+        payload = {"data": {"variableUpsert": True}}
+        mock_post = MagicMock(return_value=FakeResp(200, payload))
+        with patch.dict(os.environ, {"RAILWAY_TOKEN": "tok"}, clear=True), \
+                patch.object(railway_helpers.requests, "post", mock_post):
+            ok, err = railway_helpers.set_variable("p1", "e1", None, "SHARED_VAR", "v")
+        self.assertIsNone(err)
+        self.assertTrue(ok)
+        sent = mock_post.call_args.kwargs["json"]["variables"]["input"]
+        self.assertNotIn("serviceId", sent)  # shared (environment-level) scope
+        self.assertEqual(sent["environmentId"], "e1")
 
     def test_graphql_error_reported(self):
         with patch.dict(os.environ, {"RAILWAY_TOKEN": "tok"}, clear=True), \

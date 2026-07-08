@@ -179,16 +179,21 @@ def latest_deployment(project_id, environment_id, service_id):
 # --------------------------------------------------------------------------- #
 
 def set_variable(project_id, environment_id, service_id, name, value):
-    """Upsert a Railway variable. Returns (True, None) or (None, error)."""
+    """Upsert a Railway variable. Pass a falsy service_id to set an environment-level
+    SHARED variable (serviceId is omitted so Railway scopes it to the environment); pass
+    a service_id to scope it to that one service. Returns (True, None) or (None, error)."""
+    variable_input = {
+        "projectId": project_id, "environmentId": environment_id,
+        "name": name, "value": value,
+    }
+    if service_id:
+        variable_input["serviceId"] = service_id
     mutation = """
     mutation Upsert($input: VariableUpsertInput!) {
       variableUpsert(input: $input)
     }
     """
-    data, err = _graphql(mutation, {"input": {
-        "projectId": project_id, "environmentId": environment_id,
-        "serviceId": service_id, "name": name, "value": value,
-    }})
+    data, err = _graphql(mutation, {"input": variable_input})
     if err:
         return None, err
     return bool(data.get("variableUpsert", True)), None

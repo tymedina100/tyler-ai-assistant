@@ -469,8 +469,8 @@ TOOLS = [
      "description": "Get the latest Railway deployment's status and URL for a service/environment. Safe read-only.",
      "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}, "environment_id": {"type": "string"}, "service_id": {"type": "string"}}, "required": ["project_id", "environment_id", "service_id"]}},
     {"type": "function", "name": "railway_set_var", "strict": False,
-     "description": "Set (upsert) a Railway environment variable. Changes live infrastructure, so it requires the user's /confirm before applying.",
-     "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}, "environment_id": {"type": "string"}, "service_id": {"type": "string"}, "name": {"type": "string"}, "value": {"type": "string"}}, "required": ["project_id", "environment_id", "service_id", "name", "value"]}},
+     "description": "Set (upsert) a Railway environment variable. Omit service_id to set an environment-level SHARED variable; include it to scope the variable to one service. Changes live infrastructure, so it requires the user's /confirm before applying.",
+     "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}, "environment_id": {"type": "string"}, "service_id": {"type": "string"}, "name": {"type": "string"}, "value": {"type": "string"}}, "required": ["project_id", "environment_id", "name", "value"]}},
     {"type": "function", "name": "railway_redeploy", "strict": False,
      "description": "Trigger a redeploy of a Railway service in an environment. Changes live infrastructure, so it requires the user's /confirm before applying.",
      "parameters": {"type": "object", "properties": {"service_id": {"type": "string"}, "environment_id": {"type": "string"}}, "required": ["service_id", "environment_id"]}},
@@ -1443,7 +1443,7 @@ def confirm_pending_action(pending):
     if pending["type"] == "railway_set_var":
         ok, err = railway_helpers.set_variable(
             pending["project_id"], pending["environment_id"],
-            pending["service_id"], pending["name"], pending["value"])
+            pending.get("service_id"), pending["name"], pending["value"])
         return err if err else f"Set Railway variable {pending['name']}."
     if pending["type"] == "railway_redeploy":
         ok, err = railway_helpers.redeploy(pending["service_id"], pending["environment_id"])
@@ -1931,8 +1931,12 @@ def handle_today_command():
 
 
 def execute_tool(name, arguments):
-    print(f"\n[tool] {name}({arguments})")
-    logger.info(f"Tool call: {name}({redact_tool_arguments(arguments)})")
+    # Redact once and use for BOTH sinks: the stdout print goes to the container/deploy
+    # logs, so raw sensitive args (a Railway secret value, email body, file content)
+    # must never be printed there either - not just kept out of assistant.log.
+    safe_arguments = redact_tool_arguments(arguments)
+    print(f"\n[tool] {name}({safe_arguments})")
+    logger.info(f"Tool call: {name}({safe_arguments})")
 
     try:
         if name == "read_file":
@@ -2078,21 +2082,22 @@ def execute_tool(name, arguments):
                     "type": "railway_set_var",
                     "project_id": arguments["project_id"],
                     "environment_id": arguments["environment_id"],
-                    "service_id": arguments["service_id"],
+                    "service_id": arguments.get("service_id"),  # None -> shared variable
                     "name": arguments["name"],
                     "value": arguments["value"],
                     "company_context": sink.get("context", "") if sink else "",
                 })
                 logger.info(f"Staged Railway set var {arguments['name']}, awaiting confirmation")
-                return (f"Setting Railway variable {arguments['name']} is staged and waiting for "
-                        f"your confirmation - this changes LIVE infrastructure. Reply /confirm to "
+                scope = "service" if arguments.get("service_id") else "shared (environment-level)"
+                return (f"Setting Railway {scope} variable {arguments['name']} is staged and waiting "
+                        f"for your confirmation - this changes LIVE infrastructure. Reply /confirm to "
                         f"apply it, or anything else to cancel.")
             answer = input(f"The AI wants to set Railway variable {arguments['name']} (live). Allow? (y/n): ")
             if answer.strip().lower() != "y":
                 return "The user declined the Railway variable change."
             ok, err = railway_helpers.set_variable(
                 arguments["project_id"], arguments["environment_id"],
-                arguments["service_id"], arguments["name"], arguments["value"])
+                arguments.get("service_id"), arguments["name"], arguments["value"])
             return err if err else f"Set Railway variable {arguments['name']}."
 
         if name == "railway_redeploy":
