@@ -236,6 +236,27 @@ Example — the full loop, live:
 /confirm                   # goes live on the real domain
 ```
 
+## 6d. Railway infrastructure (`railway_*`)
+
+Patch can inspect (and, with `/confirm`, change) the backend on Railway — so a
+"verify the Railway release config" task is actually verifiable instead of blocked.
+
+Setup: create a Railway account token (**Account Settings → Tokens**) and set
+`RAILWAY_TOKEN`.
+
+Reads (safe): `railway_list_projects` → `railway_get_project` (gives service +
+environment ids) → `railway_list_vars` (variable **names only**), `railway_get_var`
+(one value — for checking a specific var like `EXPO_PUBLIC_API_URL`),
+`railway_deploy_status`.
+
+Writes (gated behind `/confirm`, like production deploys): `railway_set_var` (upsert a
+variable) and `railway_redeploy` (restart a service). During a Company Mode run these
+block the task until you `/confirm`.
+
+> **Secrets:** Railway variables can hold secrets. `railway_list_vars` never returns
+> values; `railway_get_var` returns one value on purpose (so Patch can check a specific
+> non-secret var) — the value goes to the model, and it's redacted in the logs.
+
 ## 7. Telegram: optional Linear bot
 
 The group interface (`group_bot.py`) can run a dedicated **Linear** bot. Set

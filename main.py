@@ -23,6 +23,7 @@ import github_helpers
 import google_helpers
 import linear_helpers
 import projects
+import railway_helpers
 
 
 # Windows consoles default to a limited encoding (cp1252) that can't print
@@ -452,6 +453,27 @@ TOOLS = [
     {"type": "function", "name": "check_deploy", "strict": False,
      "description": "Check the build/ready status of a Vercel deployment by its id. Safe read-only action.",
      "parameters": {"type": "object", "properties": {"deployment_id": {"type": "string"}}, "required": ["deployment_id"]}},
+    {"type": "function", "name": "railway_list_projects", "strict": False,
+     "description": "List the Railway projects (name + id). Safe read-only. Start here to get the project id for the other Railway tools.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "railway_get_project", "strict": False,
+     "description": "Get a Railway project's services and environments (with their ids), by project id. Safe read-only. You need a service id + environment id for variables/deploys.",
+     "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
+    {"type": "function", "name": "railway_list_vars", "strict": False,
+     "description": "List the NAMES of a Railway service's environment variables (values hidden - use railway_get_var for one specific value). Safe read-only. Needs project_id + environment_id, optional service_id.",
+     "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}, "environment_id": {"type": "string"}, "service_id": {"type": "string"}}, "required": ["project_id", "environment_id"]}},
+    {"type": "function", "name": "railway_get_var", "strict": False,
+     "description": "Read ONE Railway variable's value by name (e.g. to verify EXPO_PUBLIC_API_URL isn't localhost). Only call it for a specific var you need - it returns the real value, which may be a secret.",
+     "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}, "environment_id": {"type": "string"}, "name": {"type": "string"}, "service_id": {"type": "string"}}, "required": ["project_id", "environment_id", "name"]}},
+    {"type": "function", "name": "railway_deploy_status", "strict": False,
+     "description": "Get the latest Railway deployment's status and URL for a service/environment. Safe read-only.",
+     "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}, "environment_id": {"type": "string"}, "service_id": {"type": "string"}}, "required": ["project_id", "environment_id", "service_id"]}},
+    {"type": "function", "name": "railway_set_var", "strict": False,
+     "description": "Set (upsert) a Railway environment variable. Omit service_id to set an environment-level SHARED variable; include it to scope the variable to one service. Changes live infrastructure, so it requires the user's /confirm before applying.",
+     "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}, "environment_id": {"type": "string"}, "service_id": {"type": "string"}, "name": {"type": "string"}, "value": {"type": "string"}}, "required": ["project_id", "environment_id", "name", "value"]}},
+    {"type": "function", "name": "railway_redeploy", "strict": False,
+     "description": "Trigger a redeploy of a Railway service in an environment. Changes live infrastructure, so it requires the user's /confirm before applying.",
+     "parameters": {"type": "object", "properties": {"service_id": {"type": "string"}, "environment_id": {"type": "string"}}, "required": ["service_id", "environment_id"]}},
 ]
 
 DELEGATION_TOOLS = [
@@ -1418,6 +1440,14 @@ def confirm_pending_action(pending):
     if pending["type"] == "deploy":
         result, err = deploy_helpers.deploy(pending["project"], pending.get("ref", "main"), "production")
         return err if err else format_deploy_result(result)
+    if pending["type"] == "railway_set_var":
+        ok, err = railway_helpers.set_variable(
+            pending["project_id"], pending["environment_id"],
+            pending.get("service_id"), pending["name"], pending["value"])
+        return err if err else f"Set Railway variable {pending['name']}."
+    if pending["type"] == "railway_redeploy":
+        ok, err = railway_helpers.redeploy(pending["service_id"], pending["environment_id"])
+        return err if err else "Triggered a Railway redeploy."
     return "Nothing to confirm."
 
 
@@ -1439,6 +1469,13 @@ def describe_pending_action(pending):
     if pending["type"] == "deploy":
         description = f"production deploy of {pending.get('project', '?')} @ {pending.get('ref', 'main')}"
         return f"{description} ({context})" if context else description
+    if pending["type"] == "railway_set_var":
+        # Name only - the value may be a secret, so it's never echoed here.
+        description = f"setting Railway variable {pending.get('name', '?')}"
+        return f"{description} ({context})" if context else description
+    if pending["type"] == "railway_redeploy":
+        description = "a Railway redeploy"
+        return f"{description} ({context})" if context else description
     return "the staged action"
 
 
@@ -1449,6 +1486,7 @@ SENSITIVE_TOOL_ARGUMENT_KEYS = {
     "new_snippet",
     "old_snippet",
     "subject",
+    "value",  # railway_set_var - a variable value may be a secret
 }
 
 
@@ -1535,6 +1573,25 @@ def format_deploy_projects(projects_list):
         link = p.get("link") or {}
         repo = link.get("repo", "not git-linked")
         lines.append(f"- {p.get('name', '?')} ({repo})")
+    return "\n".join(lines)
+
+
+def format_railway_projects(projects_list):
+    if not projects_list:
+        return "No Railway projects found."
+    lines = ["Railway projects:"]
+    for p in projects_list:
+        lines.append(f"- {p.get('name', '?')} (id {p.get('id', '')})")
+    return "\n".join(lines)
+
+
+def format_railway_project(project):
+    lines = [f"Railway project: {project.get('name', '?')} (id {project.get('id', '')})", "Services:"]
+    for s in project.get("services", []):
+        lines.append(f"- {s.get('name', '?')} (id {s.get('id', '')})")
+    lines.append("Environments:")
+    for e in project.get("environments", []):
+        lines.append(f"- {e.get('name', '?')} (id {e.get('id', '')})")
     return "\n".join(lines)
 
 
@@ -1874,8 +1931,12 @@ def handle_today_command():
 
 
 def execute_tool(name, arguments):
-    print(f"\n[tool] {name}({arguments})")
-    logger.info(f"Tool call: {name}({redact_tool_arguments(arguments)})")
+    # Redact once and use for BOTH sinks: the stdout print goes to the container/deploy
+    # logs, so raw sensitive args (a Railway secret value, email body, file content)
+    # must never be printed there either - not just kept out of assistant.log.
+    safe_arguments = redact_tool_arguments(arguments)
+    print(f"\n[tool] {name}({safe_arguments})")
+    logger.info(f"Tool call: {name}({safe_arguments})")
 
     try:
         if name == "read_file":
@@ -1979,6 +2040,86 @@ def execute_tool(name, arguments):
                 return err
             _record_artifact(f"deploy: {result.get('url', '')}")
             return format_deploy_result(result)
+
+        if name == "railway_list_projects":
+            projects_list, err = railway_helpers.list_projects()
+            return err if err else format_railway_projects(projects_list)
+
+        if name == "railway_get_project":
+            project, err = railway_helpers.get_project(arguments["project_id"])
+            return err if err else format_railway_project(project)
+
+        if name == "railway_list_vars":
+            names, err = railway_helpers.list_variables(
+                arguments["project_id"], arguments["environment_id"], arguments.get("service_id"))
+            if err:
+                return err
+            if not names:
+                return "No variables found (values are hidden - use railway_get_var for one)."
+            return "Variable names (values hidden):\n" + "\n".join(f"- {n}" for n in names)
+
+        if name == "railway_get_var":
+            value, err = railway_helpers.get_variable(
+                arguments["project_id"], arguments["environment_id"],
+                arguments["name"], arguments.get("service_id"))
+            return err if err else f"{arguments['name']} = {value}"
+
+        if name == "railway_deploy_status":
+            status, err = railway_helpers.latest_deployment(
+                arguments["project_id"], arguments["environment_id"], arguments["service_id"])
+            if err:
+                return err
+            return (f"Latest deployment {status.get('id', '')}: {status.get('status', '?')}\n"
+                    f"{status.get('url', '')}").rstrip()
+
+        if name == "railway_set_var":
+            # Changes live infra -> gated exactly like send_email / production deploy.
+            if CONFIRMATION_MODE == "disabled":
+                return "Changing Railway variables is disabled in this interface."
+            if CONFIRMATION_MODE == "requires_confirmation":
+                sink = current_execution_sink()
+                set_pending_action({
+                    "type": "railway_set_var",
+                    "project_id": arguments["project_id"],
+                    "environment_id": arguments["environment_id"],
+                    "service_id": arguments.get("service_id"),  # None -> shared variable
+                    "name": arguments["name"],
+                    "value": arguments["value"],
+                    "company_context": sink.get("context", "") if sink else "",
+                })
+                logger.info(f"Staged Railway set var {arguments['name']}, awaiting confirmation")
+                scope = "service" if arguments.get("service_id") else "shared (environment-level)"
+                return (f"Setting Railway {scope} variable {arguments['name']} is staged and waiting "
+                        f"for your confirmation - this changes LIVE infrastructure. Reply /confirm to "
+                        f"apply it, or anything else to cancel.")
+            answer = input(f"The AI wants to set Railway variable {arguments['name']} (live). Allow? (y/n): ")
+            if answer.strip().lower() != "y":
+                return "The user declined the Railway variable change."
+            ok, err = railway_helpers.set_variable(
+                arguments["project_id"], arguments["environment_id"],
+                arguments.get("service_id"), arguments["name"], arguments["value"])
+            return err if err else f"Set Railway variable {arguments['name']}."
+
+        if name == "railway_redeploy":
+            if CONFIRMATION_MODE == "disabled":
+                return "Triggering a Railway redeploy is disabled in this interface."
+            if CONFIRMATION_MODE == "requires_confirmation":
+                sink = current_execution_sink()
+                set_pending_action({
+                    "type": "railway_redeploy",
+                    "service_id": arguments["service_id"],
+                    "environment_id": arguments["environment_id"],
+                    "company_context": sink.get("context", "") if sink else "",
+                })
+                logger.info("Staged Railway redeploy, awaiting confirmation")
+                return ("A Railway redeploy is staged and waiting for your confirmation - this "
+                        "restarts LIVE infrastructure. Reply /confirm to trigger it, or anything "
+                        "else to cancel.")
+            answer = input("The AI wants to trigger a Railway redeploy (live). Allow? (y/n): ")
+            if answer.strip().lower() != "y":
+                return "The user declined the Railway redeploy."
+            ok, err = railway_helpers.redeploy(arguments["service_id"], arguments["environment_id"])
+            return err if err else "Triggered a Railway redeploy."
 
         if name == "run_python":
             return run_python(arguments["code"])
@@ -2292,7 +2433,9 @@ SPECIALISTS = {
                        "github_list_files", "github_read_file", "github_save_file", "github_delete_file",
                        "code_list_files", "code_read_file", "code_propose_change", "code_edit_file",
                        "linear_get_issue", "linear_search_issues", "linear_list_issues",
-                       "list_deploy_projects", "deploy_site", "check_deploy"],
+                       "list_deploy_projects", "deploy_site", "check_deploy",
+                       "railway_list_projects", "railway_get_project", "railway_list_vars",
+                       "railway_get_var", "railway_deploy_status", "railway_set_var", "railway_redeploy"],
         "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
@@ -2341,6 +2484,15 @@ To put a site live, use deploy_site (Vercel). Use list_deploy_projects to find t
 project name first. A "preview" deploy is a throwaway URL and runs immediately - use it
 freely to show work. A "production" deploy touches the live domain and will ask the user
 to /confirm, so only request it when the change is truly ready to go live.
+
+To inspect or change the backend infrastructure, use the Railway tools. Discover ids
+first: railway_list_projects -> railway_get_project (gives service + environment ids) ->
+railway_list_vars (variable NAMES only) / railway_get_var (one value - only for a
+specific var you must check, since values can be secrets) / railway_deploy_status. Never
+dump every variable value. railway_set_var and railway_redeploy change LIVE infra and
+will ask the user to /confirm - only propose them when clearly needed. When a task asks
+you to verify Railway env/deploy config, actually read it with these tools instead of
+saying you lack access.
 """,
         "persona": """
 You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior

@@ -383,6 +383,83 @@ class HardeningTests(unittest.TestCase):
         )
         self.assertIn("production deploy of landing", desc)
 
+    # --- Railway writes are gated; reads are not ---
+
+    def test_railway_set_var_stages_for_confirm(self):
+        previous_mode = self.main.CONFIRMATION_MODE
+        self.main.CONFIRMATION_MODE = "requires_confirmation"
+        self.main.set_conversation("test:railwaysetvar")
+        try:
+            result = self.main.execute_tool("railway_set_var", {
+                "project_id": "p1", "environment_id": "e1", "service_id": "s1",
+                "name": "EXPO_PUBLIC_PLAID_ENABLED", "value": "false",
+            })
+            self.assertIn("staged", result.lower())
+            pending = self.main.get_pending_action()
+            self.assertEqual(pending["type"], "railway_set_var")
+            self.assertEqual(pending["name"], "EXPO_PUBLIC_PLAID_ENABLED")
+        finally:
+            self.main.clear_pending_action()
+            self.main.CONFIRMATION_MODE = previous_mode
+
+    def test_railway_redeploy_stages_for_confirm(self):
+        previous_mode = self.main.CONFIRMATION_MODE
+        self.main.CONFIRMATION_MODE = "requires_confirmation"
+        self.main.set_conversation("test:railwayredeploy")
+        try:
+            result = self.main.execute_tool(
+                "railway_redeploy", {"service_id": "s1", "environment_id": "e1"})
+            self.assertIn("staged", result.lower())
+            self.assertEqual(self.main.get_pending_action()["type"], "railway_redeploy")
+        finally:
+            self.main.clear_pending_action()
+            self.main.CONFIRMATION_MODE = previous_mode
+
+    def test_railway_set_var_value_is_redacted_in_logs(self):
+        redacted = self.main.redact_tool_arguments(
+            {"name": "SECRET_KEY", "value": "s3cr3t-value"})
+        self.assertEqual(redacted["name"], "SECRET_KEY")
+        self.assertNotIn("s3cr3t-value", redacted["value"])
+
+    def test_describe_pending_action_railway_hides_value(self):
+        desc = self.main.describe_pending_action(
+            {"type": "railway_set_var", "name": "SECRET_KEY", "value": "s3cr3t"})
+        self.assertIn("SECRET_KEY", desc)
+        self.assertNotIn("s3cr3t", desc)  # the value is never echoed
+
+    def test_execute_tool_redacts_secret_from_stdout(self):
+        # The stdout print goes to container/deploy logs, so a secret value must not
+        # appear there either. Stage a railway_set_var (no network) and check the print.
+        previous_mode = self.main.CONFIRMATION_MODE
+        self.main.CONFIRMATION_MODE = "requires_confirmation"
+        self.main.set_conversation("test:stdoutleak")
+        with patch("builtins.print") as mocked_print:
+            try:
+                self.main.execute_tool("railway_set_var", {
+                    "project_id": "p1", "environment_id": "e1",
+                    "name": "SECRET_KEY", "value": "top-secret-value",
+                })
+            finally:
+                self.main.clear_pending_action()
+                self.main.CONFIRMATION_MODE = previous_mode
+        printed = " ".join(str(c.args[0]) for c in mocked_print.call_args_list if c.args)
+        self.assertNotIn("top-secret-value", printed)
+
+    def test_railway_set_var_shared_scope_stages_with_none_service(self):
+        previous_mode = self.main.CONFIRMATION_MODE
+        self.main.CONFIRMATION_MODE = "requires_confirmation"
+        self.main.set_conversation("test:railwayshared")
+        try:
+            result = self.main.execute_tool("railway_set_var", {
+                "project_id": "p1", "environment_id": "e1",
+                "name": "SHARED_FLAG", "value": "on",  # no service_id -> shared
+            })
+            self.assertIn("staged", result.lower())
+            self.assertIsNone(self.main.get_pending_action()["service_id"])
+        finally:
+            self.main.clear_pending_action()
+            self.main.CONFIRMATION_MODE = previous_mode
+
 
 if __name__ == "__main__":
     unittest.main()
