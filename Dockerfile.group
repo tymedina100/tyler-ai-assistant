@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py group_bot.py company_mode.py company_linear.py google_helpers.py github_helpers.py gumroad_helpers.py linear_helpers.py deploy_helpers.py railway_helpers.py projects.py ./
+COPY main.py group_bot.py office_api.py office_state.py company_mode.py company_linear.py google_helpers.py github_helpers.py gumroad_helpers.py linear_helpers.py deploy_helpers.py railway_helpers.py projects.py ./
 COPY projects.json ./
 COPY files/ ./files/
 COPY assets/ ./assets/
@@ -27,7 +27,8 @@ COPY scripts/ ./scripts/
 # restart/redeploy - so mount ONE persistent volume and point DATA_DIR at it:
 #   - attach a volume with mount path /app/data
 #   - set env var DATA_DIR=/app/data
-# The app then writes memory_db/, reminders.json, company_state.json, and token.json
+# The app then writes memory_db/, reminders.json, company_state.json, office_state.json,
+# and token.json
 # under that volume, and they survive redeploys. Without DATA_DIR everything defaults
 # to /app (ephemeral). See README "Deploying it" for the exact Railway steps.
 
