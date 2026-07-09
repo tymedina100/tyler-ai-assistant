@@ -1,8 +1,8 @@
-"""Small, file-backed state store for the local virtual office dashboard.
+"""Small, file-backed state store for the Railway-backed Virtual Office desktop app.
 
-The Telegram worker is the only writer and the local HTTP server is a reader in a
-separate process. Writes use ``os.replace`` so readers see either the old complete
-JSON document or the new one, never a partial file.
+The Telegram worker writes state while its authenticated API reads it. Writes use
+``os.replace`` so readers see either the old complete JSON document or the new one,
+never a partial file.
 """
 import copy
 import json

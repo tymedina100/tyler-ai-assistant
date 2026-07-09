@@ -45,6 +45,7 @@ import company_mode
 import company_linear
 import gumroad_helpers
 import linear_helpers
+import office_api
 import office_state
 
 
@@ -171,6 +172,7 @@ main_loop = None
 # The single in-flight Company Mode plan runner (Feature: v2 checkpointed autonomy).
 # One at a time - /approve refuses to start a second while this is running.
 company_runner_task = None
+office_api_server = None
 
 # Transient office states remain visible long enough for the browser's 1.5-second
 # polling loop to show them, then office_state renders them as idle automatically.
@@ -1392,7 +1394,7 @@ async def start_scheduler():
 
 
 async def run_all():
-    global main_loop
+    global main_loop, office_api_server
     main_loop = asyncio.get_running_loop()
 
     # Build every Application and resolve every bot's own username FIRST,
@@ -1427,6 +1429,17 @@ async def run_all():
         await app.start()
         await app.updater.start_polling()
 
+    office_api_token = os.environ.get("OFFICE_API_TOKEN")
+    if office_api_token:
+        try:
+            office_api_server = office_api.start_server(office_api_token)
+            host, port = office_api_server.server_address[:2]
+            print(f"Virtual Office API listening on {host}:{port} (bearer token required).")
+        except Exception as e:
+            main.logger.error(f"Virtual Office API did not start: {e}")
+    else:
+        print("Virtual Office API disabled: set OFFICE_API_TOKEN to enable the Railway desktop connection.")
+
     print(f"All {len(BOT_KEYS)} bots running (polling). Press Ctrl+C to stop.")
 
     await start_scheduler()
@@ -1434,6 +1447,10 @@ async def run_all():
     try:
         await asyncio.Event().wait()
     finally:
+        if office_api_server is not None:
+            office_api_server.shutdown()
+            office_api_server.server_close()
+            office_api_server = None
         if scheduler is not None:
             scheduler.shutdown(wait=False)
         for app in applications.values():
