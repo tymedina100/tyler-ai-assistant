@@ -766,6 +766,33 @@ their token and enable their key.
 python group_bot.py
 ```
 
+### Virtual Office dashboard
+
+The optional Virtual Office is a local, read-only view of the enabled Telegram team:
+an original cozy office scene with desks, small avatars, live status lights, short
+reply bubbles, and a recent-activity log. It does not replace or control Telegram;
+`group_bot.py` writes a small state file as it receives, routes, delegates, and posts
+messages, while the dashboard only reads that state.
+
+Start the group bot normally, then open a second terminal and run:
+
+```powershell
+python office_server.py
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The server listens only on your
+local machine and has no authentication, so do not expose it publicly. It stores only
+sanitized 180-character message/reply previews and the 30 most recent office events in
+`office_state.json` under the existing `DATA_DIR` location (or the project directory
+locally). No new environment variables or dependencies are required.
+
+If `python` is not available on Windows PATH, use the repository virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe group_bot.py
+.\.venv\Scripts\python.exe office_server.py
+```
+
 **How it behaves:**
 - Message the group normally (no `@mention`) and a lightweight **router** picks the
   best-fit teammate(s), who reply **as themselves** — the Manager is no longer a
@@ -815,7 +842,7 @@ var and writes all of that under it:
 1. On Railway (or your platform), **attach a volume** with mount path `/app/data`.
 2. Set the env var **`DATA_DIR=/app/data`**.
 
-That's it — `memory_db/`, `reminders.json`, `company_state.json`, and `token.json` now
+That's it — `memory_db/`, `reminders.json`, `company_state.json`, `office_state.json`, and `token.json` now
 live on the volume and survive redeploys. Without `DATA_DIR`, everything defaults to the
 project directory (fine locally, ephemeral in a container). Then set the
 required group tokens you're using (`TELEGRAM_MANAGER_BOT_TOKEN`,

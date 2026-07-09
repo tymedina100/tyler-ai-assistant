@@ -1412,6 +1412,20 @@ CONFIRMATION_MODE = "enabled"
 # announcement. None (the default) is a no-op for the CLI and the single-bot bot.py.
 on_delegation = None
 
+# Optional lifecycle companion for transport/UI layers that need to surface a
+# delegation while the specialist is still working. It deliberately has no effect on
+# the core agent flow, CLI, or single-bot interface when unset.
+on_delegation_started = None
+
+
+def notify_delegation_started(specialist_key, request_text):
+    """Notify optional observers without allowing a display integration to break work."""
+    if on_delegation_started:
+        try:
+            on_delegation_started(specialist_key, request_text)
+        except Exception as e:
+            logger.error(f"Delegation-start observer failed: {e}")
+
 # The current turn's reply destination, set by group_bot.py so on_delegation knows
 # where a dispatched agent's answer should go: {"kind": "group"} posts to the group;
 # {"kind": "manager_dm", "user_id": ..., "chat_id": ...} makes each dispatched agent
@@ -2335,66 +2349,77 @@ def execute_tool(name, arguments):
             return write_file(arguments["filename"], arguments["content"])
 
         if name == "delegate_to_coding_agent":
+            notify_delegation_started("code", arguments["task"])
             answer = ask_specialist("code", arguments["task"], record_history=False)
             if on_delegation:
                 on_delegation("code", arguments["task"], answer)
             return answer
 
         if name == "delegate_to_research_agent":
+            notify_delegation_started("research", arguments["topic"])
             answer = ask_specialist("research", arguments["topic"], record_history=False)
             if on_delegation:
                 on_delegation("research", arguments["topic"], answer)
             return answer
 
         if name == "delegate_to_writer_agent":
+            notify_delegation_started("write", arguments["prompt"])
             answer = ask_specialist("write", arguments["prompt"], record_history=False)
             if on_delegation:
                 on_delegation("write", arguments["prompt"], answer)
             return answer
 
         if name == "delegate_to_marketing_agent":
+            notify_delegation_started("marketing", arguments["task"])
             answer = ask_specialist("marketing", arguments["task"], record_history=False)
             if on_delegation:
                 on_delegation("marketing", arguments["task"], answer)
             return answer
 
         if name == "delegate_to_editor_agent":
+            notify_delegation_started("editor", arguments["request"])
             answer = ask_specialist("editor", arguments["request"], record_history=False)
             if on_delegation:
                 on_delegation("editor", arguments["request"], answer)
             return answer
 
         if name == "delegate_to_finance_agent":
+            notify_delegation_started("finance", arguments["request"])
             answer = ask_specialist("finance", arguments["request"], record_history=False)
             if on_delegation:
                 on_delegation("finance", arguments["request"], answer)
             return answer
 
         if name == "delegate_to_personal_assistant":
+            notify_delegation_started("task", arguments["request"])
             answer = ask_specialist("task", arguments["request"], record_history=False)
             if on_delegation:
                 on_delegation("task", arguments["request"], answer)
             return answer
 
         if name == "delegate_to_calendar_agent":
+            notify_delegation_started("calendar", arguments["request"])
             answer = ask_specialist("calendar", arguments["request"], record_history=False)
             if on_delegation:
                 on_delegation("calendar", arguments["request"], answer)
             return answer
 
         if name == "delegate_to_gmail_agent":
+            notify_delegation_started("gmail", arguments["request"])
             answer = ask_specialist("gmail", arguments["request"], record_history=False)
             if on_delegation:
                 on_delegation("gmail", arguments["request"], answer)
             return answer
 
         if name == "delegate_to_linear_agent":
+            notify_delegation_started("linear", arguments["request"])
             answer = ask_specialist("linear", arguments["request"], record_history=False)
             if on_delegation:
                 on_delegation("linear", arguments["request"], answer)
             return answer
 
         if name == "delegate_to_general_assistant":
+            notify_delegation_started("general", arguments["prompt"])
             answer = ask_ai(arguments["prompt"], record_history=False)
             if on_delegation:
                 on_delegation("general", arguments["prompt"], answer)
