@@ -45,6 +45,7 @@ import company_mode
 import company_linear
 import gumroad_helpers
 import linear_helpers
+import office_state
 
 
 load_dotenv()
@@ -170,6 +171,46 @@ main_loop = None
 # The single in-flight Company Mode plan runner (Feature: v2 checkpointed autonomy).
 # One at a time - /approve refuses to start a second while this is running.
 company_runner_task = None
+
+# Transient office states remain visible long enough for the browser's 1.5-second
+# polling loop to show them, then office_state renders them as idle automatically.
+OFFICE_REPLY_SECONDS = 12
+OFFICE_ERROR_SECONDS = 15
+
+
+def _office_call(method, *args, **kwargs):
+    """Keep optional visual telemetry from ever affecting Telegram behavior."""
+    try:
+        return getattr(office_state, method)(*args, **kwargs)
+    except Exception as e:
+        main.logger.error(f"Virtual office state update failed ({method}): {e}")
+        return None
+
+
+def _office_role(label):
+    """Extract the existing human-readable role from a roster label."""
+    return label.split("(", 1)[1].rstrip(")") if "(" in label else label
+
+
+def _office_roster():
+    """Build enabled-agent display metadata from the existing roster authority."""
+    roster = {}
+    for key in BOT_KEYS:
+        if key in main.SPECIALISTS:
+            profile = main.SPECIALISTS[key]
+            roster[key] = {"name": profile["name"], "role": _office_role(profile["label"])}
+        else:
+            label = AGENT_INFO[key]["label"]
+            roster[key] = {"name": label.split("(", 1)[0].strip(), "role": _office_role(label)}
+    return roster
+
+
+def on_delegation_started(specialist_key, request_text):
+    """Visual-only lifecycle hook fired immediately before a delegated specialist runs."""
+    label = "Robin" if specialist_key == "general" else AGENT_INFO[specialist_key]["label"].split("(", 1)[0].strip()
+    _office_call("set_agent_status", "manager", "delegated", f"Delegating to {label}")
+    _office_call("set_agent_status", specialist_key, "thinking", request_text)
+    _office_call("add_event", "delegated", "manager", f"Miles delegated work to {label}.")
 
 
 def is_authorized(update):
@@ -311,6 +352,10 @@ def build_specialist_handler(key):
                 if await _handle_pending_confirmation(update, request):
                     return
 
+                _office_call("set_agent_status", key, "thinking", request)
+                if kind == "group":
+                    _office_call("add_event", "thinking", key, "Started a direct request.")
+
                 # Robin (general) isn't a SPECIALISTS entry; it runs through ask_ai
                 # (all-rounder, full toolset) rather than ask_specialist.
                 if key == "general":
@@ -319,11 +364,19 @@ def build_specialist_handler(key):
                     answer = await _run_metered(main.ask_specialist, key, request)
         except Exception as e:
             main.logger.error(f"Unhandled error in {key} specialist handler: {e}")
+            _office_call(
+                "set_agent_status", key, "error", "Could not complete that request.", OFFICE_ERROR_SECONDS
+            )
+            if kind == "group":
+                _office_call("add_event", "error", key, "Could not complete a direct request.")
             await update.message.reply_text("Sorry, something went wrong processing that.")
             return
 
         # Split into <=4096-char chunks (and guard against an empty answer, which
         # Telegram also rejects) - see reply_chunks / TELEGRAM_LIMIT above.
+        _office_call("set_agent_status", key, "speaking", answer, OFFICE_REPLY_SECONDS)
+        if kind == "group":
+            _office_call("add_event", "reply", key, answer)
         await reply_chunks(update.message, answer)
 
     return handle
@@ -389,9 +442,11 @@ async def handle_group_message(update: Update):
     Only genuinely multi-step/coordination requests go to Miles to orchestrate."""
     text = update.message.text
     lowered = text.lower()
+    _office_call("mark_message_received", text)
 
     for key in SPECIALIST_KEYS:
         if f"@{bot_usernames[key]}".lower() in lowered:
+            _office_call("set_agent_status", "manager", "idle")
             return  # addressed to a specific specialist - their own handler owns this
 
     if text.strip() in ("/start", f"@{bot_usernames['manager']}", f"@{bot_usernames['manager']} /start"):
@@ -442,6 +497,7 @@ async def handle_group_message(update: Update):
             await reply_chunks(update.message, company_response)
             return
 
+        _office_call("set_agent_status", "manager", "thinking", text)
         try:
             responders = await asyncio.to_thread(main.select_group_responders, text)
         except Exception as e:
@@ -455,24 +511,40 @@ async def handle_group_message(update: Update):
             # delegated agent's answer is posted to the group as itself by on_delegation,
             # then Miles's recap is posted here.
             try:
+                _office_call("set_agent_status", "manager", "delegated", "Coordinating the request.")
                 answer = await _run_metered(main.ask_manager, text)
             except Exception as e:
                 main.logger.error(f"Unhandled error in manager handler: {e}")
+                _office_call(
+                    "set_agent_status", "manager", "error", "Could not coordinate that request.", OFFICE_ERROR_SECONDS
+                )
+                _office_call("add_event", "error", "manager", "Miles could not complete the request.")
                 await update.message.reply_text("Sorry, something went wrong processing that.")
                 return
+            _office_call("set_agent_status", "manager", "speaking", answer, OFFICE_REPLY_SECONDS)
+            _office_call("add_event", "reply", "manager", answer)
             await reply_chunks(update.message, answer)
             return
 
         # Otherwise the chosen teammate(s) answer directly, each as themselves.
+        _office_call("set_agent_status", "manager", "idle")
         for key in responders:
             try:
+                _office_call("set_agent_status", key, "thinking", text)
+                _office_call("add_event", "thinking", key, "Picked up a routed request.")
                 if key == "general":
                     answer = await _run_metered(main.ask_ai, text)
                 else:
                     answer = await _run_metered(main.ask_specialist, key, text)
             except Exception as e:
                 main.logger.error(f"Error while '{key}' answered a group message: {e}")
+                _office_call(
+                    "set_agent_status", key, "error", "Could not complete that routed request.", OFFICE_ERROR_SECONDS
+                )
+                _office_call("add_event", "error", key, "Could not complete a routed request.")
                 continue
+            _office_call("set_agent_status", key, "speaking", answer, OFFICE_REPLY_SECONDS)
+            _office_call("add_event", "reply", key, answer)
             await post_agent_answer_to_group(key, answer)
 
 
@@ -539,6 +611,8 @@ def on_delegation(specialist_key, request_text, answer_text):
     ctx = main.current_reply_context() or {"kind": "group"}
     label = "General Assistant" if specialist_key == "general" else main.SPECIALISTS[specialist_key]["label"]
     target_bot = bots.get(specialist_key, bots["manager"])
+    _office_call("set_agent_status", specialist_key, "speaking", answer_text, OFFICE_REPLY_SECONDS)
+    _office_call("add_event", "reply", specialist_key, answer_text)
     try:
         company_mode.record_delegation(specialist_key, request_text, answer_text)
     except Exception as e:
@@ -791,6 +865,9 @@ async def _run_one_task(project, task):
     )
 
     await asyncio.to_thread(company_mode.update_task_status, task["id"], "in_progress")
+    _office_call("set_agent_status", "manager", "delegated", f"Assigned {task['owner']} a company task.")
+    _office_call("set_agent_status", owner or "general", "thinking", task["title"])
+    _office_call("add_event", "delegated", "manager", f"Started company task: {task['owner']} — {task['title']}")
     await post_to_group(f"Starting: {task['owner']} - {task['title']}", "manager")
 
     def work():
@@ -811,6 +888,10 @@ async def _run_one_task(project, task):
             answer = await asyncio.to_thread(work)
         except Exception as e:
             main.logger.error(f"Company task {task['id']} errored: {e}")
+            _office_call(
+                "set_agent_status", owner or "general", "error", "Company task was parked after an error.", OFFICE_ERROR_SECONDS
+            )
+            _office_call("add_event", "error", owner or "general", f"Company task {task['id']} was parked.")
             await asyncio.to_thread(
                 company_mode.mark_task_blocked, task["id"],
                 "Errored while running - see logs.", sink["cost_usd"], sink["artifacts"],
@@ -818,6 +899,8 @@ async def _run_one_task(project, task):
             await post_to_group(f"Task {task['id']} hit an error and was parked.", "manager")
             return "blocked"
 
+    _office_call("set_agent_status", owner or "general", "speaking", answer, OFFICE_REPLY_SECONDS)
+    _office_call("add_event", "reply", owner or "general", answer)
     await post_agent_answer_to_group(owner or "manager", answer)
 
     spent = sink["cost_usd"]
@@ -1328,7 +1411,9 @@ async def run_all():
         bot_usernames[key] = (await app.bot.get_me()).username
         print(f"{AGENT_INFO[key]['label']}: @{bot_usernames[key]}")
 
+    _office_call("configure_agents", _office_roster())
     main.on_delegation = on_delegation
+    main.on_delegation_started = on_delegation_started
     # Mirror Company Mode work into Linear (no-op unless LINEAR_API_KEY is set).
     company_linear.register()
 
