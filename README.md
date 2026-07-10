@@ -766,6 +766,33 @@ their token and enable their key.
 python group_bot.py
 ```
 
+### Virtual Office desktop app
+
+Virtual Office is a native Windows desktop app, not a browser dashboard. It draws an
+original cozy office scene with desks, small avatars, live status lights, reply bubbles,
+and a recent-activity log. The deployed Telegram worker is its live source of truth:
+`group_bot.py` exposes only the bounded office state (180-character previews and the 30
+most recent events) through an authenticated API.
+
+**On Railway:**
+
+1. Set a long random `OFFICE_API_TOKEN` secret on the Telegram worker service.
+2. Give that service a Railway public domain. The worker then listens on Railway's
+   assigned `$PORT` and serves `GET /api/office-state` with bearer-token authentication.
+3. Redeploy the worker. Keep the token private; it grants read access to office previews.
+
+**On your Windows desktop:**
+
+```powershell
+$env:OFFICE_API_URL = "https://your-railway-service.up.railway.app"
+$env:OFFICE_API_TOKEN = "the-same-long-random-secret"
+python office_desktop.py
+```
+
+You can also pass `--api-url` and `--token` directly. The desktop client polls every
+1.5 seconds; it does not expose a local website or require any new dependencies. If
+`python` is not on PATH, use ` .\.venv\Scripts\python.exe office_desktop.py` instead.
+
 **How it behaves:**
 - Message the group normally (no `@mention`) and a lightweight **router** picks the
   best-fit teammate(s), who reply **as themselves** — the Manager is no longer a
@@ -815,7 +842,7 @@ var and writes all of that under it:
 1. On Railway (or your platform), **attach a volume** with mount path `/app/data`.
 2. Set the env var **`DATA_DIR=/app/data`**.
 
-That's it — `memory_db/`, `reminders.json`, `company_state.json`, and `token.json` now
+That's it — `memory_db/`, `reminders.json`, `company_state.json`, `office_state.json`, and `token.json` now
 live on the volume and survive redeploys. Without `DATA_DIR`, everything defaults to the
 project directory (fine locally, ephemeral in a container). Then set the
 required group tokens you're using (`TELEGRAM_MANAGER_BOT_TOKEN`,
