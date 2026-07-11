@@ -102,6 +102,37 @@ class CommandParsingTests(unittest.TestCase):
             self.assertTrue(main.handle_command("/linear create Add watchlist alerts"))
         self.assertEqual(calls, [" create Add watchlist alerts"])
 
+    def test_brief_command_dispatches_notes_with_case_preserved(self):
+        main = self.main
+        calls = []
+        with patch.object(main, "generate_daily_brief",
+                          lambda notes: calls.append(notes) or "brief"), \
+                patch("builtins.print"):
+            self.assertTrue(main.handle_command("/brief Finish Resume Before Noon"))
+        self.assertEqual(calls, ["Finish Resume Before Noon"])
+
+    def test_brief_command_requires_notes(self):
+        main = self.main
+        with patch.object(main, "generate_daily_brief") as generate, \
+                patch("builtins.print") as mocked_print:
+            self.assertTrue(main.handle_command("/brief"))
+        generate.assert_not_called()
+        mocked_print.assert_called_once_with(
+            "Usage: /brief <notes about your day, commitments, and priorities>"
+        )
+
+    def test_daily_brief_uses_a_tools_free_structured_request(self):
+        main = self.main
+        with patch.object(main, "build_augmented_prompt", return_value="prepared notes"), \
+                patch.object(main, "run_with_tools", return_value="daily plan") as run:
+            result = main.generate_daily_brief("Finish resume")
+
+        self.assertEqual(result, "daily plan")
+        instructions, input_items = run.call_args.args[:2]
+        self.assertIn("Top 3 priorities", instructions)
+        self.assertEqual(input_items, [{"role": "user", "content": "prepared notes"}])
+        self.assertEqual(run.call_args.kwargs["tools"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
