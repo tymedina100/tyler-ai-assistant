@@ -33,6 +33,7 @@ The assistant is **not** trying to become a do-everything autonomous company, ap
 - `/search <query>` command to search the web and get a summarized answer
 - `/remember <fact>` command to explicitly save something to long-term memory
 - `/recall <query>` command to see what long-term memory has stored about a topic
+- `/brief <notes>` command to turn your context into a focused plan for the day
 - Nine specialist agents, each a named character with a real job title, its own
   personality, and curated tool access, including real external connectors (Todoist,
   OpenWeatherMap, Google, Gumroad) — see "Specialist agents" and "Meet the team" below
@@ -133,6 +134,20 @@ python main.py
 Type a message and press Enter to chat with the AI, or use one of the commands above.
 Files you want to `/read` or `/askfile` must live inside the `files/` folder — paths
 outside it are rejected for safety.
+
+### Plan your day with a daily brief
+
+Use `/brief` when you want a short command-center plan from your own context. Include
+anything that matters today: deadlines, appointments, energy level, unfinished work, or
+constraints. The assistant returns three priorities, flexible schedule blocks, one each
+for health, career, and a project, a deliberate deferral, and a reflection prompt.
+
+```text
+/brief I have a 2pm dentist appointment, need to finish my resume revision, have low energy, and want to make progress on the card tracker. Ignore non-urgent email today.
+```
+
+The command uses only the notes you provide plus relevant saved context; it does not
+create calendar events, tasks, or other external changes.
 
 ## Running the tests
 

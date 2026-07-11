@@ -1,10 +1,12 @@
 """Native isometric command-center client for the Railway-backed Virtual Office."""
 import argparse
 import json
+import math
 import os
 import threading
 import tkinter as tk
 from datetime import datetime
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -31,9 +33,21 @@ HOME_SLOTS = [
 ]
 ZONE_ANCHORS = {
     "planning": (500, 210), "operations": (500, 392), "response": (745, 432),
-    "support": (860, 260),
+    "support": (185, 280),
 }
 ZONE_OFFSETS = [(0, 0), (-50, 22), (50, 22), (-78, 46), (78, 46), (0, 55)]
+ROBOT_SPRITE_PATH = Path(__file__).resolve().parent / "assets" / "office" / "coworker-3d.png"
+ROBOT_SPRITE_DIRECTORY = Path(__file__).resolve().parent / "assets" / "office" / "sprites"
+OFFICE_ROOM_PATH = Path(__file__).resolve().parent / "assets" / "office" / "office-room.png"
+SPRITE_FRAME_NAMES = ("idle", "blink", "thinking", "speaking")
+WALK_FRAME_NAMES = ("walk-1", "walk-2")
+STATUS_ANIMATION_SEQUENCES = {
+    "idle": ("idle", "idle", "idle", "blink", "idle", "idle"),
+    "thinking": ("thinking", "thinking", "blink", "thinking"),
+    "speaking": ("speaking", "speaking", "idle", "speaking"),
+    "delegated": ("thinking", "thinking", "speaking", "thinking"),
+    "error": ("blink", "idle"),
+}
 
 
 def office_endpoint(api_url):
@@ -60,6 +74,22 @@ def _short(value, limit=72):
 def agent_color(key):
     """Use stable, original teammate colors across polling cycles."""
     return AGENT_COLORS.get(key, "#64748b")
+
+
+def robot_sprite_path(key, frame_name):
+    """Return the packaged colored 3D sprite frame for one teammate."""
+    return ROBOT_SPRITE_DIRECTORY / f"{key}-{frame_name}.png"
+
+
+def sprite_frame_for_status(status, animation_step):
+    """Choose a deterministic animation frame from the live office status."""
+    sequence = STATUS_ANIMATION_SEQUENCES.get(status, STATUS_ANIMATION_SEQUENCES["idle"])
+    return sequence[animation_step % len(sequence)]
+
+
+def walking_sprite_frame(animation_step):
+    """Alternate feet while an agent is travelling to a new office zone."""
+    return WALK_FRAME_NAMES[animation_step % len(WALK_FRAME_NAMES)]
 
 
 def scene_zone(key, status):
@@ -110,6 +140,17 @@ class VirtualOfficeDesktop:
         self.connection_note = "Connecting to Railway..."
         self.fetching = False
         self.closed = False
+        self.current_positions = {}
+        self.target_positions = {}
+        self.motion_phase = 0.0
+        self.transition_running = False
+        self.robot_sprite_source = None
+        self.robot_sprite = None
+        self.robot_sprites = self._load_robot_sprites()
+        self.room_background = self._load_room_background()
+        sprite_assets = self._load_robot_sprite()
+        if sprite_assets:
+            self.robot_sprite_source, self.robot_sprite = sprite_assets
 
         root.title("Tyler AI Assistant - Virtual Office")
         root.geometry("1380x900")
@@ -121,6 +162,7 @@ class VirtualOfficeDesktop:
         self.canvas.bind("<Configure>", lambda _event: self.render())
         self.render()
         self.poll()
+        self.root.after(120, self._motion_tick)
 
     def close(self):
         self.closed = True
@@ -133,6 +175,113 @@ class VirtualOfficeDesktop:
             self.fetching = True
             threading.Thread(target=self._fetch_in_background, name="office-desktop-poll", daemon=True).start()
         self.root.after(POLL_MS, self.poll)
+
+    def _motion_tick(self):
+        """Keep active coworkers gently alive without changing the polling contract."""
+        if self.closed:
+            return
+        self.motion_phase += 0.45
+        self.render()
+        self.root.after(120, self._motion_tick)
+
+    @staticmethod
+    def _load_robot_sprite():
+        """Load the original 3D coworker asset, with a graceful vector fallback."""
+        if not ROBOT_SPRITE_PATH.exists():
+            return None
+        try:
+            source = tk.PhotoImage(file=str(ROBOT_SPRITE_PATH))
+            return source, source.subsample(11, 11)
+        except tk.TclError:
+            return None
+
+    @staticmethod
+    def _load_room_background():
+        """Load the polished room model, retaining Canvas scenery as a resize fallback."""
+        if not OFFICE_ROOM_PATH.exists():
+            return None
+        try:
+            return tk.PhotoImage(file=str(OFFICE_ROOM_PATH))
+        except tk.TclError:
+            return None
+
+    @staticmethod
+    def _load_robot_sprites():
+        """Load the colored animation frames; individual missing assets fall back safely."""
+        sprites = {}
+        for key in AGENT_COLORS:
+            frames = {}
+            for frame_name in SPRITE_FRAME_NAMES + WALK_FRAME_NAMES:
+                path = robot_sprite_path(key, frame_name)
+                if not path.exists():
+                    continue
+                try:
+                    frames[frame_name] = tk.PhotoImage(file=str(path)).subsample(3, 3)
+                except tk.TclError:
+                    continue
+            if frames:
+                sprites[key] = frames
+        return sprites
+
+    def _robot_sprite_for(self, key, status, walking=False):
+        frames = self.robot_sprites.get(key) or self.robot_sprites.get("general", {})
+        if frames:
+            animation_step = int(self.motion_phase / 1.35)
+            frame_name = walking_sprite_frame(animation_step) if walking else sprite_frame_for_status(status, animation_step)
+            return frames.get(frame_name) or next(iter(frames.values()))
+        return self.robot_sprite
+
+    def _positioned_items(self, agents):
+        targets = assign_scene_positions(agents)
+        target_keys = set()
+        needs_transition = False
+        travel = {}
+        for item in targets:
+            key = item["key"]
+            target_keys.add(key)
+            target = (item["x"], item["y"])
+            current = self.current_positions.get(key)
+            if current is None:
+                self.current_positions[key] = target
+                travel[key] = False
+            elif abs(current[0] - target[0]) > 0.5 or abs(current[1] - target[1]) > 0.5:
+                needs_transition = True
+                travel[key] = True
+            else:
+                travel[key] = False
+            self.target_positions[key] = target
+        self.current_positions = {key: value for key, value in self.current_positions.items() if key in target_keys}
+        self.target_positions = {key: value for key, value in self.target_positions.items() if key in target_keys}
+        if needs_transition and not self.transition_running:
+            self.transition_running = True
+            self.root.after(32, self._animate_positions)
+        return [
+            {
+                **item,
+                "x": self.current_positions[item["key"]][0],
+                "y": self.current_positions[item["key"]][1],
+                "walking": travel[item["key"]],
+            }
+            for item in targets
+        ]
+
+    def _animate_positions(self):
+        if self.closed:
+            return
+        moving = False
+        for key, target in self.target_positions.items():
+            current = self.current_positions[key]
+            dx, dy = target[0] - current[0], target[1] - current[1]
+            if abs(dx) <= 0.5 and abs(dy) <= 0.5:
+                self.current_positions[key] = target
+                continue
+            self.current_positions[key] = (current[0] + dx * 0.22, current[1] + dy * 0.22)
+            moving = True
+        self.render()
+        if moving:
+            self.root.after(32, self._animate_positions)
+        else:
+            self.transition_running = False
 
     def _fetch_in_background(self):
         try:
@@ -154,10 +303,19 @@ class VirtualOfficeDesktop:
     @staticmethod
     def _rounded(canvas, x1, y1, x2, y2, radius, fill, outline="", width=1):
         radius = min(radius, (x2 - x1) / 2, (y2 - y1) / 2)
-        canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, fill=fill, outline=outline, width=width)
-        canvas.create_rectangle(x1, y1 + radius, x2, y2 - radius, fill=fill, outline=outline, width=width)
+        canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, fill=fill, outline="", width=0)
+        canvas.create_rectangle(x1, y1 + radius, x2, y2 - radius, fill=fill, outline="", width=0)
         for x, y in ((x1 + radius, y1 + radius), (x2 - radius, y1 + radius), (x1 + radius, y2 - radius), (x2 - radius, y2 - radius)):
-            canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=fill, outline=outline, width=width)
+            canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=fill, outline="", width=0)
+        if outline:
+            canvas.create_line(x1 + radius, y1, x2 - radius, y1, fill=outline, width=width)
+            canvas.create_line(x2, y1 + radius, x2, y2 - radius, fill=outline, width=width)
+            canvas.create_line(x2 - radius, y2, x1 + radius, y2, fill=outline, width=width)
+            canvas.create_line(x1, y2 - radius, x1, y1 + radius, fill=outline, width=width)
+            canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, style=tk.ARC, outline=outline, width=width)
+            canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, style=tk.ARC, outline=outline, width=width)
+            canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, style=tk.ARC, outline=outline, width=width)
+            canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, style=tk.ARC, outline=outline, width=width)
 
     def render(self):
         canvas = self.canvas
@@ -170,13 +328,16 @@ class VirtualOfficeDesktop:
         self._draw_room(*scene)
         agents = list((self.state.get("agents") or {}).items())
         if agents:
-            self._draw_agents(scene, assign_scene_positions(agents))
+            scene_items = self._positioned_items(agents)
+            self._draw_agents(scene, scene_items)
         else:
+            scene_items = []
             canvas.create_text(
                 (scene[0] + scene[2]) / 2, (scene[1] + scene[3]) / 2,
                 text="Waiting for the Railway team to enter the office.", fill="#64748b",
                 font=("Segoe UI", 15, "bold"),
             )
+        self._draw_foreground_labels(*scene)
         self._draw_console(28, height - console_height, width - 28, height - 22, agents)
 
     def _draw_header(self, width):
@@ -191,6 +352,11 @@ class VirtualOfficeDesktop:
 
     def _draw_room(self, left, top, right, bottom):
         canvas = self.canvas
+        room_width, room_height = right - left, bottom - top
+        if self.room_background and (room_width, room_height) == (self.room_background.width(), self.room_background.height()):
+            canvas.create_image(left, top, image=self.room_background, anchor="nw")
+            canvas.create_rectangle(left, top, right, bottom, outline="#d1d9e3")
+            return
         canvas.create_rectangle(left, top, right, bottom, fill="#f7f8fb", outline="#dce3ec")
         # Original room planes and isometric platform.
         canvas.create_polygon(left + 145, top + 28, right - 80, top + 105, right - 180, bottom - 26, left + 48, bottom - 86,
@@ -202,9 +368,6 @@ class VirtualOfficeDesktop:
         for offset in range(-220, 980, 58):
             canvas.create_line(left + offset, bottom - 76, left + offset + 310, top + 115, fill="#e0e6ed")
             canvas.create_line(left + offset + 60, bottom - 18, left + offset + 370, top + 57, fill="#edf0f4")
-        self._zone_label(left + 210, top + 83, "PLANNING WALL", "ideas and research", "#f7b844")
-        self._zone_label((left + right) / 2, bottom - 56, "OPERATIONS DESK", "team coordination", "#5e7df6")
-        self._zone_label(right - 250, bottom - 96, "RESPONSE PODIUM", "live updates", "#28b681")
         self._draw_whiteboard(left + 320, top + 108, 215, 94)
         self._draw_kanban(right - 335, top + 150, 175, 135)
         self._draw_lounge(left + 114, bottom - 190)
@@ -213,6 +376,13 @@ class VirtualOfficeDesktop:
         self._draw_podium(right - 250, bottom - 200)
         self._draw_plant(left + 230, bottom - 130)
         self._draw_plant(right - 128, top + 285)
+
+    def _draw_foreground_labels(self, left, top, right, bottom):
+        """Draw zone labels last so their text remains readable over live avatars."""
+        self._zone_label((left + right) / 2 - 92, top + 55, "PLANNING WALL", "ideas and research", "#f7b844")
+        self._zone_label((left + right) / 2 - 155, bottom - 52, "OPERATIONS DESK", "team coordination", "#5e7df6")
+        self._zone_label(right - 160, bottom - 152, "RESPONSE PODIUM", "live updates", "#28b681")
+        self._zone_label(left + 150, top + 250, "SECURE TOOLS", "protected actions", "#ef6461")
 
     def _zone_label(self, x, y, title, subtitle, accent):
         canvas = self.canvas
@@ -255,7 +425,6 @@ class VirtualOfficeDesktop:
         canvas.create_polygon(x + 60, y, x + 93, y + 18, x + 93, y + 102, x + 60, y + 110, fill="#7e8a99", outline="#6c7785")
         canvas.create_oval(x + 20, y + 44, x + 55, y + 79, fill="#5a6574", outline="#404a57")
         canvas.create_oval(x + 29, y + 53, x + 46, y + 70, fill="#d9e0e8", outline="")
-        canvas.create_text(x + 4, y + 150, anchor="w", text="SECURE TOOLS", fill="#64748b", font=("Segoe UI", 7, "bold"))
 
     def _draw_desk(self, x, y, width, height):
         canvas = self.canvas
@@ -290,20 +459,31 @@ class VirtualOfficeDesktop:
     def _draw_agent(self, x, y, item):
         canvas = self.canvas
         agent, status, key = item["agent"], item["status"], item["key"]
+        walking = item.get("walking", False)
         color = agent_color(key)
         status_color = STATUS_COLORS.get(status, STATUS_COLORS["idle"])
-        canvas.create_oval(x - 25, y + 28, x + 25, y + 43, fill="#c8d0da", outline="")
-        canvas.create_oval(x - 16, y - 32, x + 16, y, fill=color, outline="#344152", width=1)
-        canvas.create_oval(x - 22, y - 4, x + 22, y + 34, fill=color, outline="#344152", width=1)
-        canvas.create_rectangle(x - 10, y - 21, x + 12, y - 10, fill="#233141", outline="", width=0)
-        canvas.create_oval(x + 10, y - 38, x + 20, y - 28, fill=status_color, outline="#ffffff", width=2)
-        self._rounded(canvas, x - 49, y + 46, x + 49, y + 68, 8, "#ffffff", "#dbe2eb")
-        canvas.create_text(x, y + 53, text=_short(agent.get("name") or key, 15), fill="#263246", font=("Segoe UI", 7, "bold"))
-        canvas.create_text(x, y + 62, text=status.upper(), fill=status_color, font=("Segoe UI", 6, "bold"))
+        active = status in {"thinking", "speaking", "delegated"}
+        phase = self.motion_phase + sum(ord(char) for char in key) * 0.08
+        bob = math.sin(phase) * (2 if walking else 3 if status == "speaking" else 2 if active else 0)
+        y += bob
+        pulse = 1.0 + (math.sin(phase) + 1) * 0.8 if active else 1.0
+        canvas.create_oval(x - 42, y + 25, x + 42, y + 43, fill="#c8d0da", outline="")
+        canvas.create_oval(x - 41, y - 60, x + 41, y + 31, fill=color, outline="")
+        sprite = self._robot_sprite_for(key, status, walking)
+        if sprite:
+            canvas.create_image(x, y + 36, image=sprite, anchor="s")
+        else:
+            canvas.create_oval(x - 16, y - 32, x + 16, y, fill=color, outline="#344152", width=1)
+            canvas.create_oval(x - 22, y - 4, x + 22, y + 34, fill=color, outline="#344152", width=1)
+            canvas.create_rectangle(x - 10, y - 21, x + 12, y - 10, fill="#233141", outline="", width=0)
+        canvas.create_oval(x + 30 - pulse * 5, y - 61 - pulse * 5, x + 30 + pulse * 5, y - 61 + pulse * 5, fill=status_color, outline="#ffffff", width=2)
+        self._rounded(canvas, x - 58, y + 49, x + 58, y + 78, 8, "#ffffff", "#dbe2eb")
+        canvas.create_text(x, y + 58, text=_short(agent.get("name") or key, 17), fill="#263246", font=("Segoe UI", 8, "bold"))
+        canvas.create_text(x, y + 69, text=status.upper(), fill=status_color, font=("Segoe UI", 7, "bold"))
         message = _short(agent.get("message"), 62)
         if message:
-            self._rounded(canvas, x + 25, y - 72, x + 168, y - 37, 8, "#ffffff", "#d9e1ea")
-            canvas.create_text(x + 34, y - 55, anchor="w", width=124, text=message, fill="#38465a", font=("Segoe UI", 7))
+            self._rounded(canvas, x + 32, y - 112, x + 175, y - 77, 8, "#ffffff", "#d9e1ea")
+            canvas.create_text(x + 41, y - 95, anchor="w", width=124, text=message, fill="#38465a", font=("Segoe UI", 7))
 
     def _draw_console(self, left, top, right, bottom, agents):
         canvas = self.canvas

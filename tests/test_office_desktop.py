@@ -42,6 +42,32 @@ class OfficeDesktopLayoutTests(unittest.TestCase):
         self.assertEqual(office_desktop.assign_scene_positions(agents), office_desktop.assign_scene_positions(agents))
         self.assertEqual(office_desktop._short("abcdef", 5), "ab...")
 
+    def test_3d_coworker_asset_is_packaged_with_the_desktop_app(self):
+        self.assertEqual(office_desktop.ROBOT_SPRITE_PATH.name, "coworker-3d.png")
+        self.assertTrue(office_desktop.ROBOT_SPRITE_PATH.is_file())
+
+    def test_3d_office_room_model_is_packaged_with_the_desktop_app(self):
+        self.assertEqual(office_desktop.OFFICE_ROOM_PATH.name, "office-room.png")
+        self.assertTrue(office_desktop.OFFICE_ROOM_PATH.is_file())
+
+    def test_each_known_teammate_has_colored_3d_animation_frames(self):
+        for key in office_desktop.AGENT_COLORS:
+            for frame_name in office_desktop.SPRITE_FRAME_NAMES + office_desktop.WALK_FRAME_NAMES:
+                self.assertTrue(office_desktop.robot_sprite_path(key, frame_name).is_file())
+
+    def test_live_statuses_select_distinct_sprite_animation_sequences(self):
+        self.assertEqual(office_desktop.sprite_frame_for_status("idle", 0), "idle")
+        self.assertEqual(office_desktop.sprite_frame_for_status("idle", 3), "blink")
+        self.assertEqual(office_desktop.sprite_frame_for_status("thinking", 0), "thinking")
+        self.assertEqual(office_desktop.sprite_frame_for_status("speaking", 0), "speaking")
+        self.assertEqual(office_desktop.sprite_frame_for_status("delegated", 2), "speaking")
+        self.assertEqual(office_desktop.sprite_frame_for_status("error", 0), "blink")
+
+    def test_walking_animation_alternates_feet(self):
+        self.assertEqual(office_desktop.walking_sprite_frame(0), "walk-1")
+        self.assertEqual(office_desktop.walking_sprite_frame(1), "walk-2")
+        self.assertEqual(office_desktop.walking_sprite_frame(2), "walk-1")
+
 
 if __name__ == "__main__":
     unittest.main()
