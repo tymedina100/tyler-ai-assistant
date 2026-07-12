@@ -68,6 +68,29 @@ class OfficeDesktopLayoutTests(unittest.TestCase):
         self.assertEqual(office_desktop.walking_sprite_frame(1), "walk-2")
         self.assertEqual(office_desktop.walking_sprite_frame(2), "walk-1")
 
+    def test_walks_route_across_the_room_before_approaching_the_spot(self):
+        self.assertEqual(office_desktop.walk_path((100, 200), (400, 500)), [(400, 200), (400, 500)])
+        self.assertEqual(office_desktop.walk_path((100, 200), (100, 500)), [(100, 500)])
+        self.assertEqual(office_desktop.walk_path((100, 200), (400, 200)), [(400, 200)])
+
+    def test_agents_advance_at_a_constant_walking_speed(self):
+        position, remaining, travelled = office_desktop.advance_along_path((0, 0), [(30, 0), (30, 40)], 9)
+        self.assertEqual(position, (9.0, 0.0))
+        self.assertEqual(remaining, [(30, 0), (30, 40)])
+        self.assertEqual(travelled, 9)
+
+    def test_agents_turn_corners_without_losing_pace(self):
+        position, remaining, travelled = office_desktop.advance_along_path((27, 0), [(30, 0), (30, 40)], 9)
+        self.assertEqual(position, (30.0, 6.0))
+        self.assertEqual(remaining, [(30, 40)])
+        self.assertEqual(travelled, 9)
+
+    def test_agents_sit_at_their_desk_only_when_home_and_not_walking(self):
+        self.assertTrue(office_desktop.seated_pose("home", False))
+        self.assertFalse(office_desktop.seated_pose("home", True))
+        self.assertFalse(office_desktop.seated_pose("planning", False))
+        self.assertFalse(office_desktop.seated_pose("operations", False))
+
 
 if __name__ == "__main__":
     unittest.main()
