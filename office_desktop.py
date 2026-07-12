@@ -10,6 +10,12 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+try:  # Pillow lets the photographed room scale with the window; the app runs without it.
+    from PIL import Image as PILImage
+    from PIL import ImageTk as PILImageTk
+except ImportError:
+    PILImage = PILImageTk = None
+
 
 POLL_MS = 1500
 REQUEST_TIMEOUT_SECONDS = 8
@@ -43,6 +49,99 @@ SPRITE_FRAME_NAMES = ("idle", "blink", "thinking", "speaking")
 WALK_FRAME_NAMES = ("walk-1", "walk-2")
 WALK_SPEED = 9.0  # scene pixels moved per 32 ms animation frame
 STRIDE_LENGTH = 32.0  # scene pixels travelled before the feet swap
+SCENE_BOUNDS = (35, 115, 965, 640)  # walkable floor in the 1000x650 scene space
+OBSTACLE_MARGIN = 14
+GRID_CELL = 25
+
+
+def _scene_obstacles():
+    """Furniture footprints in scene coordinates that agents must walk around."""
+    obstacles = [
+        (300, 291, 700, 345),  # operations desk, back run
+        (300, 291, 460, 441),  # operations desk, left wing
+        (555, 291, 700, 441),  # operations desk, right wing
+        (50, 130, 205, 240),   # secure tools cabinet
+        (20, 545, 150, 645),   # lounge sofas
+        (730, 495, 850, 645),  # response podium console
+    ]
+    for slot_x, slot_y in HOME_SLOTS:
+        obstacles.append((slot_x - 44, slot_y + 2, slot_x + 44, slot_y + 52))
+    return tuple(obstacles)
+
+
+SCENE_OBSTACLES = _scene_obstacles()
+
+
+def point_blocked(x, y, margin=OBSTACLE_MARGIN):
+    """True when a scene point is off the floor or inside a piece of furniture."""
+    if not (SCENE_BOUNDS[0] <= x <= SCENE_BOUNDS[2] and SCENE_BOUNDS[1] <= y <= SCENE_BOUNDS[3]):
+        return True
+    return any(
+        x1 - margin <= x <= x2 + margin and y1 - margin <= y <= y2 + margin
+        for x1, y1, x2, y2 in SCENE_OBSTACLES
+    )
+
+
+def path_is_clear(start, end):
+    """True when the straight segment between two points stays off the furniture."""
+    distance = math.hypot(end[0] - start[0], end[1] - start[1])
+    steps = max(int(distance / 8), 1)
+    return all(
+        not point_blocked(start[0] + (end[0] - start[0]) * step / steps,
+                          start[1] + (end[1] - start[1]) * step / steps)
+        for step in range(1, steps)
+    )
+
+
+def _cell_center(cell):
+    return (
+        SCENE_BOUNDS[0] + (cell[0] + 0.5) * GRID_CELL,
+        SCENE_BOUNDS[1] + (cell[1] + 0.5) * GRID_CELL,
+    )
+
+
+_GRID_COLUMNS = int((SCENE_BOUNDS[2] - SCENE_BOUNDS[0]) // GRID_CELL)
+_GRID_ROWS = int((SCENE_BOUNDS[3] - SCENE_BOUNDS[1]) // GRID_CELL)
+_WALKABLE_CELLS = tuple(
+    cell
+    for cell in ((column, row) for row in range(_GRID_ROWS) for column in range(_GRID_COLUMNS))
+    if not point_blocked(*_cell_center(cell))
+)
+_WALKABLE_SET = set(_WALKABLE_CELLS)
+
+
+def _nearest_walkable_cell(point):
+    return min(
+        _WALKABLE_CELLS,
+        key=lambda cell: (point[0] - _cell_center(cell)[0]) ** 2 + (point[1] - _cell_center(cell)[1]) ** 2,
+    )
+
+
+def _grid_route(start_cell, goal_cell):
+    """Breadth-first route across walkable floor cells; diagonals cannot clip corners."""
+    if start_cell == goal_cell:
+        return [start_cell]
+    came_from = {start_cell: None}
+    queue = [start_cell]
+    while queue:
+        cell = queue.pop(0)
+        if cell == goal_cell:
+            break
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            neighbor = (cell[0] + dx, cell[1] + dy)
+            if neighbor in came_from or neighbor not in _WALKABLE_SET:
+                continue
+            if dx and dy and not ((cell[0] + dx, cell[1]) in _WALKABLE_SET and (cell[0], cell[1] + dy) in _WALKABLE_SET):
+                continue
+            came_from[neighbor] = cell
+            queue.append(neighbor)
+    if goal_cell not in came_from:
+        return None
+    route = [goal_cell]
+    while came_from[route[-1]] is not None:
+        route.append(came_from[route[-1]])
+    route.reverse()
+    return route
 STATUS_ANIMATION_SEQUENCES = {
     "idle": ("idle", "idle", "idle", "blink", "idle", "idle"),
     "thinking": ("thinking", "thinking", "blink", "thinking"),
@@ -95,13 +194,26 @@ def walking_sprite_frame(animation_step):
 
 
 def walk_path(current, target):
-    """Route a walk corridor-style: cross the room first, then approach the spot."""
-    path = []
-    if abs(target[0] - current[0]) > 0.5:
-        path.append((target[0], current[1]))
-    if abs(target[1] - current[1]) > 0.5 or not path:
-        path.append(target)
-    return path
+    """Route a walk around the office furniture instead of through it."""
+    if path_is_clear(current, target):
+        return [target]
+    route = _grid_route(_nearest_walkable_cell(current), _nearest_walkable_cell(target))
+    if route is None:
+        return [target]
+    points = [_cell_center(cell) for cell in route] + [target]
+    smoothed = []
+    anchor = current
+    index = 0
+    while index < len(points):
+        farthest = index
+        for probe in range(len(points) - 1, index - 1, -1):
+            if path_is_clear(anchor, points[probe]):
+                farthest = probe
+                break
+        smoothed.append(points[farthest])
+        anchor = points[farthest]
+        index = farthest + 1
+    return smoothed
 
 
 def advance_along_path(position, path, step):
@@ -190,6 +302,9 @@ class VirtualOfficeDesktop:
         self.robot_sprite = None
         self.robot_sprites = self._load_robot_sprites()
         self.room_background = self._load_room_background()
+        self.room_source = self._load_room_source()
+        self.scaled_room = None
+        self.scaled_room_size = None
         sprite_assets = self._load_robot_sprite()
         if sprite_assets:
             self.robot_sprite_source, self.robot_sprite = sprite_assets
@@ -246,6 +361,28 @@ class VirtualOfficeDesktop:
             return tk.PhotoImage(file=str(OFFICE_ROOM_PATH))
         except tk.TclError:
             return None
+
+    @staticmethod
+    def _load_room_source():
+        """Keep the raw room photo around so Pillow can rescale it to any window size."""
+        if PILImage is None or not OFFICE_ROOM_PATH.exists():
+            return None
+        try:
+            return PILImage.open(OFFICE_ROOM_PATH).convert("RGB")
+        except OSError:
+            return None
+
+    def _room_background_for(self, width, height):
+        """Return the room photo at the requested size, rescaling and caching as needed."""
+        if self.room_background and (width, height) == (self.room_background.width(), self.room_background.height()):
+            return self.room_background
+        if self.room_source is None or width < 1 or height < 1:
+            return None
+        if self.scaled_room_size != (width, height):
+            resized = self.room_source.resize((width, height), PILImage.BILINEAR)
+            self.scaled_room = PILImageTk.PhotoImage(resized)
+            self.scaled_room_size = (width, height)
+        return self.scaled_room
 
     @staticmethod
     def _mirror_horizontally(image):
@@ -419,9 +556,10 @@ class VirtualOfficeDesktop:
 
     def _draw_room(self, left, top, right, bottom):
         canvas = self.canvas
-        room_width, room_height = right - left, bottom - top
-        if self.room_background and (room_width, room_height) == (self.room_background.width(), self.room_background.height()):
-            canvas.create_image(left, top, image=self.room_background, anchor="nw")
+        room_width, room_height = int(right - left), int(bottom - top)
+        background = self._room_background_for(room_width, room_height)
+        if background:
+            canvas.create_image(left, top, image=background, anchor="nw")
             canvas.create_rectangle(left, top, right, bottom, outline="#d1d9e3")
             return
         canvas.create_rectangle(left, top, right, bottom, fill="#f7f8fb", outline="#dce3ec")
