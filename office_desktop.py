@@ -41,6 +41,8 @@ ROBOT_SPRITE_DIRECTORY = Path(__file__).resolve().parent / "assets" / "office" /
 OFFICE_ROOM_PATH = Path(__file__).resolve().parent / "assets" / "office" / "office-room.png"
 SPRITE_FRAME_NAMES = ("idle", "blink", "thinking", "speaking")
 WALK_FRAME_NAMES = ("walk-1", "walk-2")
+WALK_SPEED = 9.0  # scene pixels moved per 32 ms animation frame
+STRIDE_LENGTH = 32.0  # scene pixels travelled before the feet swap
 STATUS_ANIMATION_SEQUENCES = {
     "idle": ("idle", "idle", "idle", "blink", "idle", "idle"),
     "thinking": ("thinking", "thinking", "blink", "thinking"),
@@ -90,6 +92,43 @@ def sprite_frame_for_status(status, animation_step):
 def walking_sprite_frame(animation_step):
     """Alternate feet while an agent is travelling to a new office zone."""
     return WALK_FRAME_NAMES[animation_step % len(WALK_FRAME_NAMES)]
+
+
+def walk_path(current, target):
+    """Route a walk corridor-style: cross the room first, then approach the spot."""
+    path = []
+    if abs(target[0] - current[0]) > 0.5:
+        path.append((target[0], current[1]))
+    if abs(target[1] - current[1]) > 0.5 or not path:
+        path.append(target)
+    return path
+
+
+def advance_along_path(position, path, step):
+    """Move a constant distance through the waypoints so the walking pace never drifts."""
+    x, y = position
+    remaining = list(path)
+    travelled = 0.0
+    while remaining and step > 0:
+        waypoint_x, waypoint_y = remaining[0]
+        dx, dy = waypoint_x - x, waypoint_y - y
+        distance = math.hypot(dx, dy)
+        if distance <= step:
+            x, y = waypoint_x, waypoint_y
+            travelled += distance
+            step -= distance
+            remaining.pop(0)
+        else:
+            x += dx / distance * step
+            y += dy / distance * step
+            travelled += step
+            step = 0
+    return (x, y), remaining, travelled
+
+
+def seated_pose(zone, walking):
+    """Agents settle into their desk chair whenever they are at their workstation."""
+    return zone == "home" and not walking
 
 
 def scene_zone(key, status):
@@ -142,6 +181,9 @@ class VirtualOfficeDesktop:
         self.closed = False
         self.current_positions = {}
         self.target_positions = {}
+        self.paths = {}
+        self.facing = {}
+        self.walk_distance = {}
         self.motion_phase = 0.0
         self.transition_running = False
         self.robot_sprite_source = None
@@ -206,7 +248,17 @@ class VirtualOfficeDesktop:
             return None
 
     @staticmethod
-    def _load_robot_sprites():
+    def _mirror_horizontally(image):
+        """Build a left-facing copy of a walk frame; Tk flips with a negative subsample."""
+        try:
+            mirrored = tk.PhotoImage(width=image.width(), height=image.height())
+            mirrored.tk.call(mirrored, "copy", image, "-subsample", -1, 1)
+            return mirrored
+        except tk.TclError:
+            return None
+
+    @classmethod
+    def _load_robot_sprites(cls):
         """Load the colored animation frames; individual missing assets fall back safely."""
         sprites = {}
         for key in AGENT_COLORS:
@@ -219,23 +271,31 @@ class VirtualOfficeDesktop:
                     frames[frame_name] = tk.PhotoImage(file=str(path)).subsample(3, 3)
                 except tk.TclError:
                     continue
+            for frame_name in WALK_FRAME_NAMES:
+                frame = frames.get(frame_name)
+                if frame is not None:
+                    mirrored = cls._mirror_horizontally(frame)
+                    if mirrored is not None:
+                        frames[f"{frame_name}-left"] = mirrored
             if frames:
                 sprites[key] = frames
         return sprites
 
-    def _robot_sprite_for(self, key, status, walking=False):
+    def _robot_sprite_for(self, key, status, walking=False, facing=1, stride_step=0):
         frames = self.robot_sprites.get(key) or self.robot_sprites.get("general", {})
         if frames:
-            animation_step = int(self.motion_phase / 1.35)
-            frame_name = walking_sprite_frame(animation_step) if walking else sprite_frame_for_status(status, animation_step)
+            if walking:
+                frame_name = walking_sprite_frame(stride_step)
+                if facing < 0 and f"{frame_name}-left" in frames:
+                    frame_name = f"{frame_name}-left"
+            else:
+                frame_name = sprite_frame_for_status(status, int(self.motion_phase / 1.35))
             return frames.get(frame_name) or next(iter(frames.values()))
         return self.robot_sprite
 
     def _positioned_items(self, agents):
         targets = assign_scene_positions(agents)
         target_keys = set()
-        needs_transition = False
-        travel = {}
         for item in targets:
             key = item["key"]
             target_keys.add(key)
@@ -243,40 +303,47 @@ class VirtualOfficeDesktop:
             current = self.current_positions.get(key)
             if current is None:
                 self.current_positions[key] = target
-                travel[key] = False
-            elif abs(current[0] - target[0]) > 0.5 or abs(current[1] - target[1]) > 0.5:
-                needs_transition = True
-                travel[key] = True
-            else:
-                travel[key] = False
+                self.paths[key] = []
+            elif self.target_positions.get(key) != target:
+                self.paths[key] = walk_path(current, target)
             self.target_positions[key] = target
-        self.current_positions = {key: value for key, value in self.current_positions.items() if key in target_keys}
-        self.target_positions = {key: value for key, value in self.target_positions.items() if key in target_keys}
-        if needs_transition and not self.transition_running:
+        for attribute in ("current_positions", "target_positions", "paths", "facing", "walk_distance"):
+            store = getattr(self, attribute)
+            setattr(self, attribute, {key: value for key, value in store.items() if key in target_keys})
+        if any(self.paths.values()) and not self.transition_running:
             self.transition_running = True
             self.root.after(32, self._animate_positions)
-        return [
-            {
+        placed = []
+        for item in targets:
+            key = item["key"]
+            walking = bool(self.paths.get(key))
+            placed.append({
                 **item,
-                "x": self.current_positions[item["key"]][0],
-                "y": self.current_positions[item["key"]][1],
-                "walking": travel[item["key"]],
-            }
-            for item in targets
-        ]
+                "x": self.current_positions[key][0],
+                "y": self.current_positions[key][1],
+                "walking": walking,
+                "seated": seated_pose(item["zone"], walking),
+                "facing": self.facing.get(key, 1),
+            })
+        return placed
 
     def _animate_positions(self):
         if self.closed:
             return
         moving = False
-        for key, target in self.target_positions.items():
-            current = self.current_positions[key]
-            dx, dy = target[0] - current[0], target[1] - current[1]
-            if abs(dx) <= 0.5 and abs(dy) <= 0.5:
-                self.current_positions[key] = target
+        for key, path in self.paths.items():
+            if not path:
                 continue
-            self.current_positions[key] = (current[0] + dx * 0.22, current[1] + dy * 0.22)
-            moving = True
+            current = self.current_positions[key]
+            heading = path[0][0] - current[0]
+            if abs(heading) > 0.5:
+                self.facing[key] = 1 if heading > 0 else -1
+            position, remaining, travelled = advance_along_path(current, path, WALK_SPEED)
+            self.current_positions[key] = position
+            self.paths[key] = remaining
+            self.walk_distance[key] = self.walk_distance.get(key, 0.0) + travelled
+            if remaining:
+                moving = True
         self.render()
         if moving:
             self.root.after(32, self._animate_positions)
@@ -452,38 +519,92 @@ class VirtualOfficeDesktop:
     def _draw_agents(self, scene, placed):
         left, top, right, bottom = scene
         scale_x, scale_y = (right - left) / 1000, (bottom - top) / 650
-        for item in placed:
+        for index, item in enumerate(placed):
+            if item.get("seated"):
+                continue
+            home_x, home_y = home_position(item["key"], index)
+            self._draw_empty_workstation(left + home_x * scale_x, top + home_y * scale_y)
+        for item in sorted(placed, key=lambda entry: entry["y"]):
             x, y = left + item["x"] * scale_x, top + item["y"] * scale_y
             self._draw_agent(x, y, item)
 
     def _draw_agent(self, x, y, item):
         canvas = self.canvas
         agent, status, key = item["agent"], item["status"], item["key"]
-        walking = item.get("walking", False)
+        walking, seated, facing = item.get("walking", False), item.get("seated", False), item.get("facing", 1)
         color = agent_color(key)
         status_color = STATUS_COLORS.get(status, STATUS_COLORS["idle"])
         active = status in {"thinking", "speaking", "delegated"}
         phase = self.motion_phase + sum(ord(char) for char in key) * 0.08
-        bob = math.sin(phase) * (2 if walking else 3 if status == "speaking" else 2 if active else 0)
-        y += bob
-        pulse = 1.0 + (math.sin(phase) + 1) * 0.8 if active else 1.0
-        canvas.create_oval(x - 42, y + 25, x + 42, y + 43, fill="#c8d0da", outline="")
-        canvas.create_oval(x - 41, y - 60, x + 41, y + 31, fill=color, outline="")
-        sprite = self._robot_sprite_for(key, status, walking)
-        if sprite:
-            canvas.create_image(x, y + 36, image=sprite, anchor="s")
+        stride_progress = self.walk_distance.get(key, 0.0) / STRIDE_LENGTH
+        sprite_bob = 0.0
+        if walking:
+            y -= abs(math.sin(stride_progress * math.pi)) * 3.0
+        elif seated:
+            y += 12
+            sprite_bob = math.sin(phase * 2.2) * 0.9
         else:
-            canvas.create_oval(x - 16, y - 32, x + 16, y, fill=color, outline="#344152", width=1)
-            canvas.create_oval(x - 22, y - 4, x + 22, y + 34, fill=color, outline="#344152", width=1)
-            canvas.create_rectangle(x - 10, y - 21, x + 12, y - 10, fill="#233141", outline="", width=0)
+            y += math.sin(phase) * (3 if status == "speaking" else 2 if active else 0)
+        pulse = 1.0 + (math.sin(phase) + 1) * 0.8 if active else 1.0
+        if seated:
+            self._draw_chair(x, y)
+        elif walking:
+            canvas.create_oval(x - 26, y + 30, x + 26, y + 42, fill="#c8d0da", outline="")
+        else:
+            canvas.create_oval(x - 42, y + 25, x + 42, y + 43, fill="#c8d0da", outline="")
+            canvas.create_oval(x - 41, y - 60, x + 41, y + 31, fill=color, outline="")
+        sprite = self._robot_sprite_for(key, status, walking=walking, facing=facing, stride_step=int(stride_progress))
+        if sprite:
+            canvas.create_image(x, y + 36 + sprite_bob, image=sprite, anchor="s")
+        else:
+            self._draw_vector_robot(x, y + sprite_bob, color, facing if walking else 1)
+        if seated:
+            self._draw_desk_front(x, y, phase)
         canvas.create_oval(x + 30 - pulse * 5, y - 61 - pulse * 5, x + 30 + pulse * 5, y - 61 + pulse * 5, fill=status_color, outline="#ffffff", width=2)
         self._rounded(canvas, x - 58, y + 49, x + 58, y + 78, 8, "#ffffff", "#dbe2eb")
         canvas.create_text(x, y + 58, text=_short(agent.get("name") or key, 17), fill="#263246", font=("Segoe UI", 8, "bold"))
         canvas.create_text(x, y + 69, text=status.upper(), fill=status_color, font=("Segoe UI", 7, "bold"))
         message = _short(agent.get("message"), 62)
-        if message:
+        if message and not walking:
             self._rounded(canvas, x + 32, y - 112, x + 175, y - 77, 8, "#ffffff", "#d9e1ea")
             canvas.create_text(x + 41, y - 95, anchor="w", width=124, text=message, fill="#38465a", font=("Segoe UI", 7))
+
+    def _draw_vector_robot(self, x, y, color, facing=1):
+        canvas = self.canvas
+        canvas.create_oval(x - 16, y - 32, x + 16, y, fill=color, outline="#344152", width=1)
+        canvas.create_oval(x - 22, y - 4, x + 22, y + 34, fill=color, outline="#344152", width=1)
+        visor_shift = 4 * facing
+        canvas.create_rectangle(x - 10 + visor_shift, y - 21, x + 12 + visor_shift, y - 10, fill="#233141", outline="", width=0)
+
+    def _draw_chair(self, x, y):
+        canvas = self.canvas
+        canvas.create_oval(x - 30, y + 22, x + 30, y + 44, fill="#c8d0da", outline="")
+        self._rounded(canvas, x - 48, y - 58, x + 48, y + 26, 16, "#4b586c", "#39465a")
+        canvas.create_rectangle(x - 4, y + 26, x + 4, y + 38, fill="#39465a", outline="")
+
+    def _draw_desk_front(self, x, y, phase):
+        """Occlude the seated agent's legs with their desk so they read as sitting and typing."""
+        canvas = self.canvas
+        top = y + 2
+        canvas.create_polygon(x - 58, top + 9, x - 42, top, x + 42, top, x + 58, top + 9, fill="#8b5f45", outline="#654330")
+        canvas.create_rectangle(x - 58, top + 9, x + 58, top + 44, fill="#704a38", outline="#5c3b2f")
+        canvas.create_line(x - 58, top + 16, x + 58, top + 16, fill="#5c3b2f")
+        canvas.create_polygon(x - 20, top + 1, x + 16, top + 1, x + 20, top - 21, x - 24, top - 21, fill="#2b3440", outline="#17202b")
+        glow = "#d7f0fa" if int(phase * 2) % 4 == 0 else "#9bd0e8"
+        canvas.create_rectangle(x - 22, top - 19, x + 18, top - 15, fill=glow, outline="")
+        lift = 2 if int(phase * 3) % 2 else 0
+        canvas.create_oval(x - 14, top - 3 - lift, x - 7, top + 4 - lift, fill="#e8edf3", outline="#b9c3d0")
+        canvas.create_oval(x + 2, top - 1 + lift, x + 9, top + 6 + lift, fill="#e8edf3", outline="#b9c3d0")
+        canvas.create_oval(x + 32, top + 2, x + 42, top + 9, fill="#f5f7fa", outline="#b9c3d0")
+
+    def _draw_empty_workstation(self, x, y):
+        """Keep every teammate's own desk visible while they are away from it."""
+        canvas = self.canvas
+        top = y + 14
+        self._rounded(canvas, x - 40, y - 30, x + 40, top + 20, 14, "#d3dae4", "#b8c2cf")
+        canvas.create_polygon(x - 58, top + 9, x - 42, top, x + 42, top, x + 58, top + 9, fill="#a17a5e", outline="#84604a")
+        canvas.create_rectangle(x - 58, top + 9, x + 58, top + 40, fill="#8b6650", outline="#755442")
+        canvas.create_polygon(x - 20, top + 1, x + 16, top + 1, x + 20, top - 21, x - 24, top - 21, fill="#3a4451", outline="#232c37")
 
     def _draw_console(self, left, top, right, bottom, agents):
         canvas = self.canvas
