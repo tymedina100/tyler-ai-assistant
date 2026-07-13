@@ -5,11 +5,14 @@ import os
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import office_state
 
 
 OFFICE_STATE_PATH = "/api/office-state"
+OFFICE_PAGE_PATHS = {"/", "/office", "/office3d"}
+OFFICE_PAGE_FILE = Path(__file__).resolve().parent / "assets" / "office" / "office3d.html"
 
 
 class OfficeAPIRequestHandler(BaseHTTPRequestHandler):
@@ -31,8 +34,26 @@ class OfficeAPIRequestHandler(BaseHTTPRequestHandler):
         expected = f"Bearer {self.api_token}"
         return hmac.compare_digest(authorization, expected)
 
+    def _send_office_page(self):
+        """Serve the 3D office viewer; the page is public, the state API stays token-gated."""
+        try:
+            body = OFFICE_PAGE_FILE.read_bytes()
+        except OSError:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Office page is not packaged"})
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path.split("?", 1)[0] != OFFICE_STATE_PATH:
+        path = self.path.split("?", 1)[0]
+        if path in OFFICE_PAGE_PATHS:
+            self._send_office_page()
+            return
+        if path != OFFICE_STATE_PATH:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
         if not self.headers.get("Authorization"):
