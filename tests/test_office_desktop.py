@@ -68,10 +68,35 @@ class OfficeDesktopLayoutTests(unittest.TestCase):
         self.assertEqual(office_desktop.walking_sprite_frame(1), "walk-2")
         self.assertEqual(office_desktop.walking_sprite_frame(2), "walk-1")
 
-    def test_walks_route_across_the_room_before_approaching_the_spot(self):
-        self.assertEqual(office_desktop.walk_path((100, 200), (400, 500)), [(400, 200), (400, 500)])
-        self.assertEqual(office_desktop.walk_path((100, 200), (100, 500)), [(100, 500)])
-        self.assertEqual(office_desktop.walk_path((100, 200), (400, 200)), [(400, 200)])
+    def test_unobstructed_walks_go_straight_to_the_spot(self):
+        self.assertEqual(office_desktop.walk_path((500, 500), (500, 600)), [(500, 600)])
+
+    def test_walks_detour_around_the_operations_desk(self):
+        start, target = (885, 355), (450, 232)
+        self.assertFalse(office_desktop.path_is_clear(start, target))
+        path = office_desktop.walk_path(start, target)
+        self.assertGreater(len(path), 1)
+        self.assertEqual(path[-1], target)
+        desk_rects = office_desktop.SCENE_OBSTACLES[:3]
+        anchor = start
+        for waypoint in path:
+            for step in range(1, 50):
+                x = anchor[0] + (waypoint[0] - anchor[0]) * step / 50
+                y = anchor[1] + (waypoint[1] - anchor[1]) * step / 50
+                inside_desk = any(x1 <= x <= x2 and y1 <= y <= y2 for x1, y1, x2, y2 in desk_rects)
+                self.assertFalse(inside_desk, f"walk crosses the operations desk at ({x:.0f}, {y:.0f})")
+            anchor = waypoint
+
+    def test_every_zone_is_reachable_from_every_workstation(self):
+        for slot in office_desktop.HOME_SLOTS:
+            for anchor in office_desktop.ZONE_ANCHORS.values():
+                path = office_desktop.walk_path(slot, anchor)
+                self.assertEqual(path[-1], anchor)
+
+    def test_furniture_blocks_points_and_the_floor_stays_walkable(self):
+        self.assertTrue(office_desktop.point_blocked(500, 320))  # operations desk
+        self.assertTrue(office_desktop.point_blocked(5, 5))  # off the floor
+        self.assertFalse(office_desktop.point_blocked(500, 500))  # open floor
 
     def test_agents_advance_at_a_constant_walking_speed(self):
         position, remaining, travelled = office_desktop.advance_along_path((0, 0), [(30, 0), (30, 40)], 9)
