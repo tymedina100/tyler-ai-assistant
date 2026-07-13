@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tyler AI Assistant — Virtual Office 3D</title>
+<style>
+  :root {
+    --panel: rgba(17, 24, 39, 0.78);
+    --panel-border: rgba(148, 163, 184, 0.25);
+    --text: #e5ecf5;
+    --muted: #94a3b8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b1020; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; color: var(--text); }
+  canvas { display: block; }
+  .chip {
+    position: absolute; display: flex; align-items: center; gap: 10px;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 14px; padding: 10px 16px; backdrop-filter: blur(10px);
+  }
+  #title-chip { top: 18px; left: 18px; flex-direction: column; align-items: flex-start; gap: 2px; }
+  #title-chip .kicker { font-size: 10px; font-weight: 700; letter-spacing: 2px; color: var(--muted); }
+  #title-chip .name { font-size: 20px; font-weight: 700; }
+  #connection-chip { top: 18px; right: 18px; font-size: 12px; font-weight: 600; }
+  #connection-dot { width: 9px; height: 9px; border-radius: 50%; background: #f7b844; }
+  #event-panel {
+    position: absolute; left: 18px; bottom: 18px; width: min(430px, 44vw);
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px;
+    padding: 14px 16px; backdrop-filter: blur(10px);
+  }
+  #event-panel h2 { font-size: 11px; letter-spacing: 2px; color: var(--muted); margin-bottom: 10px; }
+  .event-row { display: flex; align-items: baseline; gap: 8px; font-size: 12px; padding: 3px 0; }
+  .event-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; }
+  .event-agent { font-weight: 700; flex: none; }
+  .event-text { color: #c3cede; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .event-time { margin-left: auto; color: var(--muted); font-size: 10px; flex: none; }
+  #team-panel { position: absolute; right: 18px; bottom: 18px; display: flex; gap: 10px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px;
+    padding: 8px 14px; text-align: left; backdrop-filter: blur(10px); min-width: 74px;
+  }
+  .stat .label { font-size: 9px; font-weight: 700; letter-spacing: 1.5px; color: var(--muted); }
+  .stat .value { font-size: 18px; font-weight: 700; }
+  #hint { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+    font-size: 11px; color: var(--muted); background: var(--panel); border: 1px solid var(--panel-border);
+    padding: 6px 12px; border-radius: 999px; backdrop-filter: blur(10px); }
+  #token-modal {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(5, 8, 18, 0.72); backdrop-filter: blur(6px);
+  }
+  #token-modal .card {
+    background: #101a2e; border: 1px solid var(--panel-border); border-radius: 16px;
+    padding: 28px; width: 360px; display: flex; flex-direction: column; gap: 12px;
+  }
+  #token-modal h2 { font-size: 17px; }
+  #token-modal p { font-size: 12px; color: var(--muted); line-height: 1.5; }
+  #token-input {
+    background: #0b1322; color: var(--text); border: 1px solid #2b3a55; border-radius: 9px;
+    padding: 10px 12px; font-size: 13px; outline: none;
+  }
+  #token-input:focus { border-color: #5e7df6; }
+  #token-save {
+    background: #5e7df6; color: white; border: none; border-radius: 9px;
+    padding: 10px; font-size: 13px; font-weight: 700; cursor: pointer;
+  }
+  #token-save:hover { background: #4c6cf0; }
+  #demo-badge {
+    position: absolute; top: 78px; left: 18px; display: none; font-size: 10px; font-weight: 700;
+    letter-spacing: 1.5px; color: #f7b844; background: rgba(247, 184, 68, 0.12);
+    border: 1px solid rgba(247, 184, 68, 0.4); border-radius: 999px; padding: 5px 11px;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="title-chip" class="chip"><span class="kicker">TYLER AI ASSISTANT</span><span class="name">Virtual Office 3D</span></div>
+<div id="connection-chip" class="chip"><span id="connection-dot"></span><span id="connection-text">Connecting…</span></div>
+<div id="demo-badge">DEMO MODE</div>
+<div id="event-panel">
+  <h2>ACTIVITY CONSOLE</h2>
+  <div id="event-rows"><div class="event-row"><span class="event-text">Waiting for Telegram activity…</span></div></div>
+</div>
+<div id="team-panel">
+  <div class="stat"><div class="label">TEAM</div><div class="value" id="stat-team" style="color:#5e7df6">0</div></div>
+  <div class="stat"><div class="label">ACTIVE</div><div class="value" id="stat-active" style="color:#28b681">0</div></div>
+  <div class="stat"><div class="label">EVENTS</div><div class="value" id="stat-events" style="color:#f7b844">0</div></div>
+</div>
+<div id="hint">Drag to orbit &nbsp;·&nbsp; Scroll to zoom &nbsp;·&nbsp; Right-drag to pan</div>
+<div id="token-modal"><div class="card">
+  <h2>Connect to the office</h2>
+  <p>Paste the office API token (the value of <b>OFFICE_API_TOKEN</b> on Railway). It is stored only in this browser.</p>
+  <input id="token-input" type="password" placeholder="Office API token" autocomplete="off">
+  <button id="token-save">Enter the office</button>
+</div></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ------------------------------------------------------------------ *
+ * Shared layout contract — keep in sync with office_desktop.py.      *
+ * Scene space is 1000x650; 3D maps sceneX -> x-500, sceneY -> z-325. *
+ * ------------------------------------------------------------------ */
+const POLL_MS = 1500;
+const STATUS_COLORS = { idle: '#7a8799', thinking: '#f7b844', speaking: '#28b681', delegated: '#5e7df6', error: '#ef6461' };
+const AGENT_COLORS = {
+  manager: '#ff9d4d', code: '#3e8cff', research: '#48b78a', write: '#ad70e8',
+  task: '#ef7278', marketing: '#f7ba3f', editor: '#9a70d8', finance: '#4bb3c5',
+  calendar: '#f07898', gmail: '#ef8062', linear: '#6174e8', general: '#64748b',
+};
+const HOME_SLOTS = [
+  [150, 170], [300, 145], [700, 145], [850, 170],
+  [120, 360], [885, 355], [170, 505], [315, 535],
+  [680, 535], [835, 505], [440, 550], [560, 550],
+];
+const ZONE_ANCHORS = { planning: [500, 210], operations: [500, 392], response: [745, 432], support: [185, 280] };
+const ZONE_OFFSETS = [[0, 0], [-50, 22], [50, 22], [-78, 46], [78, 46], [0, 55]];
+const SCENE_BOUNDS = [35, 115, 965, 640];
+const OBSTACLE_MARGIN = 14;
+const GRID_CELL = 25;
+const WALK_SPEED = 280;      // scene units per second
+const STRIDE_LENGTH = 32;
+
+const SCENE_OBSTACLES = [
+  [300, 291, 700, 345],   // operations desk, back run
+  [300, 291, 460, 441],   // operations desk, left wing
+  [555, 291, 700, 441],   // operations desk, right wing
+  [50, 130, 205, 240],    // secure cabinet
+  [20, 545, 150, 645],    // lounge sofas
+  [730, 495, 850, 645],   // response podium console
+  ...HOME_SLOTS.map(([x, y]) => [x - 44, y + 2, x + 44, y + 52]),
+];
+
+function agentColor(key) { return AGENT_COLORS[key] || '#64748b'; }
+
+function sceneZone(key, status) {
+  if (status === 'error') return 'support';
+  if (key === 'manager' || status === 'delegated') return 'operations';
+  if (status === 'thinking') return 'planning';
+  if (status === 'speaking') return 'response';
+  return 'home';
+}
+
+function homePosition(key, index) {
+  const known = Object.keys(AGENT_COLORS).indexOf(key);
+  const slot = known >= 0 ? known : index;
+  return HOME_SLOTS[slot % HOME_SLOTS.length];
+}
+
+function assignScenePositions(agents) {
+  const placed = [];
+  const zoneCounts = { planning: 0, operations: 0, response: 0, support: 0 };
+  agents.forEach(([key, agent], index) => {
+    const status = agent.status || 'idle';
+    const zone = sceneZone(key, status);
+    let x, y;
+    if (zone === 'home') {
+      [x, y] = homePosition(key, index);
+    } else {
+      const [baseX, baseY] = ZONE_ANCHORS[zone];
+      const [offsetX, offsetY] = ZONE_OFFSETS[zoneCounts[zone] % ZONE_OFFSETS.length];
+      zoneCounts[zone] += 1;
+      x = baseX + offsetX; y = baseY + offsetY;
+    }
+    placed.push({ key, agent, status, zone, x, y });
+  });
+  return placed;
+}
+
+/* ----------------------- collision routing ----------------------- */
+function pointBlocked(x, y, margin = OBSTACLE_MARGIN) {
+  if (x < SCENE_BOUNDS[0] || x > SCENE_BOUNDS[2] || y < SCENE_BOUNDS[1] || y > SCENE_BOUNDS[3]) return true;
+  return SCENE_OBSTACLES.some(([x1, y1, x2, y2]) =>
+    x >= x1 - margin && x <= x2 + margin && y >= y1 - margin && y <= y2 + margin);
+}
+
+function pathIsClear(start, end) {
+  const distance = Math.hypot(end[0] - start[0], end[1] - start[1]);
+  const steps = Math.max(Math.floor(distance / 8), 1);
+  for (let step = 1; step < steps; step += 1) {
+    if (pointBlocked(start[0] + (end[0] - start[0]) * step / steps,
+                     start[1] + (end[1] - start[1]) * step / steps)) return false;
+  }
+  return true;
+}
+
+const GRID_COLUMNS = Math.floor((SCENE_BOUNDS[2] - SCENE_BOUNDS[0]) / GRID_CELL);
+const GRID_ROWS = Math.floor((SCENE_BOUNDS[3] - SCENE_BOUNDS[1]) / GRID_CELL);
+const cellCenter = ([cx, cy]) => [SCENE_BOUNDS[0] + (cx + 0.5) * GRID_CELL, SCENE_BOUNDS[1] + (cy + 0.5) * GRID_CELL];
+const WALKABLE_CELLS = [];
+const WALKABLE_SET = new Set();
+for (let row = 0; row < GRID_ROWS; row += 1) {
+  for (let column = 0; column < GRID_COLUMNS; column += 1) {
+    const [x, y] = cellCenter([column, row]);
+    if (!pointBlocked(x, y)) { WALKABLE_CELLS.push([column, row]); WALKABLE_SET.add(`${column},${row}`); }
+  }
+}
+
+function nearestWalkableCell(point) {
+  let best = null, bestDistance = Infinity;
+  for (const cell of WALKABLE_CELLS) {
+    const [x, y] = cellCenter(cell);
+    const d = (point[0] - x) ** 2 + (point[1] - y) ** 2;
+    if (d < bestDistance) { bestDistance = d; best = cell; }
+  }
+  return best;
+}
+
+function gridRoute(startCell, goalCell) {
+  const keyOf = (c) => `${c[0]},${c[1]}`;
+  if (keyOf(startCell) === keyOf(goalCell)) return [startCell];
+  const cameFrom = new Map([[keyOf(startCell), null]]);
+  const queue = [startCell];
+  const directions = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+  while (queue.length) {
+    const cell = queue.shift();
+    if (keyOf(cell) === keyOf(goalCell)) break;
+    for (const [dx, dy] of directions) {
+      const neighbor = [cell[0] + dx, cell[1] + dy];
+      const nk = keyOf(neighbor);
+      if (cameFrom.has(nk) || !WALKABLE_SET.has(nk)) continue;
+      if (dx && dy && !(WALKABLE_SET.has(`${cell[0] + dx},${cell[1]}`) && WALKABLE_SET.has(`${cell[0]},${cell[1] + dy}`))) continue;
+      cameFrom.set(nk, cell);
+      queue.push(neighbor);
+    }
+  }
+  if (!cameFrom.has(keyOf(goalCell))) return null;
+  const route = [goalCell];
+  while (cameFrom.get(keyOf(route[route.length - 1]))) route.push(cameFrom.get(keyOf(route[route.length - 1])));
+  return route.reverse();
+}
+
+function walkPath(current, target) {
+  if (pathIsClear(current, target)) return [target];
+  const route = gridRoute(nearestWalkableCell(current), nearestWalkableCell(target));
+  if (!route) return [target];
+  const points = route.map(cellCenter).concat([target]);
+  const smoothed = [];
+  let anchor = current, index = 0;
+  while (index < points.length) {
+    let farthest = index;
+    for (let probe = points.length - 1; probe >= index; probe -= 1) {
+      if (pathIsClear(anchor, points[probe])) { farthest = probe; break; }
+    }
+    smoothed.push(points[farthest]);
+    anchor = points[farthest];
+    index = farthest + 1;
+  }
+  return smoothed;
+}
+
+/* --------------------------- three.js setup --------------------------- */
+const toWorld = (sx, sy) => new THREE.Vector3(sx - 500, 0, sy - 325);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.25;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#101728');
+scene.fog = new THREE.Fog('#101728', 1500, 2600);
+
+const camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 1, 4000);
+camera.position.set(60, 620, 800);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 20, 30);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.maxPolarAngle = Math.PI * 0.46;
+controls.minDistance = 260;
+controls.maxDistance = 1600;
+
+scene.add(new THREE.HemisphereLight('#dbe8ff', '#9b8d7a', 1.25));
+const sun = new THREE.DirectionalLight('#fff4e0', 2.1);
+sun.position.set(420, 640, 260);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -700; sun.shadow.camera.right = 700;
+sun.shadow.camera.top = 700; sun.shadow.camera.bottom = -700;
+sun.shadow.camera.far = 2000;
+sun.shadow.bias = -0.0002;
+sun.shadow.normalBias = 3;
+scene.add(sun);
+const fillLight = new THREE.PointLight('#ffd9a0', 0.9, 1100);
+fillLight.position.set(0, 280, 100);
+scene.add(fillLight);
+const windowGlow = new THREE.PointLight('#bcd9ff', 0.5, 900);
+windowGlow.position.set(420, 180, 0);
+scene.add(windowGlow);
+
+/* --------------------------- materials --------------------------- */
+const WOOD = new THREE.MeshStandardMaterial({ color: '#8a6142', roughness: 0.62 });
+const WOOD_DARK = new THREE.MeshStandardMaterial({ color: '#6d4a33', roughness: 0.68 });
+const METAL = new THREE.MeshStandardMaterial({ color: '#9aa6b5', roughness: 0.35, metalness: 0.55 });
+const DARK_PANEL = new THREE.MeshStandardMaterial({ color: '#232c3a', roughness: 0.5 });
+const CHAIR_FABRIC = new THREE.MeshStandardMaterial({ color: '#3c4658', roughness: 0.85 });
+const SCREEN_ON = new THREE.MeshStandardMaterial({ color: '#0f1722', emissive: '#4fc3e8', emissiveIntensity: 0.9, roughness: 0.3 });
+const SCREEN_OFF = new THREE.MeshStandardMaterial({ color: '#141c28', emissive: '#1c2b3d', emissiveIntensity: 0.4, roughness: 0.3 });
+
+function box(width, height, depth, material, x, y, z, receive = true, cast = true) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, height, depth), material);
+  mesh.position.set(x, y, z);
+  mesh.castShadow = cast; mesh.receiveShadow = receive;
+  return mesh;
+}
+
+/* ----------------------------- the room ----------------------------- */
+function buildFloorTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 2048; canvas.height = 1332;
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#cfc1b0';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  for (let y = 0; y < canvas.height; y += 66) {   // wide, low-contrast oak planks
+    context.fillStyle = (y / 66) % 2 ? '#ccbdab' : '#d1c3b2';
+    context.fillRect(0, y, canvas.width, 66);
+  }
+  context.strokeStyle = 'rgba(104, 86, 66, 0.16)';
+  context.lineWidth = 2;
+  for (let x = 0; x < canvas.width; x += 256) { context.beginPath(); context.moveTo(x, 0); context.lineTo(x, canvas.height); context.stroke(); }
+  for (let y = 0; y < canvas.height; y += 266) { context.beginPath(); context.moveTo(0, y); context.lineTo(canvas.width, y); context.stroke(); }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return texture;
+}
+
+function buildRoom() {
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(1000, 650),
+    new THREE.MeshStandardMaterial({ map: buildFloorTexture(), roughness: 0.8 }));
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  // keep the plinth top below the floor plane to avoid coplanar z-fighting
+  const plinth = box(1040, 24, 690, new THREE.MeshStandardMaterial({ color: '#3a4250', roughness: 0.9 }), 0, -12.8, 0);
+  scene.add(plinth);
+
+  const wallMaterial = new THREE.MeshStandardMaterial({ color: '#e8e2d6', roughness: 0.9 });
+  const accentMaterial = new THREE.MeshStandardMaterial({ color: '#31435c', roughness: 0.85 });
+  scene.add(box(1000, 250, 12, wallMaterial, 0, 125, -331, true, false));  // back wall
+  scene.add(box(12, 250, 650, accentMaterial, -506, 125, 0, true, false)); // left wall
+  scene.add(box(1000, 10, 12, DARK_PANEL, 0, 5, -330));                    // baseboards, proud of the wall
+  scene.add(box(12, 10, 650, DARK_PANEL, -505, 5, 0));
+
+  // glass curtain wall on the right with warm skyline glow
+  const glassMaterial = new THREE.MeshStandardMaterial({ color: '#9fd4e8', transparent: true, opacity: 0.16, roughness: 0.1 });
+  scene.add(box(10, 250, 650, glassMaterial, 506, 125, 0, false, false));
+  for (let z = -325; z <= 325; z += 130) scene.add(box(6, 250, 8, METAL, 506, 125, z, false, false));
+  scene.add(box(6, 6, 650, METAL, 506, 246, 0, false, false));
+  const skyline = new THREE.Mesh(new THREE.PlaneGeometry(900, 320),
+    new THREE.MeshBasicMaterial({ color: '#2c3d63', fog: false }));
+  skyline.position.set(760, 150, 0);
+  skyline.rotation.y = -Math.PI / 2;
+  scene.add(skyline);
+
+  // planning wall: big whiteboard with sticky notes
+  scene.add(box(390, 130, 6, new THREE.MeshStandardMaterial({ color: '#f7f9fb', roughness: 0.35 }), 0, 150, -323.5, true, false));
+  scene.add(box(400, 140, 4, WOOD_DARK, 0, 150, -326.4, true, false));
+  const noteColors = ['#f6d55c', '#f28b82', '#81c995', '#8ab4f8', '#f6d55c', '#d7aefb', '#81c995', '#f28b82'];
+  noteColors.forEach((color, index) => {
+    const note = box(26, 26, 2, new THREE.MeshStandardMaterial({ color, roughness: 0.6 }),
+      -160 + (index % 4) * 105 + (index * 7) % 22, 168 - Math.floor(index / 4) * 44, -320, false, false);
+    note.rotation.z = ((index * 37) % 10 - 5) * 0.02;
+    scene.add(note);
+  });
+
+  // wall clock + logo
+  const clock = new THREE.Mesh(new THREE.CylinderGeometry(16, 16, 4, 32), new THREE.MeshStandardMaterial({ color: '#f2f5f8' }));
+  clock.rotation.x = Math.PI / 2;
+  clock.position.set(320, 200, -324);
+  scene.add(clock);
+  scene.add(box(2.5, 11, 1, DARK_PANEL, 320, 203, -321));
+  scene.add(box(8, 2.5, 1, DARK_PANEL, 323, 200, -321));
+  scene.add(makeTextPlate('TYLER AI', '#5e7df6', 200, 46, -300, 210, -323));
+
+  // slim hanging light bars over the middle of the room
+  for (const x of [-260, 0, 260]) {
+    const housing = box(170, 5, 10, DARK_PANEL, x, 262, 60, false, false);
+    scene.add(housing);
+    scene.add(box(160, 1.6, 7, new THREE.MeshStandardMaterial({ color: '#fff6dd', emissive: '#fff6dd', emissiveIntensity: 1.6 }), x, 259, 60, false, false));
+    scene.add(box(1.6, 46, 1.6, DARK_PANEL, x - 70, 287, 60, false, false));
+    scene.add(box(1.6, 46, 1.6, DARK_PANEL, x + 70, 287, 60, false, false));
+  }
+}
+
+function makeTextPlate(text, color, width, height, x, y, z) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512; canvas.height = Math.round(512 * height / width);
+  const context = canvas.getContext('2d');
+  context.fillStyle = color;
+  context.font = `700 ${canvas.height * 0.62}px "Segoe UI", sans-serif`;
+  context.textAlign = 'center'; context.textBaseline = 'middle';
+  context.fillText(text, canvas.width / 2, canvas.height / 2);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const plate = new THREE.Mesh(new THREE.PlaneGeometry(width, height),
+    new THREE.MeshBasicMaterial({ map: texture, transparent: true }));
+  plate.position.set(x, y, z);
+  return plate;
+}
+
+function buildMonitor(parent, x, y, z, rotationY, on = true) {
+  const monitor = new THREE.Group();
+  monitor.add(box(34, 22, 2.5, DARK_PANEL, 0, 25, 0));
+  const screen = box(30, 18, 1, on ? SCREEN_ON.clone() : SCREEN_OFF, 0, 25, 1.6, false, false);
+  monitor.add(screen);
+  monitor.add(box(3, 12, 3, METAL, 0, 8, -0.5));
+  monitor.add(box(14, 2, 9, METAL, 0, 1.5, -0.5));
+  monitor.position.set(x, y, z);
+  monitor.rotation.y = rotationY;
+  parent.add(monitor);
+  return screen;
+}
+
+function buildChair(sceneX, sceneY, rotationY) {
+  // seat faces +z (toward the desk); the backrest sits behind the robot on -z
+  const chair = new THREE.Group();
+  chair.add(box(26, 3.5, 24, CHAIR_FABRIC, 0, 14, 0));
+  chair.add(box(26, 30, 3.5, CHAIR_FABRIC, 0, 30, -12));
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(2, 2, 12, 10), METAL);
+  stem.position.y = 7; chair.add(stem);
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(11, 11, 2, 14), METAL);
+  base.position.y = 1.4; base.castShadow = true; chair.add(base);
+  const position = toWorld(sceneX, sceneY);
+  chair.position.set(position.x, 0, position.z);
+  chair.rotation.y = rotationY;
+  scene.add(chair);
+  return chair;
+}
+
+const workstationScreens = [];
+function buildWorkstation(sceneX, sceneY) {
+  // desk footprint mirrors the collision rect: x±44, y+2..y+52
+  const center = toWorld(sceneX, sceneY + 27);
+  const desk = new THREE.Group();
+  desk.add(box(88, 4, 50, WOOD, 0, 28, 0));
+  desk.add(box(84, 26, 4, WOOD_DARK, 0, 14, 21));            // modesty panel
+  desk.add(box(4, 28, 46, WOOD_DARK, -41, 14, 0));
+  desk.add(box(4, 28, 46, WOOD_DARK, 41, 14, 0));
+  desk.add(box(24, 2, 10, DARK_PANEL, -6, 30.6, -12));       // keyboard
+  const mug = new THREE.Mesh(new THREE.CylinderGeometry(3.4, 3, 6, 12),
+    new THREE.MeshStandardMaterial({ color: '#f5f7fa', roughness: 0.4 }));
+  mug.position.set(28, 33.5, -8); mug.castShadow = true;
+  desk.add(mug);
+  desk.position.set(center.x, 0, center.z);
+  scene.add(desk);
+  // monitor sits on the desk facing the seat (which is north of the desk)
+  workstationScreens.push(buildMonitor(desk, 0, 30, 6, Math.PI));
+  buildChair(sceneX, sceneY, 0);   // chair back faces south, agent faces the desk
+}
+
+function buildOperationsDesk() {
+  const parts = [
+    [300, 291, 700, 345],
+    [300, 291, 460, 441],
+    [555, 291, 700, 441],
+  ];
+  for (const [x1, y1, x2, y2] of parts) {
+    const center = toWorld((x1 + x2) / 2, (y1 + y2) / 2);
+    scene.add(box(x2 - x1, 4, y2 - y1, WOOD, center.x, 30, center.z));
+    scene.add(box(x2 - x1 - 6, 28, y2 - y1 - 6, WOOD_DARK, center.x, 15, center.z));
+  }
+  for (const sceneX of [360, 460, 560, 660]) {
+    const spot = toWorld(sceneX, 318);
+    buildMonitor(scene, spot.x, 32, spot.z, 0);
+  }
+  const rug = new THREE.Mesh(new THREE.CircleGeometry(150, 40),
+    new THREE.MeshStandardMaterial({ color: '#41537a', roughness: 0.95 }));
+  rug.rotation.x = -Math.PI / 2;
+  const rugSpot = toWorld(500, 400);
+  rug.position.set(rugSpot.x, 0.4, rugSpot.z);
+  rug.receiveShadow = true;
+  scene.add(rug);
+}
+
+function buildLounge() {
+  const sofaMaterial = new THREE.MeshStandardMaterial({ color: '#3f6259', roughness: 0.9 });
+  const cushionMaterial = new THREE.MeshStandardMaterial({ color: '#dcb46a', roughness: 0.9 });
+  const spot = toWorld(85, 595);
+  const sofa = new THREE.Group();
+  sofa.add(box(110, 18, 44, sofaMaterial, 0, 9, 0));
+  sofa.add(box(110, 26, 10, sofaMaterial, 0, 26, -19));
+  sofa.add(box(10, 26, 44, sofaMaterial, -52, 20, 0));
+  sofa.add(box(10, 26, 44, sofaMaterial, 52, 20, 0));
+  sofa.add(box(24, 8, 24, cushionMaterial, -22, 22, -8));
+  sofa.add(box(24, 8, 24, cushionMaterial, 22, 22, -8));
+  sofa.position.set(spot.x, 0, spot.z);
+  sofa.rotation.y = 0.5;
+  scene.add(sofa);
+  const tableSpot = toWorld(160, 615);
+  const table = new THREE.Mesh(new THREE.CylinderGeometry(20, 20, 3, 20), WOOD);
+  table.position.set(tableSpot.x, 18, tableSpot.z); table.castShadow = true;
+  scene.add(table);
+  const leg = new THREE.Mesh(new THREE.CylinderGeometry(2.4, 2.4, 17, 10), METAL);
+  leg.position.set(tableSpot.x, 8.5, tableSpot.z);
+  scene.add(leg);
+}
+
+function buildSecureCabinet() {
+  const center = toWorld(127, 185);
+  const cabinet = new THREE.Group();
+  cabinet.add(box(150, 110, 105, new THREE.MeshStandardMaterial({ color: '#5b6675', roughness: 0.45, metalness: 0.35 }), 0, 55, 0));
+  const dial = new THREE.Mesh(new THREE.CylinderGeometry(16, 16, 6, 24),
+    new THREE.MeshStandardMaterial({ color: '#37404d', roughness: 0.35, metalness: 0.5 }));
+  dial.rotation.x = Math.PI / 2;
+  dial.position.set(0, 58, 56);
+  cabinet.add(dial);
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(5, 5, 8, 16), METAL);
+  hub.rotation.x = Math.PI / 2;
+  hub.position.set(0, 58, 59);
+  cabinet.add(hub);
+  cabinet.add(box(120, 3, 2, METAL, 0, 22, 53.5));
+  cabinet.position.set(center.x, 0, center.z);
+  scene.add(cabinet);
+}
+
+function buildPodium() {
+  const center = toWorld(790, 570);
+  const podium = new THREE.Group();
+  podium.add(box(110, 60, 140, new THREE.MeshStandardMaterial({ color: '#8d99a8', roughness: 0.5 }), 0, 30, 0));
+  const screenTilt = new THREE.Group();
+  screenTilt.add(box(86, 52, 4, DARK_PANEL, 0, 0, 0));
+  screenTilt.add(box(78, 44, 1.5, SCREEN_ON.clone(), 0, 0, 2.6, false, false));
+  screenTilt.position.set(0, 68, -20);
+  screenTilt.rotation.x = -0.5;
+  podium.add(screenTilt);
+  podium.position.set(center.x, 0, center.z);
+  scene.add(podium);
+}
+
+function buildPlant(sceneX, sceneY, scale = 1) {
+  const spot = toWorld(sceneX, sceneY);
+  const plant = new THREE.Group();
+  const pot = new THREE.Mesh(new THREE.CylinderGeometry(11, 8, 16, 14),
+    new THREE.MeshStandardMaterial({ color: '#b8977a', roughness: 0.8 }));
+  pot.position.y = 8; pot.castShadow = true;
+  plant.add(pot);
+  const leafMaterial = new THREE.MeshStandardMaterial({ color: '#4d8e58', roughness: 0.85 });
+  [[0, 30, 0, 13], [-8, 24, 5, 9], [8, 25, -5, 10], [3, 38, 3, 8]].forEach(([x, y, z, r]) => {
+    const leaf = new THREE.Mesh(new THREE.SphereGeometry(r, 12, 10), leafMaterial);
+    leaf.position.set(x, y, z); leaf.castShadow = true;
+    plant.add(leaf);
+  });
+  plant.scale.setScalar(scale);
+  plant.position.set(spot.x, 0, spot.z);
+  scene.add(plant);
+}
+
+function buildZoneMarker(sceneX, sceneY, label, color) {
+  const spot = toWorld(sceneX, sceneY);
+  const ring = new THREE.Mesh(new THREE.RingGeometry(52, 56, 48),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.32, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.set(spot.x, 0.8, spot.z);
+  scene.add(ring);
+  const sprite = makeLabelSprite(label, color, true);
+  sprite.position.set(spot.x, 4, spot.z + 62);
+  sprite.scale.set(88, 20, 1);
+  scene.add(sprite);
+}
+
+buildRoom();
+buildOperationsDesk();
+HOME_SLOTS.forEach(([x, y]) => buildWorkstation(x, y));
+buildLounge();
+buildSecureCabinet();
+buildPodium();
+buildPlant(255, 585); buildPlant(940, 240, 1.2); buildPlant(60, 420, 0.9); buildPlant(945, 615, 1.1);
+buildZoneMarker(500, 235, 'PLANNING', '#f7b844');
+buildZoneMarker(500, 400, 'OPERATIONS', '#5e7df6');
+buildZoneMarker(760, 440, 'RESPONSE', '#28b681');
+buildZoneMarker(185, 292, 'SUPPORT', '#ef6461');
+
+/* ----------------------------- labels ----------------------------- */
+function makeLabelSprite(text, color, plain = false) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512; canvas.height = 128;
+  const context = canvas.getContext('2d');
+  if (!plain) {
+    context.fillStyle = 'rgba(13, 20, 34, 0.82)';
+    roundRect(context, 6, 14, 500, 100, 26);
+    context.fill();
+  }
+  context.fillStyle = color;
+  context.font = '700 52px "Segoe UI", sans-serif';
+  context.textAlign = 'center'; context.textBaseline = 'middle';
+  context.fillText(text, 256, 64);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false }));
+  return sprite;
+}
+
+function roundRect(context, x, y, width, height, radius) {
+  context.beginPath();
+  context.moveTo(x + radius, y);
+  context.arcTo(x + width, y, x + width, y + height, radius);
+  context.arcTo(x + width, y + height, x, y + height, radius);
+  context.arcTo(x, y + height, x, y, radius);
+  context.arcTo(x, y, x + width, y, radius);
+  context.closePath();
+}
+
+function drawAgentLabel(canvas, name, status, message) {
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  const statusColor = STATUS_COLORS[status] || STATUS_COLORS.idle;
+  context.fillStyle = 'rgba(13, 20, 34, 0.85)';
+  roundRect(context, 40, 96, 432, 116, 30);
+  context.fill();
+  context.strokeStyle = 'rgba(148, 163, 184, 0.4)';
+  context.lineWidth = 3;
+  roundRect(context, 40, 96, 432, 116, 30);
+  context.stroke();
+  context.fillStyle = '#eef3fa';
+  context.font = '700 54px "Segoe UI", sans-serif';
+  context.textAlign = 'center';
+  context.fillText(name, 256, 152);
+  context.fillStyle = statusColor;
+  context.font = '700 36px "Segoe UI", sans-serif';
+  context.fillText(status.toUpperCase(), 256, 196);
+  if (message) {
+    context.fillStyle = 'rgba(246, 249, 253, 0.95)';
+    roundRect(context, 10, 6, 492, 74, 24);
+    context.fill();
+    context.fillStyle = '#2a3a52';
+    context.font = '500 34px "Segoe UI", sans-serif';
+    const shortened = message.length > 30 ? message.slice(0, 29).trimEnd() + '…' : message;
+    context.fillText(shortened, 256, 52);
+  }
+}
+
+/* ----------------------------- the robots ----------------------------- */
+class Robot {
+  constructor(key, name) {
+    this.key = key;
+    this.status = 'idle';
+    this.zone = 'home';
+    this.message = '';
+    this.name = name || key;
+    this.scenePosition = null;
+    this.target = null;
+    this.path = [];
+    this.walkDistance = 0;
+    this.heading = 0;
+    this.group = new THREE.Group();
+
+    const color = agentColor(key);
+    const bodyMaterial = new THREE.MeshStandardMaterial({ color, roughness: 0.38, metalness: 0.12 });
+    const jointMaterial = new THREE.MeshStandardMaterial({ color: '#2d3745', roughness: 0.5 });
+
+    this.hips = new THREE.Group();
+    this.hips.position.y = 20;
+    this.group.add(this.hips);
+
+    this.legs = [];
+    for (const side of [-1, 1]) {
+      const leg = new THREE.Group();
+      leg.position.set(side * 6.5, 0, 0);
+      const limb = new THREE.Mesh(new THREE.CapsuleGeometry(4, 11, 6, 12), bodyMaterial);
+      limb.position.y = -10; limb.castShadow = true;
+      const foot = new THREE.Mesh(new THREE.BoxGeometry(8, 4, 12), jointMaterial);
+      foot.position.set(0, -18, 2); foot.castShadow = true;
+      leg.add(limb); leg.add(foot);
+      this.hips.add(leg);
+      this.legs.push(leg);
+    }
+
+    this.torso = new THREE.Group();
+    this.torso.position.y = 14;
+    this.hips.add(this.torso);
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(13, 12, 8, 18), bodyMaterial);
+    body.castShadow = true;
+    this.torso.add(body);
+    const chest = new THREE.Mesh(new THREE.BoxGeometry(12, 7, 2), jointMaterial);
+    chest.position.set(0, 2, 12.6);
+    this.torso.add(chest);
+
+    this.arms = [];
+    for (const side of [-1, 1]) {
+      const arm = new THREE.Group();
+      arm.position.set(side * 15, 7, 0);
+      const limb = new THREE.Mesh(new THREE.CapsuleGeometry(3.6, 12, 6, 12), bodyMaterial);
+      limb.position.y = -8; limb.castShadow = true;
+      const hand = new THREE.Mesh(new THREE.SphereGeometry(4.4, 12, 10), jointMaterial);
+      hand.position.y = -17;
+      limb.castShadow = true;
+      arm.add(limb); arm.add(hand);
+      this.torso.add(arm);
+      this.arms.push(arm);
+    }
+
+    this.head = new THREE.Group();
+    this.head.position.y = 28;
+    this.torso.add(this.head);
+    const skull = new THREE.Mesh(new THREE.SphereGeometry(11.5, 20, 16), bodyMaterial);
+    skull.castShadow = true;
+    this.head.add(skull);
+    const visor = new THREE.Mesh(new THREE.SphereGeometry(9.4, 18, 14), new THREE.MeshStandardMaterial({ color: '#101823', roughness: 0.25 }));
+    visor.scale.set(1, 0.72, 0.62);
+    visor.position.set(0, 0.5, 5.4);
+    this.head.add(visor);
+    for (const side of [-1, 1]) {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(1.8, 10, 8),
+        new THREE.MeshStandardMaterial({ color: '#9beaff', emissive: '#7ef0ff', emissiveIntensity: 1.4 }));
+      eye.position.set(side * 3.6, 1.2, 13.4);
+      this.head.add(eye);
+    }
+    const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 7, 8), jointMaterial);
+    antenna.position.y = 14;
+    this.head.add(antenna);
+    this.statusOrb = new THREE.Mesh(new THREE.SphereGeometry(3.2, 12, 10),
+      new THREE.MeshStandardMaterial({ color: STATUS_COLORS.idle, emissive: STATUS_COLORS.idle, emissiveIntensity: 0.9 }));
+    this.statusOrb.position.y = 19;
+    this.head.add(this.statusOrb);
+
+    this.speakRing = new THREE.Mesh(new THREE.RingGeometry(16, 19, 36),
+      new THREE.MeshBasicMaterial({ color: STATUS_COLORS.speaking, transparent: true, opacity: 0, side: THREE.DoubleSide }));
+    this.speakRing.rotation.x = -Math.PI / 2;
+    this.speakRing.position.y = 0.9;
+    this.group.add(this.speakRing);
+
+    this.thoughtDots = new THREE.Group();
+    for (let index = 0; index < 3; index += 1) {
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(1.9 + index * 0.7, 10, 8),
+        new THREE.MeshStandardMaterial({ color: '#f7f9fc', transparent: true, opacity: 0.9 }));
+      dot.position.set(9 + index * 5.5, 78 + index * 7, 0);
+      this.thoughtDots.add(dot);
+    }
+    this.thoughtDots.visible = false;
+    this.group.add(this.thoughtDots);
+
+    this.labelCanvas = document.createElement('canvas');
+    this.labelCanvas.width = 512; this.labelCanvas.height = 224;
+    drawAgentLabel(this.labelCanvas, this.name, 'idle', '');
+    this.labelTexture = new THREE.CanvasTexture(this.labelCanvas);
+    this.labelTexture.colorSpace = THREE.SRGBColorSpace;
+    this.label = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.labelTexture, transparent: true, depthWrite: false }));
+    this.label.scale.set(96, 42, 1);
+    this.label.position.y = 108;
+    this.group.add(this.label);
+
+    scene.add(this.group);
+  }
+
+  refreshLabel() {
+    drawAgentLabel(this.labelCanvas, this.name, this.status, this.message);
+    this.labelTexture.needsUpdate = true;
+  }
+
+  setScenePosition(sceneX, sceneY) {
+    this.scenePosition = [sceneX, sceneY];
+    const spot = toWorld(sceneX, sceneY);
+    this.group.position.x = spot.x;
+    this.group.position.z = spot.z;
+  }
+
+  retarget(placement) {
+    const changed = this.status !== placement.status || this.name !== (placement.agent.name || this.key)
+      || this.message !== (placement.agent.message || '');
+    this.status = placement.status;
+    this.zone = placement.zone;
+    this.name = placement.agent.name || this.key;
+    this.message = placement.agent.message || '';
+    if (changed) this.refreshLabel();
+    const target = [placement.x, placement.y];
+    if (!this.scenePosition) {
+      this.setScenePosition(target[0], target[1]);
+      this.target = target;
+      return;
+    }
+    if (!this.target || this.target[0] !== target[0] || this.target[1] !== target[1]) {
+      this.target = target;
+      this.path = walkPath(this.scenePosition, target);
+    }
+  }
+
+  get walking() { return this.path.length > 0; }
+  get seated() { return this.zone === 'home' && !this.walking; }
+
+  advance(dt) {
+    if (!this.walking) return;
+    let step = WALK_SPEED * dt;
+    let [x, y] = this.scenePosition;
+    while (this.path.length && step > 0) {
+      const [wx, wy] = this.path[0];
+      const dx = wx - x, dy = wy - y;
+      const distance = Math.hypot(dx, dy);
+      if (distance > 1) this.heading = Math.atan2(dx, dy);
+      if (distance <= step) {
+        x = wx; y = wy;
+        step -= distance;
+        this.walkDistance += distance;
+        this.path.shift();
+      } else {
+        x += dx / distance * step;
+        y += dy / distance * step;
+        this.walkDistance += step;
+        step = 0;
+      }
+    }
+    this.setScenePosition(x, y);
+  }
+
+  pose(time) {
+    const active = this.status === 'thinking' || this.status === 'speaking' || this.status === 'delegated';
+    const phase = time * 2 + this.key.length;
+    const orbColor = new THREE.Color(STATUS_COLORS[this.status] || STATUS_COLORS.idle);
+    this.statusOrb.material.color.copy(orbColor);
+    this.statusOrb.material.emissive.copy(orbColor);
+    this.statusOrb.material.emissiveIntensity = active ? 1.2 + Math.sin(phase * 2.4) * 0.5 : 0.7;
+    this.statusOrb.scale.setScalar(active ? 1 + Math.sin(phase * 2.4) * 0.22 : 1);
+
+    this.thoughtDots.visible = this.status === 'thinking' || this.status === 'delegated';
+    if (this.thoughtDots.visible) {
+      this.thoughtDots.children.forEach((dot, index) => {
+        dot.position.y = 78 + index * 7 + Math.sin(phase * 1.6 + index) * 2.2;
+        dot.material.opacity = 0.55 + Math.sin(phase * 1.6 + index) * 0.35;
+      });
+    }
+
+    const speaking = this.status === 'speaking';
+    if (speaking) {
+      const pulse = (time % 1.4) / 1.4;
+      this.speakRing.material.opacity = 0.55 * (1 - pulse);
+      this.speakRing.scale.setScalar(1 + pulse * 1.6);
+    } else {
+      this.speakRing.material.opacity = 0;
+    }
+
+    if (this.status === 'error') {
+      this.group.position.y = Math.sin(time * 40) * 0.7;
+      this.statusOrb.material.emissiveIntensity = 1.4 + Math.sin(time * 18) * 0.8;
+    } else {
+      this.group.position.y = 0;
+    }
+
+    if (this.walking) {
+      const stride = (this.walkDistance / STRIDE_LENGTH) * Math.PI;
+      this.group.rotation.y = dampAngle(this.group.rotation.y, this.heading, 12, 1 / 60);
+      this.hips.position.y = 20 + Math.abs(Math.sin(stride)) * 2.4;
+      this.legs[0].rotation.x = Math.sin(stride) * 0.7;
+      this.legs[1].rotation.x = -Math.sin(stride) * 0.7;
+      this.arms[0].rotation.x = -Math.sin(stride) * 0.55;
+      this.arms[1].rotation.x = Math.sin(stride) * 0.55;
+      this.torso.rotation.x = 0.08;
+      this.torso.rotation.y = Math.sin(stride) * 0.05;
+    } else if (this.seated) {
+      this.group.rotation.y = dampAngle(this.group.rotation.y, 0, 8, 1 / 60);
+      this.hips.position.y = 17.5;
+      this.legs[0].rotation.x = 1.45;
+      this.legs[1].rotation.x = 1.45;
+      this.arms[0].rotation.x = 0.85 + Math.sin(phase * 5) * 0.07;
+      this.arms[1].rotation.x = 0.85 - Math.sin(phase * 5) * 0.07;
+      this.torso.rotation.x = 0.12;
+      this.torso.rotation.y = 0;
+      this.torso.position.y = 14 + Math.sin(phase * 2.2) * 0.35;
+    } else {
+      this.group.rotation.y = dampAngle(this.group.rotation.y, 0, 6, 1 / 60);
+      this.hips.position.y = 20 + (active ? Math.sin(phase) * 1.6 : 0);
+      this.legs[0].rotation.x = 0;
+      this.legs[1].rotation.x = 0;
+      this.arms[0].rotation.x = active ? Math.sin(phase) * 0.18 : 0;
+      this.arms[1].rotation.x = active ? -Math.sin(phase) * 0.18 : 0;
+      this.torso.rotation.x = 0;
+      this.torso.rotation.y = 0;
+      this.torso.position.y = 14;
+    }
+  }
+
+  dispose() {
+    scene.remove(this.group);
+  }
+}
+
+function dampAngle(current, target, lambda, dt) {
+  let delta = ((target - current + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+  return current + delta * Math.min(1, lambda * dt);
+}
+
+/* --------------------------- live state --------------------------- */
+const robots = new Map();
+let latestState = { agents: {}, events: [] };
+
+function applyState(state) {
+  latestState = state;
+  const agents = Object.entries(state.agents || {});
+  const placements = assignScenePositions(agents);
+  const seen = new Set();
+  for (const placement of placements) {
+    seen.add(placement.key);
+    if (!robots.has(placement.key)) robots.set(placement.key, new Robot(placement.key, placement.agent.name));
+    robots.get(placement.key).retarget(placement);
+  }
+  for (const [key, robot] of robots) {
+    if (!seen.has(key)) { robot.dispose(); robots.delete(key); }
+  }
+  renderPanels(state, agents);
+}
+
+function renderPanels(state, agents) {
+  const events = (state.events || []).slice(0, 5);
+  const rows = events.map((event) => {
+    const kind = event.kind || 'activity';
+    const dot = kind === 'error' ? '#ef6461' : kind === 'message' ? '#f7b844' : '#28b681';
+    const agentKey = event.agent_key || 'Telegram';
+    const label = agentKey.charAt(0).toUpperCase() + agentKey.slice(1);
+    return `<div class="event-row"><span class="event-dot" style="background:${dot}"></span>` +
+      `<span class="event-agent" style="color:${agentColor(event.agent_key)}">${escapeHtml(label)}</span>` +
+      `<span class="event-text">${escapeHtml(event.text || '')}</span>` +
+      `<span class="event-time">${eventTime(event.timestamp)}</span></div>`;
+  });
+  document.getElementById('event-rows').innerHTML = rows.join('') ||
+    '<div class="event-row"><span class="event-text">Waiting for Telegram activity…</span></div>';
+  document.getElementById('stat-team').textContent = agents.length;
+  document.getElementById('stat-active').textContent = agents.filter(([, agent]) => (agent.status || 'idle') !== 'idle').length;
+  document.getElementById('stat-events').textContent = (state.events || []).length;
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function eventTime(value) {
+  try {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return 'now';
+    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  } catch { return 'now'; }
+}
+
+/* --------------------------- connection --------------------------- */
+const params = new URLSearchParams(location.search);
+const demoMode = params.get('demo') === '1';
+const connectionDot = document.getElementById('connection-dot');
+const connectionText = document.getElementById('connection-text');
+const tokenModal = document.getElementById('token-modal');
+
+function setConnection(color, text) {
+  connectionDot.style.background = color;
+  connectionText.textContent = text;
+}
+
+async function pollState() {
+  const token = localStorage.getItem('office_token') || '';
+  if (!token) { tokenModal.style.display = 'flex'; setConnection('#ef6461', 'Token needed'); return; }
+  try {
+    const response = await fetch('api/office-state', { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' });
+    if (response.status === 401 || response.status === 403) {
+      tokenModal.style.display = 'flex';
+      setConnection('#ef6461', 'Token rejected');
+      return;
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    tokenModal.style.display = 'none';
+    applyState(await response.json());
+    setConnection('#28b681', 'Live from Railway');
+  } catch {
+    setConnection('#f7b844', 'Reconnecting…');
+  }
+}
+
+document.getElementById('token-save').addEventListener('click', () => {
+  const value = document.getElementById('token-input').value.trim();
+  if (!value) return;
+  localStorage.setItem('office_token', value);
+  tokenModal.style.display = 'none';
+  pollState();
+});
+
+/* ----------------------------- demo mode ----------------------------- */
+const DEMO_ROSTER = {
+  manager: 'Miles', code: 'Coder', research: 'Scout', write: 'Writer', finance: 'Penny', marketing: 'Mara',
+};
+const DEMO_PHASES = [
+  { code: ['thinking', 'Refactoring the parser'], research: ['speaking', 'Found three qualified leads'], manager: ['delegated', 'Assigning the launch work'] },
+  { marketing: ['thinking', 'Drafting the campaign brief'], write: ['thinking', 'Outlining the newsletter'] },
+  { code: ['speaking', 'Deploy is green across the board'], finance: ['error', 'Stripe webhook failed twice'] },
+  {},
+];
+
+function demoState(phaseIndex) {
+  const phase = DEMO_PHASES[phaseIndex % DEMO_PHASES.length];
+  const agents = {};
+  for (const [key, name] of Object.entries(DEMO_ROSTER)) {
+    const [status, message] = phase[key] || ['idle', ''];
+    agents[key] = { name, status, message };
+  }
+  return {
+    agents,
+    events: [
+      { kind: 'message', agent_key: 'code', text: 'Deployed the new build to Railway', timestamp: new Date().toISOString() },
+      { kind: 'activity', agent_key: 'research', text: 'Scanned 14 subreddits for leads', timestamp: new Date(Date.now() - 240000).toISOString() },
+      { kind: 'error', agent_key: 'finance', text: 'Stripe webhook needs a retry', timestamp: new Date(Date.now() - 480000).toISOString() },
+    ],
+  };
+}
+
+if (demoMode) {
+  document.getElementById('demo-badge').style.display = 'block';
+  setConnection('#5e7df6', 'Demo activity');
+  let phase = 0;
+  applyState(demoState(phase));
+  setInterval(() => { phase += 1; applyState(demoState(phase)); }, 8000);
+} else {
+  pollState();
+  setInterval(pollState, POLL_MS);
+}
+
+/* ----------------------------- render loop ----------------------------- */
+const frameClock = new THREE.Clock();
+let renderPaused = false;
+window.__office = { renderer, scene, camera, setPaused: (value) => { renderPaused = Boolean(value); } };
+function animate() {
+  requestAnimationFrame(animate);
+  if (renderPaused) return;
+  const dt = Math.min(frameClock.getDelta(), 0.1);
+  const time = frameClock.elapsedTime;
+  for (const robot of robots.values()) {
+    robot.advance(dt);
+    robot.pose(time);
+  }
+  workstationScreens.forEach((screen, index) => {
+    screen.material.emissiveIntensity = 0.75 + Math.sin(time * 2.2 + index * 1.7) * 0.15;
+  });
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

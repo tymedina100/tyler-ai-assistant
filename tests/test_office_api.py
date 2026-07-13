@@ -54,6 +54,19 @@ class OfficeAPITests(unittest.TestCase):
             urlopen(url, timeout=3)
         self.assertEqual(result.exception.code, 404)
 
+    def test_3d_office_page_is_served_without_a_token(self):
+        base = f"http://127.0.0.1:{self.server.server_port}"
+        for path in ("/", "/office", "/office3d"):
+            with urlopen(base + path, timeout=3) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("text/html", response.headers.get("Content-Type", ""))
+            self.assertIn("Virtual Office 3D", body)
+            self.assertIn("three", body)
+
+    def test_3d_office_page_asset_is_packaged(self):
+        self.assertTrue(office_api.OFFICE_PAGE_FILE.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
