@@ -105,6 +105,8 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 /* ------------------------------------------------------------------ *
  * Shared layout contract — keep in sync with office_desktop.py.      *
@@ -267,12 +269,17 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.25;
+renderer.toneMappingExposure = 1.05;
 document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color('#101728');
-scene.fog = new THREE.Fog('#101728', 1500, 2600);
+scene.background = buildSkyGradientTexture();
+scene.fog = new THREE.Fog('#131b30', 1500, 2600);
+
+// image-based lighting so plastics and metals pick up soft studio reflections
+const pmremGenerator = new THREE.PMREMGenerator(renderer);
+scene.environment = pmremGenerator.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+pmremGenerator.dispose();
 
 const camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 1, 4000);
 camera.position.set(60, 620, 800);
@@ -284,8 +291,8 @@ controls.maxPolarAngle = Math.PI * 0.46;
 controls.minDistance = 260;
 controls.maxDistance = 1600;
 
-scene.add(new THREE.HemisphereLight('#dbe8ff', '#9b8d7a', 1.25));
-const sun = new THREE.DirectionalLight('#fff4e0', 2.1);
+scene.add(new THREE.HemisphereLight('#dbe8ff', '#9b8d7a', 0.55));
+const sun = new THREE.DirectionalLight('#fff4e0', 1.9);
 sun.position.set(420, 640, 260);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
@@ -295,7 +302,7 @@ sun.shadow.camera.far = 2000;
 sun.shadow.bias = -0.0002;
 sun.shadow.normalBias = 3;
 scene.add(sun);
-const fillLight = new THREE.PointLight('#ffd9a0', 0.9, 1100);
+const fillLight = new THREE.PointLight('#ffd9a0', 0.7, 1100);
 fillLight.position.set(0, 280, 100);
 scene.add(fillLight);
 const windowGlow = new THREE.PointLight('#bcd9ff', 0.5, 900);
@@ -310,12 +317,37 @@ const DARK_PANEL = new THREE.MeshStandardMaterial({ color: '#232c3a', roughness:
 const CHAIR_FABRIC = new THREE.MeshStandardMaterial({ color: '#3c4658', roughness: 0.85 });
 const SCREEN_ON = new THREE.MeshStandardMaterial({ color: '#0f1722', emissive: '#4fc3e8', emissiveIntensity: 0.9, roughness: 0.3 });
 const SCREEN_OFF = new THREE.MeshStandardMaterial({ color: '#141c28', emissive: '#1c2b3d', emissiveIntensity: 0.4, roughness: 0.3 });
+const CEILING_MAT = new THREE.MeshStandardMaterial({ color: '#e9e9ef', roughness: 0.92 });
+const CARPET = new THREE.MeshStandardMaterial({ color: '#3c4d68', roughness: 0.97 });
+const FRAME_MAT = new THREE.MeshStandardMaterial({ color: '#2b3442', roughness: 0.5 });
 
+// desks and chairs repeat 12x, so identical part dimensions share one geometry
+const boxGeometryCache = new Map();
 function box(width, height, depth, material, x, y, z, receive = true, cast = true) {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, height, depth), material);
+  const key = `${width}x${height}x${depth}`;
+  if (!boxGeometryCache.has(key)) boxGeometryCache.set(key, new THREE.BoxGeometry(width, height, depth));
+  const mesh = new THREE.Mesh(boxGeometryCache.get(key), material);
   mesh.position.set(x, y, z);
   mesh.castShadow = cast; mesh.receiveShadow = receive;
   return mesh;
+}
+
+const roundedGeometryCache = new Map();
+function rbox(width, height, depth, radius, material, x, y, z, receive = true, cast = true) {
+  const key = `${width}x${height}x${depth}x${radius}`;
+  if (!roundedGeometryCache.has(key)) {
+    roundedGeometryCache.set(key, new RoundedBoxGeometry(width, height, depth, 2, radius));
+  }
+  const mesh = new THREE.Mesh(roundedGeometryCache.get(key), material);
+  mesh.position.set(x, y, z);
+  mesh.castShadow = cast; mesh.receiveShadow = receive;
+  return mesh;
+}
+
+function seededRandom(seed) {
+  let value = seed % 2147483647;
+  if (value <= 0) value += 2147483646;
+  return () => (value = value * 16807 % 2147483647) / 2147483647;
 }
 
 /* ----------------------------- the room ----------------------------- */
@@ -339,6 +371,142 @@ function buildFloorTexture() {
   return texture;
 }
 
+function buildSkyGradientTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64; canvas.height = 512;
+  const context = canvas.getContext('2d');
+  const gradient = context.createLinearGradient(0, 0, 0, 512);
+  gradient.addColorStop(0, '#060a18');
+  gradient.addColorStop(0.55, '#131b30');
+  gradient.addColorStop(1, '#2a3a5e');
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 64, 512);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function buildSkylineTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1024; canvas.height = 320;
+  const context = canvas.getContext('2d');
+  const sky = context.createLinearGradient(0, 0, 0, 320);
+  sky.addColorStop(0, '#141f3d');
+  sky.addColorStop(0.72, '#33436e');
+  sky.addColorStop(1, '#5a5a7d');
+  context.fillStyle = sky;
+  context.fillRect(0, 0, 1024, 320);
+  const random = seededRandom(20260717);
+  let x = 0;
+  while (x < 1024) {
+    const width = 34 + random() * 60;
+    const height = 70 + random() * 190;
+    context.fillStyle = '#101830';
+    context.fillRect(x, 320 - height, width, height);
+    context.fillStyle = '#ffd98a';
+    for (let wx = x + 5; wx < x + width - 6; wx += 9) {
+      for (let wy = 320 - height + 8; wy < 308; wy += 12) {
+        if (random() < 0.28) context.fillRect(wx, wy, 4, 6);
+      }
+    }
+    x += width + 6 + random() * 14;
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function buildBlindsTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64; canvas.height = 256;
+  const context = canvas.getContext('2d');
+  for (let y = 0; y < 256; y += 16) {
+    context.fillStyle = (y / 16) % 2 ? '#cfd6e2' : '#c2cad8';
+    context.fillRect(0, y, 64, 11);
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function buildArtTexture(variant) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256; canvas.height = 320;
+  const context = canvas.getContext('2d');
+  const palettes = [
+    ['#f4efe6', '#5e7df6', '#f7b844', '#28b681'],
+    ['#f4efe6', '#ef6461', '#31435c', '#f7b844'],
+    ['#f4efe6', '#48b78a', '#5e7df6', '#ad70e8'],
+  ];
+  const [paper, ...colors] = palettes[variant % palettes.length];
+  context.fillStyle = paper;
+  context.fillRect(0, 0, 256, 320);
+  const random = seededRandom(1013 + variant * 977);
+  colors.forEach((color, index) => {
+    context.fillStyle = color;
+    context.globalAlpha = 0.85;
+    if (index % 2) {
+      context.beginPath();
+      context.arc(60 + random() * 140, 60 + random() * 200, 34 + random() * 30, 0, Math.PI * 2);
+      context.fill();
+    } else {
+      context.fillRect(30 + random() * 110, 30 + random() * 160, 50 + random() * 80, 50 + random() * 90);
+    }
+  });
+  context.globalAlpha = 1;
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function buildLightPanelTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128; canvas.height = 96;
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#454c58';
+  context.fillRect(0, 0, 128, 96);
+  context.fillStyle = '#fff8e8';
+  context.fillRect(8, 8, 112, 80);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function buildCeiling() {
+  // the ceiling plane faces down, so overhead orbit shots still see into the room;
+  // it overhangs the walls so grazing angles never show open sky at the roofline
+  const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(1160, 800), CEILING_MAT);
+  ceiling.rotation.x = Math.PI / 2;
+  ceiling.position.y = 250;
+  scene.add(ceiling);
+
+  const panelTexture = buildLightPanelTexture();
+  const panelMaterial = new THREE.MeshStandardMaterial({
+    map: panelTexture, emissive: '#ffffff', emissiveMap: panelTexture, emissiveIntensity: 0.85, roughness: 0.6 });
+  const panelGeometry = new THREE.PlaneGeometry(120, 80);
+  for (const column of [-375, -125, 125, 375]) {
+    for (const row of [-200, 0, 200]) {
+      const panel = new THREE.Mesh(panelGeometry, panelMaterial);
+      panel.rotation.x = Math.PI / 2;
+      panel.position.set(column, 249, row);
+      scene.add(panel);
+    }
+  }
+
+  // pendant cluster hanging over the operations table
+  const bulbMaterial = new THREE.MeshStandardMaterial({ color: '#fff2d0', emissive: '#ffe7b0', emissiveIntensity: 1.6 });
+  for (const x of [-130, 0, 130]) {
+    scene.add(box(1.2, 34, 1.2, DARK_PANEL, x, 232, 41, false, false));
+    const shade = new THREE.Mesh(new THREE.CylinderGeometry(9, 13, 10, 20), DARK_PANEL);
+    shade.position.set(x, 211, 41);
+    shade.castShadow = true;
+    scene.add(shade);
+    const bulb = new THREE.Mesh(new THREE.CylinderGeometry(8, 8, 1.5, 20), bulbMaterial);
+    bulb.position.set(x, 205.6, 41);
+    scene.add(bulb);
+  }
+}
+
 function buildRoom() {
   const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(1000, 650),
@@ -351,23 +519,63 @@ function buildRoom() {
   const plinth = box(1040, 24, 690, new THREE.MeshStandardMaterial({ color: '#3a4250', roughness: 0.9 }), 0, -12.8, 0);
   scene.add(plinth);
 
+  // carpet tiles under each desk pod; the wood floor stays as the walkway
+  const carpetGeometry = new THREE.PlaneGeometry(112, 88);
+  HOME_SLOTS.forEach(([slotX, slotY]) => {
+    const spot = toWorld(slotX, slotY + 27);
+    const carpet = new THREE.Mesh(carpetGeometry, CARPET);
+    carpet.rotation.x = -Math.PI / 2;
+    carpet.position.set(spot.x, 0.3, spot.z);
+    carpet.receiveShadow = true;
+    scene.add(carpet);
+  });
+  const loungeRug = new THREE.Mesh(new THREE.PlaneGeometry(190, 130),
+    new THREE.MeshStandardMaterial({ color: '#5c4f43', roughness: 0.97 }));
+  loungeRug.rotation.x = -Math.PI / 2;
+  const loungeRugSpot = toWorld(110, 595);
+  loungeRug.position.set(loungeRugSpot.x, 0.3, loungeRugSpot.z);
+  loungeRug.receiveShadow = true;
+  scene.add(loungeRug);
+
   const wallMaterial = new THREE.MeshStandardMaterial({ color: '#e8e2d6', roughness: 0.9 });
   const accentMaterial = new THREE.MeshStandardMaterial({ color: '#31435c', roughness: 0.85 });
   scene.add(box(1000, 250, 12, wallMaterial, 0, 125, -331, true, false));  // back wall
   scene.add(box(12, 250, 650, accentMaterial, -506, 125, 0, true, false)); // left wall
+  // south wall renders only from inside the room, so orbiting from the front stays open
+  const southWall = new THREE.Mesh(new THREE.PlaneGeometry(1000, 250), wallMaterial);
+  southWall.rotation.y = Math.PI;
+  southWall.position.set(0, 125, 324);
+  southWall.receiveShadow = true;
+  scene.add(southWall);
   scene.add(box(1000, 10, 12, DARK_PANEL, 0, 5, -330));                    // baseboards, proud of the wall
   scene.add(box(12, 10, 650, DARK_PANEL, -505, 5, 0));
+  scene.add(box(1000, 10, 4, DARK_PANEL, 0, 5, 322, true, false));
+  scene.add(box(1000, 6, 6, DARK_PANEL, 0, 246, -327, false, false));      // crown trim
+  scene.add(box(6, 6, 650, DARK_PANEL, -502, 246, 0, false, false));
 
   // glass curtain wall on the right with warm skyline glow
   const glassMaterial = new THREE.MeshStandardMaterial({ color: '#9fd4e8', transparent: true, opacity: 0.16, roughness: 0.1 });
   scene.add(box(10, 250, 650, glassMaterial, 506, 125, 0, false, false));
   for (let z = -325; z <= 325; z += 130) scene.add(box(6, 250, 8, METAL, 506, 125, z, false, false));
   scene.add(box(6, 6, 650, METAL, 506, 246, 0, false, false));
-  const skyline = new THREE.Mesh(new THREE.PlaneGeometry(900, 320),
-    new THREE.MeshBasicMaterial({ color: '#2c3d63', fog: false }));
-  skyline.position.set(760, 150, 0);
+  const skyline = new THREE.Mesh(new THREE.PlaneGeometry(1400, 360),
+    new THREE.MeshBasicMaterial({ map: buildSkylineTexture(), fog: false }));
+  skyline.position.set(900, 165, 0);
   skyline.rotation.y = -Math.PI / 2;
   scene.add(skyline);
+
+  // half-lowered blinds at staggered heights along the curtain wall
+  const blindsTexture = buildBlindsTexture();
+  const blindsMaterial = new THREE.MeshStandardMaterial({
+    map: blindsTexture, transparent: true, side: THREE.DoubleSide, roughness: 0.8 });
+  [-260, -130, 0, 130, 260].forEach((z, index) => {
+    const drop = 46 + (index * 37) % 34;
+    const blind = new THREE.Mesh(new THREE.PlaneGeometry(122, drop), blindsMaterial);
+    blind.rotation.y = -Math.PI / 2;
+    blind.position.set(501, 247 - drop / 2, z);
+    scene.add(blind);
+    scene.add(box(6, 5, 126, DARK_PANEL, 501, 248, z, false, false));       // headrail
+  });
 
   // planning wall: big whiteboard with sticky notes
   scene.add(box(390, 130, 6, new THREE.MeshStandardMaterial({ color: '#f7f9fb', roughness: 0.35 }), 0, 150, -323.5, true, false));
@@ -389,14 +597,25 @@ function buildRoom() {
   scene.add(box(8, 2.5, 1, DARK_PANEL, 323, 200, -321));
   scene.add(makeTextPlate('TYLER AI', '#5e7df6', 200, 46, -300, 210, -323));
 
-  // slim hanging light bars over the middle of the room
-  for (const x of [-260, 0, 260]) {
-    const housing = box(170, 5, 10, DARK_PANEL, x, 262, 60, false, false);
-    scene.add(housing);
-    scene.add(box(160, 1.6, 7, new THREE.MeshStandardMaterial({ color: '#fff6dd', emissive: '#fff6dd', emissiveIntensity: 1.6 }), x, 259, 60, false, false));
-    scene.add(box(1.6, 46, 1.6, DARK_PANEL, x - 70, 287, 60, false, false));
-    scene.add(box(1.6, 46, 1.6, DARK_PANEL, x + 70, 287, 60, false, false));
+  // framed prints on the accent and planning walls
+  const artSpots = [
+    [-498, 155, -140, Math.PI / 2, 0],
+    [-498, 155, 90, Math.PI / 2, 1],
+    [432, 150, -322, 0, 2],
+  ];
+  for (const [x, y, z, rotationY, variant] of artSpots) {
+    const art = new THREE.Group();
+    art.add(rbox(74, 92, 3, 1, FRAME_MAT, 0, 0, 0, false, false));
+    const print = new THREE.Mesh(new THREE.PlaneGeometry(64, 82),
+      new THREE.MeshStandardMaterial({ map: buildArtTexture(variant), roughness: 0.85 }));
+    print.position.z = 1.8;
+    art.add(print);
+    art.position.set(x, y, z);
+    art.rotation.y = rotationY;
+    scene.add(art);
   }
+
+  buildCeiling();
 }
 
 function makeTextPlate(text, color, width, height, x, y, z) {
@@ -417,52 +636,84 @@ function makeTextPlate(text, color, width, height, x, y, z) {
 
 function buildMonitor(parent, x, y, z, rotationY, on = true) {
   const monitor = new THREE.Group();
-  monitor.add(box(34, 22, 2.5, DARK_PANEL, 0, 25, 0));
-  const screen = box(30, 18, 1, on ? SCREEN_ON.clone() : SCREEN_OFF, 0, 25, 1.6, false, false);
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(5, 6, 1.6, 18), METAL);
+  base.position.set(0, 0.8, -7); base.castShadow = true;
+  monitor.add(base);
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(1.2, 1.2, 17, 10), METAL);
+  post.position.set(0, 9, -7); post.castShadow = true;
+  monitor.add(post);
+  monitor.add(box(2, 2, 7, METAL, 0, 17, -3.8, false, true));               // monitor arm
+  monitor.add(box(2, 7, 2, METAL, 0, 21, -1.2, false, true));
+  monitor.add(rbox(34, 21, 2.4, 0.9, DARK_PANEL, 0, 25, 0));
+  const screen = box(30.5, 17.5, 0.8, on ? SCREEN_ON.clone() : SCREEN_OFF, 0, 25, 1.5, false, false);
+  screen.name = 'screen';
   monitor.add(screen);
-  monitor.add(box(3, 12, 3, METAL, 0, 8, -0.5));
-  monitor.add(box(14, 2, 9, METAL, 0, 1.5, -0.5));
   monitor.position.set(x, y, z);
   monitor.rotation.y = rotationY;
   parent.add(monitor);
   return screen;
 }
 
-function buildChair(sceneX, sceneY, rotationY) {
+function buildChairGroup() {
   // seat faces +z (toward the desk); the backrest sits behind the robot on -z
   const chair = new THREE.Group();
-  chair.add(box(26, 3.5, 24, CHAIR_FABRIC, 0, 14, 0));
-  chair.add(box(26, 30, 3.5, CHAIR_FABRIC, 0, 30, -12));
-  const stem = new THREE.Mesh(new THREE.CylinderGeometry(2, 2, 12, 10), METAL);
-  stem.position.y = 7; chair.add(stem);
-  const base = new THREE.Mesh(new THREE.CylinderGeometry(11, 11, 2, 14), METAL);
-  base.position.y = 1.4; base.castShadow = true; chair.add(base);
-  const position = toWorld(sceneX, sceneY);
-  chair.position.set(position.x, 0, position.z);
-  chair.rotation.y = rotationY;
-  scene.add(chair);
+  chair.add(rbox(26, 4.5, 24, 2, CHAIR_FABRIC, 0, 13.8, 0));
+  const back = rbox(24, 27, 4, 2, CHAIR_FABRIC, 0, 29.5, -13);
+  back.rotation.x = -0.09;
+  chair.add(back);
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(1.7, 1.7, 11, 10), METAL);
+  stem.position.y = 7;
+  chair.add(stem);
+  for (let spokeIndex = 0; spokeIndex < 5; spokeIndex += 1) {
+    const spoke = new THREE.Group();
+    spoke.rotation.y = spokeIndex * Math.PI * 2 / 5;
+    spoke.add(box(2.4, 1.6, 11, METAL, 0, 1.6, 5.5, false, true));
+    const caster = new THREE.Mesh(new THREE.SphereGeometry(1.7, 10, 8), DARK_PANEL);
+    caster.position.set(0, 1.2, 10.4);
+    spoke.add(caster);
+    chair.add(spoke);
+  }
   return chair;
 }
 
 const workstationScreens = [];
-function buildWorkstation(sceneX, sceneY) {
-  // desk footprint mirrors the collision rect: x±44, y+2..y+52
-  const center = toWorld(sceneX, sceneY + 27);
+let workstationTemplate = null;
+
+function buildWorkstationTemplate() {
+  const station = new THREE.Group();
   const desk = new THREE.Group();
-  desk.add(box(88, 4, 50, WOOD, 0, 28, 0));
-  desk.add(box(84, 26, 4, WOOD_DARK, 0, 14, 21));            // modesty panel
-  desk.add(box(4, 28, 46, WOOD_DARK, -41, 14, 0));
-  desk.add(box(4, 28, 46, WOOD_DARK, 41, 14, 0));
-  desk.add(box(24, 2, 10, DARK_PANEL, -6, 30.6, -12));       // keyboard
+  desk.add(rbox(88, 4, 50, 1.4, WOOD, 0, 28, 0));
+  for (const [legX, legZ] of [[-40, -21], [40, -21], [-40, 21], [40, 21]]) {
+    desk.add(box(3, 26, 3, METAL, legX, 13, legZ));
+  }
+  desk.add(rbox(80, 17, 2.4, 0.8, WOOD_DARK, 0, 18.5, 21));                 // floating modesty panel
+  desk.add(rbox(24, 1.8, 10, 0.6, DARK_PANEL, -6, 30.9, -12));              // keyboard
+  desk.add(rbox(5, 1.8, 7.5, 0.8, DARK_PANEL, 12, 30.9, -12));              // mouse
   const mug = new THREE.Mesh(new THREE.CylinderGeometry(3.4, 3, 6, 12),
     new THREE.MeshStandardMaterial({ color: '#f5f7fa', roughness: 0.4 }));
-  mug.position.set(28, 33.5, -8); mug.castShadow = true;
+  mug.position.set(28, 33, -8); mug.castShadow = true;
   desk.add(mug);
-  desk.position.set(center.x, 0, center.z);
-  scene.add(desk);
   // monitor sits on the desk facing the seat (which is north of the desk)
-  workstationScreens.push(buildMonitor(desk, 0, 30, 6, Math.PI));
-  buildChair(sceneX, sceneY, 0);   // chair back faces south, agent faces the desk
+  buildMonitor(desk, 0, 30, 6, Math.PI);
+  desk.position.z = 27;      // desk footprint mirrors the collision rect: x±44, y+2..y+52
+  station.add(desk);
+  station.add(buildChairGroup());   // chair back faces south, agent faces the desk
+  return station;
+}
+
+function buildWorkstation(sceneX, sceneY) {
+  // all twelve stations clone one template so they share geometry buffers
+  if (!workstationTemplate) workstationTemplate = buildWorkstationTemplate();
+  const station = workstationTemplate.clone();
+  const spot = toWorld(sceneX, sceneY);
+  station.position.set(spot.x, 0, spot.z);
+  station.traverse((node) => {
+    if (node.name === 'screen') {
+      node.material = SCREEN_ON.clone();
+      workstationScreens.push(node);
+    }
+  });
+  scene.add(station);
 }
 
 function buildOperationsDesk() {
@@ -473,8 +724,8 @@ function buildOperationsDesk() {
   ];
   for (const [x1, y1, x2, y2] of parts) {
     const center = toWorld((x1 + x2) / 2, (y1 + y2) / 2);
-    scene.add(box(x2 - x1, 4, y2 - y1, WOOD, center.x, 30, center.z));
-    scene.add(box(x2 - x1 - 6, 28, y2 - y1 - 6, WOOD_DARK, center.x, 15, center.z));
+    scene.add(rbox(x2 - x1, 5, y2 - y1, 1.8, WOOD, center.x, 29.5, center.z));
+    scene.add(box(x2 - x1 - 10, 27, y2 - y1 - 10, WOOD_DARK, center.x, 13.5, center.z));
   }
   for (const sceneX of [360, 460, 560, 660]) {
     const spot = toWorld(sceneX, 318);
@@ -494,12 +745,15 @@ function buildLounge() {
   const cushionMaterial = new THREE.MeshStandardMaterial({ color: '#dcb46a', roughness: 0.9 });
   const spot = toWorld(85, 595);
   const sofa = new THREE.Group();
-  sofa.add(box(110, 18, 44, sofaMaterial, 0, 9, 0));
-  sofa.add(box(110, 26, 10, sofaMaterial, 0, 26, -19));
-  sofa.add(box(10, 26, 44, sofaMaterial, -52, 20, 0));
-  sofa.add(box(10, 26, 44, sofaMaterial, 52, 20, 0));
-  sofa.add(box(24, 8, 24, cushionMaterial, -22, 22, -8));
-  sofa.add(box(24, 8, 24, cushionMaterial, 22, 22, -8));
+  sofa.add(rbox(110, 18, 44, 4, sofaMaterial, 0, 9, 0));
+  sofa.add(rbox(110, 28, 11, 4, sofaMaterial, 0, 26, -19));
+  sofa.add(rbox(11, 26, 44, 4, sofaMaterial, -52, 21, 0));
+  sofa.add(rbox(11, 26, 44, 4, sofaMaterial, 52, 21, 0));
+  sofa.add(rbox(24, 8, 24, 3, cushionMaterial, -22, 21, -6));
+  sofa.add(rbox(24, 8, 24, 3, cushionMaterial, 22, 21, -6));
+  const pillow = rbox(20, 18, 7, 3, cushionMaterial, -38, 26, -13);
+  pillow.rotation.z = 0.28;
+  sofa.add(pillow);
   sofa.position.set(spot.x, 0, spot.z);
   sofa.rotation.y = 0.5;
   scene.add(sofa);
@@ -515,7 +769,7 @@ function buildLounge() {
 function buildSecureCabinet() {
   const center = toWorld(127, 185);
   const cabinet = new THREE.Group();
-  cabinet.add(box(150, 110, 105, new THREE.MeshStandardMaterial({ color: '#5b6675', roughness: 0.45, metalness: 0.35 }), 0, 55, 0));
+  cabinet.add(rbox(150, 110, 105, 4, new THREE.MeshStandardMaterial({ color: '#5b6675', roughness: 0.45, metalness: 0.35 }), 0, 55, 0));
   const dial = new THREE.Mesh(new THREE.CylinderGeometry(16, 16, 6, 24),
     new THREE.MeshStandardMaterial({ color: '#37404d', roughness: 0.35, metalness: 0.5 }));
   dial.rotation.x = Math.PI / 2;
@@ -533,9 +787,9 @@ function buildSecureCabinet() {
 function buildPodium() {
   const center = toWorld(790, 570);
   const podium = new THREE.Group();
-  podium.add(box(110, 60, 140, new THREE.MeshStandardMaterial({ color: '#8d99a8', roughness: 0.5 }), 0, 30, 0));
+  podium.add(rbox(110, 60, 140, 4, new THREE.MeshStandardMaterial({ color: '#8d99a8', roughness: 0.5 }), 0, 30, 0));
   const screenTilt = new THREE.Group();
-  screenTilt.add(box(86, 52, 4, DARK_PANEL, 0, 0, 0));
+  screenTilt.add(rbox(86, 52, 4, 1.5, DARK_PANEL, 0, 0, 0));
   screenTilt.add(box(78, 44, 1.5, SCREEN_ON.clone(), 0, 0, 2.6, false, false));
   screenTilt.position.set(0, 68, -20);
   screenTilt.rotation.x = -0.5;
@@ -586,6 +840,13 @@ buildZoneMarker(500, 235, 'PLANNING', '#f7b844');
 buildZoneMarker(500, 400, 'OPERATIONS', '#5e7df6');
 buildZoneMarker(760, 440, 'RESPONSE', '#28b681');
 buildZoneMarker(185, 292, 'SUPPORT', '#ef6461');
+
+// full-strength environment reflections wash out the palette, so dial the room back
+scene.traverse((node) => {
+  if (node.isMesh && node.material && 'envMapIntensity' in node.material) {
+    node.material.envMapIntensity = 0.4;
+  }
+});
 
 /* ----------------------------- labels ----------------------------- */
 function makeLabelSprite(text, color, plain = false) {
@@ -948,6 +1209,19 @@ function eventTime(value) {
 /* --------------------------- connection --------------------------- */
 const params = new URLSearchParams(location.search);
 const demoMode = params.get('demo') === '1';
+
+// camera presets for debugging / screenshot verification, e.g. ?demo=1&view=low
+const VIEW_PRESETS = {
+  low: { position: [-420, 120, 700], target: [80, 60, -40] },
+  window: { position: [-380, 190, -40], target: [520, 130, 40] },
+  ops: { position: [10, 300, 480], target: [0, 40, 40] },
+};
+const viewPreset = VIEW_PRESETS[params.get('view')];
+if (viewPreset) {
+  camera.position.set(...viewPreset.position);
+  controls.target.set(...viewPreset.target);
+  controls.update();
+}
 const connectionDot = document.getElementById('connection-dot');
 const connectionText = document.getElementById('connection-text');
 const tokenModal = document.getElementById('token-modal');
