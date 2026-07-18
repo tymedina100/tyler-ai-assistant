@@ -816,7 +816,12 @@ browser: it renders a full room with three.js — ceiling with recessed light pa
 a night skyline behind the glass curtain wall with half-lowered blinds, framed wall
 art, carpeted desk pods, and rounded furniture with proper desk legs, monitor arms,
 and task chairs — and the robots physically walk around the furniture, sit down at
-their desks, and type while they work. Drag to orbit, scroll to zoom.
+their desks, and type while they work. Drag to orbit, scroll to zoom. The office
+follows your local time of day: the sun sweeps across the room and warms toward
+sunset, and after dark the skyline windows light up and every desk lamp comes on.
+A quality chip in the top-right corner cycles post-processing (ambient occlusion,
+bloom, SMAA) between Auto/High/Medium/Low; Auto steps itself down if the machine
+can't hold a smooth frame rate.
 On first load the page asks for the `OFFICE_API_TOKEN` value and keeps it only in
 that browser's local storage; the state API itself stays token-protected. Add
 `?demo=1` to the URL to watch scripted office activity without a token.

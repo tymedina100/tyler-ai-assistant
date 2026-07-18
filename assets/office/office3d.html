@@ -25,6 +25,11 @@
   #title-chip .name { font-size: 20px; font-weight: 700; }
   #connection-chip { top: 18px; right: 18px; font-size: 12px; font-weight: 600; }
   #connection-dot { width: 9px; height: 9px; border-radius: 50%; background: #f7b844; }
+  #quality-chip {
+    top: 64px; right: 18px; font-size: 10px; font-weight: 700; letter-spacing: 1.2px;
+    color: var(--muted); cursor: pointer; user-select: none; padding: 7px 13px;
+  }
+  #quality-chip:hover { color: var(--text); }
   #event-panel {
     position: absolute; left: 18px; bottom: 18px; width: min(430px, 44vw);
     background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px;
@@ -84,6 +89,7 @@
 <body>
 <div id="title-chip" class="chip"><span class="kicker">TYLER AI ASSISTANT</span><span class="name">Virtual Office 3D</span></div>
 <div id="connection-chip" class="chip"><span id="connection-dot"></span><span id="connection-text">Connecting…</span></div>
+<div id="quality-chip" class="chip" title="Cycle render quality">QUALITY AUTO</div>
 <div id="demo-badge">DEMO MODE</div>
 <div id="event-panel">
   <h2>ACTIVITY CONSOLE</h2>
@@ -107,6 +113,12 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 /* ------------------------------------------------------------------ *
  * Shared layout contract — keep in sync with office_desktop.py.      *
@@ -273,7 +285,7 @@ renderer.toneMappingExposure = 1.05;
 document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = buildSkyGradientTexture();
+// background + fog colors are painted by the day/night cycle further down
 scene.fog = new THREE.Fog('#131b30', 1500, 2600);
 
 // image-based lighting so plastics and metals pick up soft studio reflections
@@ -291,7 +303,8 @@ controls.maxPolarAngle = Math.PI * 0.46;
 controls.minDistance = 260;
 controls.maxDistance = 1600;
 
-scene.add(new THREE.HemisphereLight('#dbe8ff', '#9b8d7a', 0.55));
+const hemi = new THREE.HemisphereLight('#dbe8ff', '#9b8d7a', 0.55);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight('#fff4e0', 1.9);
 sun.position.set(420, 640, 260);
 sun.castShadow = true;
@@ -320,6 +333,10 @@ const SCREEN_OFF = new THREE.MeshStandardMaterial({ color: '#141c28', emissive: 
 const CEILING_MAT = new THREE.MeshStandardMaterial({ color: '#e9e9ef', roughness: 0.92 });
 const CARPET = new THREE.MeshStandardMaterial({ color: '#3c4d68', roughness: 0.97 });
 const FRAME_MAT = new THREE.MeshStandardMaterial({ color: '#2b3442', roughness: 0.5 });
+// shared by every desk lamp; the day/night cycle turns them up after dark
+const LAMP_BULB = new THREE.MeshStandardMaterial({ color: '#fff4d6', emissive: '#ffdf9e', emissiveIntensity: 0.1 });
+// materials and meshes the day/night cycle drives, registered as the room is built
+const lighting = {};
 
 // desks and chairs repeat 12x, so identical part dimensions share one geometry
 const boxGeometryCache = new Map();
@@ -371,39 +388,30 @@ function buildFloorTexture() {
   return texture;
 }
 
-function buildSkyGradientTexture() {
-  const canvas = document.createElement('canvas');
-  canvas.width = 64; canvas.height = 512;
-  const context = canvas.getContext('2d');
-  const gradient = context.createLinearGradient(0, 0, 0, 512);
-  gradient.addColorStop(0, '#060a18');
-  gradient.addColorStop(0.55, '#131b30');
-  gradient.addColorStop(1, '#2a3a5e');
-  context.fillStyle = gradient;
-  context.fillRect(0, 0, 64, 512);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  return texture;
-}
-
-function buildSkylineTexture() {
+function buildSkylineTexture(night) {
   const canvas = document.createElement('canvas');
   canvas.width = 1024; canvas.height = 320;
   const context = canvas.getContext('2d');
   const sky = context.createLinearGradient(0, 0, 0, 320);
-  sky.addColorStop(0, '#141f3d');
-  sky.addColorStop(0.72, '#33436e');
-  sky.addColorStop(1, '#5a5a7d');
+  if (night) {
+    sky.addColorStop(0, '#141f3d');
+    sky.addColorStop(0.72, '#33436e');
+    sky.addColorStop(1, '#5a5a7d');
+  } else {
+    sky.addColorStop(0, '#7fb0e0');
+    sky.addColorStop(0.72, '#b5d2ec');
+    sky.addColorStop(1, '#e3edf6');
+  }
   context.fillStyle = sky;
   context.fillRect(0, 0, 1024, 320);
-  const random = seededRandom(20260717);
+  const random = seededRandom(20260717);   // same seed: identical skyline day and night
   let x = 0;
   while (x < 1024) {
     const width = 34 + random() * 60;
     const height = 70 + random() * 190;
-    context.fillStyle = '#101830';
+    context.fillStyle = night ? '#101830' : '#8fa3c4';
     context.fillRect(x, 320 - height, width, height);
-    context.fillStyle = '#ffd98a';
+    context.fillStyle = night ? '#ffd98a' : '#7d92b5';
     for (let wx = x + 5; wx < x + width - 6; wx += 9) {
       for (let wy = 320 - height + 8; wy < 308; wy += 12) {
         if (random() < 0.28) context.fillRect(wx, wy, 4, 6);
@@ -483,6 +491,7 @@ function buildCeiling() {
   const panelTexture = buildLightPanelTexture();
   const panelMaterial = new THREE.MeshStandardMaterial({
     map: panelTexture, emissive: '#ffffff', emissiveMap: panelTexture, emissiveIntensity: 0.85, roughness: 0.6 });
+  lighting.panelMaterial = panelMaterial;
   const panelGeometry = new THREE.PlaneGeometry(120, 80);
   for (const column of [-375, -125, 125, 375]) {
     for (const row of [-200, 0, 200]) {
@@ -495,6 +504,7 @@ function buildCeiling() {
 
   // pendant cluster hanging over the operations table
   const bulbMaterial = new THREE.MeshStandardMaterial({ color: '#fff2d0', emissive: '#ffe7b0', emissiveIntensity: 1.6 });
+  lighting.pendantBulb = bulbMaterial;
   for (const x of [-130, 0, 130]) {
     scene.add(box(1.2, 34, 1.2, DARK_PANEL, x, 232, 41, false, false));
     const shade = new THREE.Mesh(new THREE.CylinderGeometry(9, 13, 10, 20), DARK_PANEL);
@@ -558,11 +568,19 @@ function buildRoom() {
   scene.add(box(10, 250, 650, glassMaterial, 506, 125, 0, false, false));
   for (let z = -325; z <= 325; z += 130) scene.add(box(6, 250, 8, METAL, 506, 125, z, false, false));
   scene.add(box(6, 6, 650, METAL, 506, 246, 0, false, false));
-  const skyline = new THREE.Mesh(new THREE.PlaneGeometry(1400, 360),
-    new THREE.MeshBasicMaterial({ map: buildSkylineTexture(), fog: false }));
-  skyline.position.set(900, 165, 0);
-  skyline.rotation.y = -Math.PI / 2;
-  scene.add(skyline);
+  // day skyline behind, night skyline in front; its opacity follows the night factor
+  const skylineGeometry = new THREE.PlaneGeometry(1400, 360);
+  const skylineDay = new THREE.Mesh(skylineGeometry,
+    new THREE.MeshBasicMaterial({ map: buildSkylineTexture(false), fog: false }));
+  skylineDay.position.set(900, 165, 0);
+  skylineDay.rotation.y = -Math.PI / 2;
+  scene.add(skylineDay);
+  const skylineNight = new THREE.Mesh(skylineGeometry,
+    new THREE.MeshBasicMaterial({ map: buildSkylineTexture(true), fog: false, transparent: true, depthWrite: false }));
+  skylineNight.position.set(899, 165, 0);
+  skylineNight.rotation.y = -Math.PI / 2;
+  scene.add(skylineNight);
+  lighting.skylineNight = skylineNight.material;
 
   // half-lowered blinds at staggered heights along the curtain wall
   const blindsTexture = buildBlindsTexture();
@@ -693,6 +711,21 @@ function buildWorkstationTemplate() {
     new THREE.MeshStandardMaterial({ color: '#f5f7fa', roughness: 0.4 }));
   mug.position.set(28, 33, -8); mug.castShadow = true;
   desk.add(mug);
+  // desk lamp; the shared bulb material brightens after dark
+  const lamp = new THREE.Group();
+  const lampBase = new THREE.Mesh(new THREE.CylinderGeometry(3, 3.6, 1.6, 12), DARK_PANEL);
+  lampBase.position.y = 0.8;
+  const lampArm = box(1.4, 13, 1.4, DARK_PANEL, -1.8, 7, 0, false, true);
+  lampArm.rotation.z = 0.35;
+  const lampHead = new THREE.Mesh(new THREE.ConeGeometry(3.6, 5.5, 12, 1, true), DARK_PANEL);
+  lampHead.position.set(-5.2, 13.6, 0);
+  lampHead.rotation.z = 0.55;
+  lampHead.castShadow = true;
+  const lampGlow = new THREE.Mesh(new THREE.SphereGeometry(1.6, 10, 8), LAMP_BULB);
+  lampGlow.position.set(-6.2, 12.4, 0);
+  lamp.add(lampBase, lampArm, lampHead, lampGlow);
+  lamp.position.set(-32, 30, 4);
+  desk.add(lamp);
   // monitor sits on the desk facing the seat (which is north of the desk)
   buildMonitor(desk, 0, 30, 6, Math.PI);
   desk.position.z = 27;      // desk footprint mirrors the collision rect: x±44, y+2..y+52
@@ -1297,15 +1330,171 @@ if (demoMode) {
   setInterval(pollState, POLL_MS);
 }
 
+/* --------------------------- day / night --------------------------- */
+const skyCanvas = document.createElement('canvas');
+skyCanvas.width = 64; skyCanvas.height = 512;
+const skyTexture = new THREE.CanvasTexture(skyCanvas);
+skyTexture.colorSpace = THREE.SRGBColorSpace;
+scene.background = skyTexture;
+
+const hourOverride = parseFloat(params.get('hour'));   // e.g. ?hour=22 to preview night
+
+const colorScratch = new THREE.Color();
+function hexLerp(dayHex, nightHex, t) {
+  return colorScratch.set(dayHex).lerp(new THREE.Color(nightHex), t);
+}
+
+function paintSky(nightFactor) {
+  const context = skyCanvas.getContext('2d');
+  const gradient = context.createLinearGradient(0, 0, 0, 512);
+  gradient.addColorStop(0, '#' + hexLerp('#79a8dd', '#060a18', nightFactor).getHexString());
+  gradient.addColorStop(0.55, '#' + hexLerp('#a8c6e8', '#131b30', nightFactor).getHexString());
+  gradient.addColorStop(1, '#' + hexLerp('#d9e6f4', '#2a3a5e', nightFactor).getHexString());
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 64, 512);
+  skyTexture.needsUpdate = true;
+}
+
+function currentHour() {
+  if (Number.isFinite(hourOverride)) return ((hourOverride % 24) + 24) % 24;
+  const now = new Date();
+  return now.getHours() + now.getMinutes() / 60;
+}
+
+function nightFactorAt(hour) {
+  // 0 in daylight, 1 after dark, smooth ramps at dawn (5:30-7:30) and dusk (17:30-19:30)
+  let linear;
+  if (hour < 5.5 || hour >= 19.5) linear = 1;
+  else if (hour < 7.5) linear = 1 - (hour - 5.5) / 2;
+  else if (hour < 17.5) linear = 0;
+  else linear = (hour - 17.5) / 2;
+  return linear * linear * (3 - 2 * linear);
+}
+
+const MOON_POSITION = new THREE.Vector3(-380, 520, -140);
+const sunArc = new THREE.Vector3();
+let paintedNight = -1;
+
+function updateDayNight() {
+  const hour = currentHour();
+  const nf = nightFactorAt(hour);
+  const day = 1 - nf;
+  // sun sweeps east (glass wall) to west between 5:30 and 19:30, then hands off to the moon
+  const t = Math.min(Math.max((hour - 5.5) / 14, 0), 1);
+  const elevation = Math.sin(t * Math.PI);
+  sunArc.set(Math.cos(t * Math.PI) * 620, 240 + elevation * 430, 260).lerp(MOON_POSITION, nf);
+  sun.position.copy(sunArc);
+  sun.intensity = 0.28 + day * 1.62;
+  const warmth = Math.min(1, (1 - elevation) * 0.85);          // low sun goes amber
+  sun.color.copy(hexLerp('#fff4e0', '#ff9e5e', warmth * day)).lerp(new THREE.Color('#9db8e8'), nf);
+  hemi.intensity = 0.2 + day * 0.35;
+  fillLight.intensity = 0.45 + nf * 0.4;                       // interior lamps carry the night
+  windowGlow.intensity = 0.15 + day * 0.45;
+  windowGlow.color.copy(hexLerp('#bcd9ff', '#7d95c9', nf));
+  if (lighting.panelMaterial) lighting.panelMaterial.emissiveIntensity = 0.55 + nf * 0.75;
+  if (lighting.pendantBulb) lighting.pendantBulb.emissiveIntensity = 0.9 + nf * 1.2;
+  LAMP_BULB.emissiveIntensity = 0.08 + nf * 1.8;
+  if (lighting.skylineNight) lighting.skylineNight.opacity = nf;
+  if (Math.abs(nf - paintedNight) > 0.02) {
+    paintedNight = nf;
+    paintSky(nf);
+    scene.fog.color.copy(hexLerp('#b9c9e2', '#131b30', nf));
+  }
+}
+
+/* --------------------- post-processing & quality --------------------- */
+const QUALITY_TIERS = ['low', 'medium', 'high'];
+let composer = null;
+let activeTier = 'low';
+let autoQuality = true;
+
+function buildComposer(tier) {
+  if (composer) {
+    try { composer.dispose(); } catch { /* older three builds lack dispose */ }
+    composer = null;
+  }
+  if (tier === 'low') return;   // low = direct MSAA rendering, no passes
+  try {
+    const next = new EffectComposer(renderer);
+    next.setPixelRatio(renderer.getPixelRatio());
+    next.setSize(window.innerWidth, window.innerHeight);
+    next.addPass(new RenderPass(scene, camera));
+    if (tier === 'high') {
+      const ssao = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
+      ssao.kernelRadius = 20;
+      ssao.minDistance = 0.0008;
+      ssao.maxDistance = 0.12;
+      next.addPass(ssao);
+    }
+    next.addPass(new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight), 0.3, 0.55, 0.72));
+    next.addPass(new OutputPass());
+    next.addPass(new SMAAPass(window.innerWidth, window.innerHeight));
+    composer = next;
+  } catch (error) {
+    console.warn('Post-processing unavailable; using direct rendering.', error);
+    composer = null;
+  }
+}
+
+const qualityChip = document.getElementById('quality-chip');
+function updateQualityChip() {
+  const label = activeTier.toUpperCase();
+  qualityChip.textContent = autoQuality ? `QUALITY AUTO · ${label}` : `QUALITY ${label}`;
+}
+
+function applyQuality(tier) {
+  activeTier = tier;
+  buildComposer(tier);
+  updateQualityChip();
+}
+
+function defaultTier() {
+  return (navigator.hardwareConcurrency || 4) >= 6 ? 'high' : 'medium';
+}
+
+qualityChip.addEventListener('click', () => {
+  if (autoQuality) { autoQuality = false; applyQuality('high'); }
+  else if (activeTier === 'high') applyQuality('medium');
+  else if (activeTier === 'medium') applyQuality('low');
+  else { autoQuality = true; applyQuality(defaultTier()); }
+  try { localStorage.setItem('office_quality', autoQuality ? 'auto' : activeTier); } catch { /* private mode */ }
+});
+
+{
+  const requested = params.get('quality') || localStorage.getItem('office_quality') || 'auto';
+  if (QUALITY_TIERS.includes(requested)) { autoQuality = false; applyQuality(requested); }
+  else applyQuality(defaultTier());
+}
+
+// step quality down (never up, to avoid flapping) when sustained fps dips
+let frameSamples = [];
+function autoAdjustQuality(dt, time) {
+  if (!autoQuality || activeTier === 'low' || time < 3) return;
+  frameSamples.push(dt);
+  if (frameSamples.length < 90) return;
+  const average = frameSamples.reduce((total, value) => total + value, 0) / frameSamples.length;
+  frameSamples = [];
+  if (average > 1 / 38) {
+    applyQuality(QUALITY_TIERS[QUALITY_TIERS.indexOf(activeTier) - 1]);
+  }
+}
+
 /* ----------------------------- render loop ----------------------------- */
 const frameClock = new THREE.Clock();
 let renderPaused = false;
-window.__office = { renderer, scene, camera, setPaused: (value) => { renderPaused = Boolean(value); } };
+window.__office = {
+  renderer, scene, camera,
+  setPaused: (value) => { renderPaused = Boolean(value); },
+  getQuality: () => ({ tier: activeTier, auto: autoQuality, composer: Boolean(composer) }),
+};
 function animate() {
   requestAnimationFrame(animate);
   if (renderPaused) return;
   const dt = Math.min(frameClock.getDelta(), 0.1);
   const time = frameClock.elapsedTime;
+  updateDayNight();
+  autoAdjustQuality(dt, time);
   for (const robot of robots.values()) {
     robot.advance(dt);
     robot.pose(time);
@@ -1314,7 +1503,8 @@ function animate() {
     screen.material.emissiveIntensity = 0.75 + Math.sin(time * 2.2 + index * 1.7) * 0.15;
   });
   controls.update();
-  renderer.render(scene, camera);
+  if (composer) composer.render();
+  else renderer.render(scene, camera);
 }
 animate();
 
@@ -1322,6 +1512,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  if (composer) composer.setSize(window.innerWidth, window.innerHeight);
 });
 </script>
 </body>
