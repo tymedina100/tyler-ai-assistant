@@ -953,6 +953,17 @@ class Robot {
     this.path = [];
     this.walkDistance = 0;
     this.heading = 0;
+    // articulation + behavior state
+    this.rand = seededRandom(Array.from(key).reduce((sum, c) => sum + c.charCodeAt(0) * 31, 7));
+    this.seedPhase = this.rand() * Math.PI * 2;
+    this.sitProgress = 0;
+    this.nextBlinkAt = 2 + this.rand() * 4;
+    this.blinkUntil = 0;
+    this.idleAction = null;
+    this.nextIdleAt = 6 + this.rand() * 10;
+    this.glanceDirection = 0;
+    this.excursion = null;
+    this.placementTarget = null;
     this.group = new THREE.Group();
 
     const color = agentColor(key);
@@ -965,15 +976,22 @@ class Robot {
 
     this.legs = [];
     for (const side of [-1, 1]) {
-      const leg = new THREE.Group();
-      leg.position.set(side * 6.5, 0, 0);
-      const limb = new THREE.Mesh(new THREE.CapsuleGeometry(4, 11, 6, 12), bodyMaterial);
-      limb.position.y = -10; limb.castShadow = true;
-      const foot = new THREE.Mesh(new THREE.BoxGeometry(8, 4, 12), jointMaterial);
-      foot.position.set(0, -18, 2); foot.castShadow = true;
-      leg.add(limb); leg.add(foot);
-      this.hips.add(leg);
-      this.legs.push(leg);
+      const hip = new THREE.Group();
+      hip.position.set(side * 6.5, 0, 0);
+      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(4, 7, 6, 12), bodyMaterial);
+      thigh.position.y = -5.5; thigh.castShadow = true;
+      hip.add(thigh);
+      const knee = new THREE.Group();
+      knee.position.y = -10;
+      hip.add(knee);
+      const shin = new THREE.Mesh(new THREE.CapsuleGeometry(3.4, 6, 6, 12), bodyMaterial);
+      shin.position.y = -4.5; shin.castShadow = true;
+      knee.add(shin);
+      const foot = new THREE.Mesh(new THREE.BoxGeometry(7.5, 3.5, 11), jointMaterial);
+      foot.position.set(0, -8.4, 2.5); foot.castShadow = true;
+      knee.add(foot);
+      this.hips.add(hip);
+      this.legs.push({ hip, knee });
     }
 
     this.torso = new THREE.Group();
@@ -988,16 +1006,22 @@ class Robot {
 
     this.arms = [];
     for (const side of [-1, 1]) {
-      const arm = new THREE.Group();
-      arm.position.set(side * 15, 7, 0);
-      const limb = new THREE.Mesh(new THREE.CapsuleGeometry(3.6, 12, 6, 12), bodyMaterial);
-      limb.position.y = -8; limb.castShadow = true;
-      const hand = new THREE.Mesh(new THREE.SphereGeometry(4.4, 12, 10), jointMaterial);
-      hand.position.y = -17;
-      limb.castShadow = true;
-      arm.add(limb); arm.add(hand);
-      this.torso.add(arm);
-      this.arms.push(arm);
+      const shoulder = new THREE.Group();
+      shoulder.position.set(side * 15, 7, 0);
+      const upper = new THREE.Mesh(new THREE.CapsuleGeometry(3.6, 6, 6, 12), bodyMaterial);
+      upper.position.y = -5; upper.castShadow = true;
+      shoulder.add(upper);
+      const elbow = new THREE.Group();
+      elbow.position.y = -9.5;
+      shoulder.add(elbow);
+      const forearm = new THREE.Mesh(new THREE.CapsuleGeometry(3.1, 5, 6, 12), bodyMaterial);
+      forearm.position.y = -4; forearm.castShadow = true;
+      elbow.add(forearm);
+      const hand = new THREE.Mesh(new THREE.SphereGeometry(4, 12, 10), jointMaterial);
+      hand.position.y = -8.5;
+      elbow.add(hand);
+      this.torso.add(shoulder);
+      this.arms.push({ shoulder, elbow });
     }
 
     this.head = new THREE.Group();
@@ -1010,11 +1034,13 @@ class Robot {
     visor.scale.set(1, 0.72, 0.62);
     visor.position.set(0, 0.5, 5.4);
     this.head.add(visor);
+    this.eyes = [];
     for (const side of [-1, 1]) {
       const eye = new THREE.Mesh(new THREE.SphereGeometry(1.8, 10, 8),
         new THREE.MeshStandardMaterial({ color: '#9beaff', emissive: '#7ef0ff', emissiveIntensity: 1.4 }));
       eye.position.set(side * 3.6, 1.2, 13.4);
       this.head.add(eye);
+      this.eyes.push(eye);
     }
     const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 7, 8), jointMaterial);
     antenna.position.y = 14;
@@ -1066,7 +1092,8 @@ class Robot {
   }
 
   retarget(placement) {
-    const changed = this.status !== placement.status || this.name !== (placement.agent.name || this.key)
+    const statusChanged = this.status !== placement.status;
+    const changed = statusChanged || this.name !== (placement.agent.name || this.key)
       || this.message !== (placement.agent.message || '');
     this.status = placement.status;
     this.zone = placement.zone;
@@ -1074,22 +1101,32 @@ class Robot {
     this.message = placement.agent.message || '';
     if (changed) this.refreshLabel();
     const target = [placement.x, placement.y];
+    this.placementTarget = target;
     if (!this.scenePosition) {
       this.setScenePosition(target[0], target[1]);
       this.target = target;
       return;
     }
+    if (statusChanged && (this.excursion || this.idleAction)) {
+      // real work interrupts coffee breaks and stretches immediately
+      this.excursion = null;
+      this.idleAction = null;
+      this.path = walkPath(this.scenePosition, target);
+      this.target = target;
+      return;
+    }
     if (!this.target || this.target[0] !== target[0] || this.target[1] !== target[1]) {
       this.target = target;
-      this.path = walkPath(this.scenePosition, target);
+      if (!this.excursion) this.path = walkPath(this.scenePosition, target);
     }
   }
 
   get walking() { return this.path.length > 0; }
-  get seated() { return this.zone === 'home' && !this.walking; }
+  get seated() { return this.zone === 'home' && !this.walking && !this.excursion; }
 
   advance(dt) {
     if (!this.walking) return;
+    if (this.sitProgress > 0.45) return;   // stand up from the chair before stepping off
     let step = WALK_SPEED * dt;
     let [x, y] = this.scenePosition;
     while (this.path.length && step > 0) {
@@ -1112,9 +1149,88 @@ class Robot {
     this.setScenePosition(x, y);
   }
 
-  pose(time) {
+  updateBlink(time) {
+    if (time > this.nextBlinkAt) {
+      this.blinkUntil = time + 0.13;
+      this.nextBlinkAt = time + 2.5 + this.rand() * 4;
+    }
+    const lidScale = time < this.blinkUntil ? 0.12 : 1;
+    for (const eye of this.eyes) {
+      eye.scale.y += (lidScale - eye.scale.y) * 0.55;
+    }
+  }
+
+  updateIdle(time) {
+    if (this.status !== 'idle') return;
+    if (this.excursion) {
+      if (!this.walking && time > this.excursion.returnAt) {
+        this.excursion = null;
+        if (this.placementTarget) this.path = walkPath(this.scenePosition, this.placementTarget);
+      }
+      return;
+    }
+    if (this.idleAction) {
+      if ((time - this.idleAction.start) / this.idleAction.duration >= 1) {
+        this.idleAction = null;
+        this.nextIdleAt = time + 5 + this.rand() * 9;
+      }
+      return;
+    }
+    if (!this.seated || this.sitProgress < 0.9) {
+      // only fidget after settling into the chair for a few seconds
+      this.nextIdleAt = Math.max(this.nextIdleAt, time + 3);
+      return;
+    }
+    if (time < this.nextIdleAt) return;
+    const roll = this.rand();
+    if (roll < 0.08 && this.zone === 'home') {
+      // wander to the open floor beside the lounge table (clear of every obstacle rect)
+      const point = [185 + this.rand() * 55, 575 + this.rand() * 45];
+      this.excursion = { returnAt: time + 7 + this.rand() * 5 };
+      this.path = walkPath(this.scenePosition, point);
+    } else {
+      const pick = this.rand();
+      const name = pick < 0.28 ? 'stretch' : pick < 0.56 ? 'sip' : pick < 0.78 ? 'swivel' : 'glance';
+      this.glanceDirection = (this.rand() < 0.5 ? -1 : 1) * (0.6 + this.rand() * 0.5);
+      this.idleAction = { name, start: time, duration: name === 'swivel' ? 3.2 : 2.4 };
+    }
+  }
+
+  updateHead(time, dt) {
+    let targetYaw = 0;
+    if (this.idleAction && this.idleAction.name === 'glance') {
+      targetYaw = this.glanceDirection;
+    } else if (this.walking && this.path.length) {
+      const desired = Math.atan2(this.path[0][0] - this.scenePosition[0], this.path[0][1] - this.scenePosition[1]);
+      targetYaw = clampValue(angleDelta(desired, this.group.rotation.y), -0.9, 0.9) * 0.6;
+    } else if (speakingKey && speakingKey !== this.key && robots.has(speakingKey)) {
+      const speaker = robots.get(speakingKey).group.position;
+      const desired = Math.atan2(speaker.x - this.group.position.x, speaker.z - this.group.position.z);
+      targetYaw = clampValue(angleDelta(desired, this.group.rotation.y), -1.15, 1.15);
+    } else {
+      targetYaw = Math.sin(time * 0.35 + this.seedPhase) * 0.12;
+    }
+    this.head.rotation.y += (targetYaw - this.head.rotation.y) * Math.min(1, 5 * dt);
+  }
+
+  applyLimbs(pose) {
+    this.hips.position.y = pose.hipsY;
+    this.legs[0].hip.rotation.x = pose.hipL;
+    this.legs[1].hip.rotation.x = pose.hipR;
+    this.legs[0].knee.rotation.x = pose.kneeL;
+    this.legs[1].knee.rotation.x = pose.kneeR;
+    this.arms[0].shoulder.rotation.x = pose.shoulderL;
+    this.arms[1].shoulder.rotation.x = pose.shoulderR;
+    this.arms[0].elbow.rotation.x = pose.elbowL;
+    this.arms[1].elbow.rotation.x = pose.elbowR;
+    this.torso.rotation.x = pose.torsoRotX;
+    this.torso.rotation.y = pose.torsoRotY;
+    this.torso.position.y = pose.torsoY;
+  }
+
+  pose(time, dt) {
     const active = this.status === 'thinking' || this.status === 'speaking' || this.status === 'delegated';
-    const phase = time * 2 + this.key.length;
+    const phase = time * 2 + this.seedPhase;
     const orbColor = new THREE.Color(STATUS_COLORS[this.status] || STATUS_COLORS.idle);
     this.statusOrb.material.color.copy(orbColor);
     this.statusOrb.material.emissive.copy(orbColor);
@@ -1145,42 +1261,94 @@ class Robot {
       this.group.position.y = 0;
     }
 
-    if (this.walking) {
+    this.updateBlink(time);
+    this.updateIdle(time);
+
+    // sit-down sequence: arrive, turn to face the desk, then settle into the chair
+    // (chair swivels rotate the body on purpose, so they bypass the facing gate)
+    const swiveling = this.idleAction && this.idleAction.name === 'swivel';
+    const facingDesk = swiveling || Math.abs(angleDelta(0, this.group.rotation.y)) < 0.35;
+    const sitTarget = this.seated && facingDesk ? 1 : 0;
+    const sitRate = sitTarget > this.sitProgress ? 3.2 : 5.5;
+    this.sitProgress += (sitTarget - this.sitProgress) * Math.min(1, sitRate * dt);
+    const sit = this.sitProgress;
+
+    let base;
+    if (this.walking && sit < 0.45) {
       const stride = (this.walkDistance / STRIDE_LENGTH) * Math.PI;
-      this.group.rotation.y = dampAngle(this.group.rotation.y, this.heading, 12, 1 / 60);
-      this.hips.position.y = 20 + Math.abs(Math.sin(stride)) * 2.4;
-      this.legs[0].rotation.x = Math.sin(stride) * 0.7;
-      this.legs[1].rotation.x = -Math.sin(stride) * 0.7;
-      this.arms[0].rotation.x = -Math.sin(stride) * 0.55;
-      this.arms[1].rotation.x = Math.sin(stride) * 0.55;
-      this.torso.rotation.x = 0.08;
-      this.torso.rotation.y = Math.sin(stride) * 0.05;
-    } else if (this.seated) {
-      this.group.rotation.y = dampAngle(this.group.rotation.y, 0, 8, 1 / 60);
-      this.hips.position.y = 17.5;
-      this.legs[0].rotation.x = 1.45;
-      this.legs[1].rotation.x = 1.45;
-      this.arms[0].rotation.x = 0.85 + Math.sin(phase * 5) * 0.07;
-      this.arms[1].rotation.x = 0.85 - Math.sin(phase * 5) * 0.07;
-      this.torso.rotation.x = 0.12;
-      this.torso.rotation.y = 0;
-      this.torso.position.y = 14 + Math.sin(phase * 2.2) * 0.35;
+      this.group.rotation.y = dampAngle(this.group.rotation.y, this.heading, 12, dt);
+      const swing = Math.sin(stride);
+      base = {
+        hipsY: 20 + Math.abs(swing) * 2.2,
+        hipL: swing * 0.65, hipR: -swing * 0.65,
+        kneeL: -Math.max(0, Math.sin(stride + 0.7)) * 0.85,
+        kneeR: -Math.max(0, Math.sin(stride + Math.PI + 0.7)) * 0.85,
+        shoulderL: -swing * 0.5, shoulderR: swing * 0.5,
+        elbowL: 0.3, elbowR: 0.3,
+        torsoRotX: 0.08, torsoRotY: swing * 0.05, torsoY: 14,
+      };
+    } else if (this.seated || sit > 0.05) {
+      this.group.rotation.y = dampAngle(this.group.rotation.y, 0, 8, dt);
+      base = {
+        hipsY: 20, hipL: 0, hipR: 0, kneeL: 0, kneeR: 0,
+        shoulderL: 0.05, shoulderR: 0.05, elbowL: 0.15, elbowR: 0.15,
+        torsoRotX: 0, torsoRotY: 0, torsoY: 14,
+      };
+      const typeBob = Math.sin(phase * 5) * 0.08;
+      const seatedPose = {
+        hipsY: 16.6, hipL: 1.5, hipR: 1.5, kneeL: -1.35, kneeR: -1.35,
+        shoulderL: 0.5 + typeBob, shoulderR: 0.5 - typeBob,
+        elbowL: 1.05 - typeBob, elbowR: 1.05 + typeBob,
+        torsoRotX: 0.12, torsoRotY: 0, torsoY: 14 + Math.sin(phase * 2.2) * 0.35,
+      };
+      for (const field of Object.keys(base)) {
+        base[field] += (seatedPose[field] - base[field]) * sit;
+      }
     } else {
-      this.group.rotation.y = dampAngle(this.group.rotation.y, 0, 6, 1 / 60);
-      this.hips.position.y = 20 + (active ? Math.sin(phase) * 1.6 : 0);
-      this.legs[0].rotation.x = 0;
-      this.legs[1].rotation.x = 0;
-      this.arms[0].rotation.x = active ? Math.sin(phase) * 0.18 : 0;
-      this.arms[1].rotation.x = active ? -Math.sin(phase) * 0.18 : 0;
-      this.torso.rotation.x = 0;
-      this.torso.rotation.y = 0;
-      this.torso.position.y = 14;
+      this.group.rotation.y = dampAngle(this.group.rotation.y, this.excursion ? this.heading : 0, 6, dt);
+      base = {
+        hipsY: 20 + (active ? Math.sin(phase) * 1.6 : 0),
+        hipL: 0, hipR: 0, kneeL: -0.06, kneeR: -0.06,
+        shoulderL: active ? Math.sin(phase) * 0.18 : 0.04,
+        shoulderR: active ? -Math.sin(phase) * 0.18 : 0.04,
+        elbowL: 0.18, elbowR: 0.18,
+        torsoRotX: 0, torsoRotY: 0, torsoY: 14,
+      };
     }
+
+    // idle micro-behaviors layer on top of whatever the body is doing
+    if (this.idleAction) {
+      const progress = Math.min(1, (time - this.idleAction.start) / this.idleAction.duration);
+      const envelope = Math.sin(progress * Math.PI);
+      if (this.idleAction.name === 'stretch') {
+        base.shoulderL += (-2.7 - base.shoulderL) * envelope;
+        base.shoulderR += (-2.7 - base.shoulderR) * envelope;
+        base.elbowL += (-0.2 - base.elbowL) * envelope;
+        base.elbowR += (-0.2 - base.elbowR) * envelope;
+        base.torsoRotX += -0.1 * envelope;
+      } else if (this.idleAction.name === 'sip') {
+        base.shoulderR += (0.55 - base.shoulderR) * envelope;
+        base.elbowR += (2.05 - base.elbowR) * envelope;
+      } else if (this.idleAction.name === 'swivel') {
+        this.group.rotation.y = Math.sin(progress * Math.PI * 2) * 0.45 * this.glanceDirection;
+      }
+    }
+
+    this.applyLimbs(base);
+    this.updateHead(time, dt);
   }
 
   dispose() {
     scene.remove(this.group);
   }
+}
+
+function clampValue(value, low, high) {
+  return Math.min(high, Math.max(low, value));
+}
+
+function angleDelta(target, current) {
+  return ((target - current + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
 }
 
 function dampAngle(current, target, lambda, dt) {
@@ -1191,10 +1359,12 @@ function dampAngle(current, target, lambda, dt) {
 /* --------------------------- live state --------------------------- */
 const robots = new Map();
 let latestState = { agents: {}, events: [] };
+let speakingKey = null;   // seated neighbors turn their heads toward the speaker
 
 function applyState(state) {
   latestState = state;
   const agents = Object.entries(state.agents || {});
+  speakingKey = (agents.find(([, agent]) => agent.status === 'speaking') || [null])[0];
   const placements = assignScenePositions(agents);
   const seen = new Set();
   for (const placement of placements) {
@@ -1248,6 +1418,7 @@ const VIEW_PRESETS = {
   low: { position: [-420, 120, 700], target: [80, 60, -40] },
   window: { position: [-380, 190, -40], target: [520, 130, 40] },
   ops: { position: [10, 300, 480], target: [0, 40, 40] },
+  desk: { position: [-95, 95, 390], target: [-185, 30, 215] },
 };
 const viewPreset = VIEW_PRESETS[params.get('view')];
 if (viewPreset) {
@@ -1483,21 +1654,16 @@ function autoAdjustQuality(dt, time) {
 /* ----------------------------- render loop ----------------------------- */
 const frameClock = new THREE.Clock();
 let renderPaused = false;
-window.__office = {
-  renderer, scene, camera,
-  setPaused: (value) => { renderPaused = Boolean(value); },
-  getQuality: () => ({ tier: activeTier, auto: autoQuality, composer: Boolean(composer) }),
-};
-function animate() {
-  requestAnimationFrame(animate);
-  if (renderPaused) return;
-  const dt = Math.min(frameClock.getDelta(), 0.1);
-  const time = frameClock.elapsedTime;
+let sceneTime = 0;
+
+function stepScene(dt) {
+  sceneTime += dt;
+  const time = sceneTime;
   updateDayNight();
   autoAdjustQuality(dt, time);
   for (const robot of robots.values()) {
     robot.advance(dt);
-    robot.pose(time);
+    robot.pose(time, dt);
   }
   workstationScreens.forEach((screen, index) => {
     screen.material.emissiveIntensity = 0.75 + Math.sin(time * 2.2 + index * 1.7) * 0.15;
@@ -1505,6 +1671,27 @@ function animate() {
   controls.update();
   if (composer) composer.render();
   else renderer.render(scene, camera);
+}
+
+window.__office = {
+  renderer, scene, camera,
+  setPaused: (value) => { renderPaused = Boolean(value); },
+  getQuality: () => ({ tier: activeTier, auto: autoQuality, composer: Boolean(composer) }),
+  stepFrame: (dt = 1 / 60) => stepScene(dt),   // manual stepping for debugging
+  debugRobots: () => Array.from(robots.values()).map((robot) => ({
+    key: robot.key, status: robot.status, zone: robot.zone,
+    walking: robot.walking, sit: Number(robot.sitProgress.toFixed(2)),
+    yaw: Number(robot.group.rotation.y.toFixed(2)),
+    position: robot.scenePosition && robot.scenePosition.map(Math.round),
+    idle: robot.idleAction && robot.idleAction.name,
+    excursion: Boolean(robot.excursion),
+  })),
+};
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (renderPaused) return;
+  stepScene(Math.min(frameClock.getDelta(), 0.1));
 }
 animate();
 

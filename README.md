@@ -816,7 +816,11 @@ browser: it renders a full room with three.js — ceiling with recessed light pa
 a night skyline behind the glass curtain wall with half-lowered blinds, framed wall
 art, carpeted desk pods, and rounded furniture with proper desk legs, monitor arms,
 and task chairs — and the robots physically walk around the furniture, sit down at
-their desks, and type while they work. Drag to orbit, scroll to zoom. The office
+their desks, and type while they work. The robots are fully articulated — knees
+and elbows bend, they turn to face their chair and settle into it instead of
+teleporting, their heads track where they're walking or whoever is speaking, they
+blink — and between tasks they stretch, sip coffee, swivel their chairs, or wander
+to the lounge for a break. Drag to orbit, scroll to zoom. The office
 follows your local time of day: the sun sweeps across the room and warms toward
 sunset, and after dark the skyline windows light up and every desk lamp comes on.
 A quality chip in the top-right corner cycles post-processing (ambient occlusion,
