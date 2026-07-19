@@ -820,7 +820,10 @@ their desks, and type while they work. The robots are fully articulated — knee
 and elbows bend, they turn to face their chair and settle into it instead of
 teleporting, their heads track where they're walking or whoever is speaking, they
 blink — and between tasks they stretch, sip coffee, swivel their chairs, or wander
-to the lounge for a break. Drag to orbit, scroll to zoom. The office
+to the lounge for a break. Drag to orbit, scroll to zoom, click any robot to have
+the camera follow it around (click the floor to release), or hit the TOUR chip for
+a slow cinematic camera that's perfect for a second monitor. Name plates and reply
+bubbles are crisp DOM overlays, so they stay sharp at any zoom. The office
 follows your local time of day: the sun sweeps across the room and warms toward
 sunset, and after dark the skyline windows light up and every desk lamp comes on.
 A quality chip in the top-right corner cycles post-processing (ambient occlusion,
