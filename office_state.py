@@ -17,6 +17,7 @@ from uuid import uuid4
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILENAME = "office_state.json"
 MAX_EVENTS = 30
+MAX_AGENT_HISTORY = 8
 MAX_PREVIEW_CHARS = 180
 VALID_STATUSES = {"idle", "thinking", "speaking", "delegated", "error"}
 
@@ -50,6 +51,13 @@ def _preview(text):
     if len(clean) <= MAX_PREVIEW_CHARS:
         return clean
     return clean[:MAX_PREVIEW_CHARS - 1].rstrip() + "…"
+
+
+def _clean_history(history):
+    """Keep per-agent history a small bounded list of event dicts (same privacy rules)."""
+    if not isinstance(history, list):
+        return []
+    return [item for item in history if isinstance(item, dict)][:MAX_AGENT_HISTORY]
 
 
 def _read_unlocked(path=None):
@@ -119,6 +127,7 @@ def configure_agents(agents, path=None):
                 "message": old.get("message") if isinstance(old.get("message"), str) else None,
                 "updated_at": old.get("updated_at") or _timestamp(),
                 "expires_at": old.get("expires_at") if isinstance(old.get("expires_at"), str) else None,
+                "history": _clean_history(old.get("history")),
             }
         state["agents"] = roster
         _write_unlocked(state, path)
@@ -150,7 +159,11 @@ def set_agent_status(key, status, message=None, duration_seconds=None, path=None
 
 
 def add_event(kind, agent_key, text, path=None):
-    """Prepend one concise activity item and retain only the newest events."""
+    """Prepend one concise activity item and retain only the newest events.
+
+    Events attributed to a rostered agent are also mirrored into that agent's
+    own bounded ``history`` list, newest first, so per-agent views stay cheap.
+    """
     with _lock:
         state = _read_unlocked(path)
         event = {
@@ -161,6 +174,9 @@ def add_event(kind, agent_key, text, path=None):
             "text": _preview(text),
         }
         state["events"] = [event, *state["events"]][:MAX_EVENTS]
+        agent = state["agents"].get(agent_key) if agent_key else None
+        if isinstance(agent, dict):
+            agent["history"] = [event, *_clean_history(agent.get("history"))][:MAX_AGENT_HISTORY]
         _write_unlocked(state, path)
         return event
 
@@ -195,4 +211,5 @@ def get_state(path=None):
             agent["expires_at"] = None
         elif agent.get("status") not in VALID_STATUSES:
             agent["status"] = "idle"
+        agent["history"] = _clean_history(agent.get("history"))
     return state
