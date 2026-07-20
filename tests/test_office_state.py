@@ -73,6 +73,46 @@ class OfficeStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             office_state.set_agent_status("code", "busy")
 
+    def test_agent_events_build_a_bounded_newest_first_history(self):
+        office_state.configure_agents({"code": {"name": "Patch", "role": "Engineering"}})
+        for number in range(office_state.MAX_AGENT_HISTORY + 3):
+            office_state.add_event("reply", "code", f"event {number}")
+        history = office_state.get_state()["agents"]["code"]["history"]
+        self.assertEqual(len(history), office_state.MAX_AGENT_HISTORY)
+        self.assertEqual(history[0]["text"], f"event {office_state.MAX_AGENT_HISTORY + 2}")
+        self.assertEqual(history[-1]["text"], "event 3")
+
+    def test_events_for_unknown_agents_do_not_create_roster_entries(self):
+        office_state.configure_agents({"code": {"name": "Patch", "role": "Engineering"}})
+        office_state.add_event("reply", "ghost", "not on the roster")
+        office_state.mark_message_received("plain group message")
+        state = office_state.get_state()
+        self.assertEqual(set(state["agents"]), {"code"})
+        self.assertEqual(state["agents"]["code"]["history"], [])
+
+    def test_reconfigure_preserves_history_for_retained_agents_only(self):
+        office_state.configure_agents({
+            "code": {"name": "Patch", "role": "Engineering"},
+            "write": {"name": "Quill", "role": "Writer"},
+        })
+        office_state.add_event("reply", "code", "shipped a fix")
+        office_state.add_event("reply", "write", "drafted a post")
+        state = office_state.configure_agents({
+            "code": {"name": "Patch", "role": "Engineering"},
+            "research": {"name": "Scout", "role": "Research"},
+        })
+        self.assertEqual(state["agents"]["code"]["history"][0]["text"], "shipped a fix")
+        self.assertEqual(state["agents"]["research"]["history"], [])
+        self.assertNotIn("write", state["agents"])
+
+    def test_corrupted_history_is_sanitized_on_read(self):
+        office_state.configure_agents({"code": {"name": "Patch", "role": "Engineering"}})
+        raw = office_state._read_unlocked()
+        raw["agents"]["code"]["history"] = "not a list"
+        office_state._write_unlocked(raw)
+        state = office_state.get_state()
+        self.assertEqual(state["agents"]["code"]["history"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

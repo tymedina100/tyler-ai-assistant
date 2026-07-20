@@ -786,8 +786,8 @@ python group_bot.py
 Virtual Office is a native Windows desktop app, not a browser dashboard. It draws an
 original cozy office scene with desks, small avatars, live status lights, reply bubbles,
 and a recent-activity log. The deployed Telegram worker is its live source of truth:
-`group_bot.py` exposes only the bounded office state (180-character previews and the 30
-most recent events) through an authenticated API.
+`group_bot.py` exposes only the bounded office state (180-character previews, the 30
+most recent events, and each agent's 8 most recent events) through an authenticated API.
 
 **On Railway:**
 
