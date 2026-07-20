@@ -676,16 +676,10 @@ function buildRoom() {
     scene.add(box(6, 5, 126, DARK_PANEL, 501, 248, z, false, false));       // headrail
   });
 
-  // planning wall: big whiteboard with sticky notes
+  // planning wall: big whiteboard with sticky notes that show the newest events
   scene.add(box(390, 130, 6, new THREE.MeshStandardMaterial({ color: '#f7f9fb', roughness: 0.35 }), 0, 150, -323.5, true, false));
   scene.add(box(400, 140, 4, WOOD_DARK, 0, 150, -326.4, true, false));
-  const noteColors = ['#f6d55c', '#f28b82', '#81c995', '#8ab4f8', '#f6d55c', '#d7aefb', '#81c995', '#f28b82'];
-  noteColors.forEach((color, index) => {
-    const note = box(26, 26, 2, new THREE.MeshStandardMaterial({ color, roughness: 0.6 }),
-      -160 + (index % 4) * 105 + (index * 7) % 22, 168 - Math.floor(index / 4) * 44, -320, false, false);
-    note.rotation.z = ((index * 37) % 10 - 5) * 0.02;
-    scene.add(note);
-  });
+  buildPlanningNotes();
 
   // wall clock + logo
   const clock = new THREE.Mesh(new THREE.CylinderGeometry(16, 16, 4, 32), new THREE.MeshStandardMaterial({ color: '#f2f5f8' }));
@@ -715,6 +709,68 @@ function buildRoom() {
   }
 
   buildCeiling();
+}
+
+/* --------- planning-wall sticky notes showing the newest events --------- */
+const planningNotes = [];
+const NOTE_COLORS = ['#f6d55c', '#f28b82', '#81c995', '#8ab4f8', '#f6d55c', '#d7aefb', '#81c995', '#f28b82'];
+
+function buildPlanningNotes() {
+  const noteGeometry = new THREE.PlaneGeometry(34, 34);
+  NOTE_COLORS.forEach((color, index) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128; canvas.height = 128;
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    const mesh = new THREE.Mesh(noteGeometry, new THREE.MeshStandardMaterial({ map: texture, roughness: 0.6 }));
+    mesh.position.set(-160 + (index % 4) * 105 + (index * 7) % 22, 168 - Math.floor(index / 4) * 44, -320);
+    mesh.rotation.z = ((index * 37) % 10 - 5) * 0.02;
+    scene.add(mesh);
+    const note = { canvas, texture, color, lastText: null };
+    planningNotes.push(note);
+    paintPlanningNote(note, '');
+  });
+}
+
+function paintPlanningNote(note, text) {
+  const context = note.canvas.getContext('2d');
+  context.fillStyle = note.color;
+  context.fillRect(0, 0, 128, 128);
+  context.fillStyle = 'rgba(255, 255, 255, 0.4)';
+  context.fillRect(0, 0, 128, 13);   // glue strip
+  if (text) {
+    context.fillStyle = '#3a3428';
+    context.font = '700 19px "Segoe UI", sans-serif';
+    context.textBaseline = 'top';
+    const words = String(text).split(' ');
+    const lines = [];
+    let line = '';
+    let truncated = false;
+    for (const word of words) {
+      const probe = line ? `${line} ${word}` : word;
+      if (context.measureText(probe).width > 108 && line) {
+        if (lines.length === 3) { truncated = true; break; }
+        lines.push(line);
+        line = word;
+      } else {
+        line = probe;
+      }
+    }
+    if (line && lines.length < 4) lines.push(line);
+    if (truncated) lines[lines.length - 1] += '…';
+    lines.forEach((entry, lineIndex) => context.fillText(entry, 10, 24 + lineIndex * 24));
+  }
+  note.texture.needsUpdate = true;
+}
+
+function updatePlanningNotes(events) {
+  planningNotes.forEach((note, index) => {
+    const text = events[index] && events[index].text ? String(events[index].text) : '';
+    if (text === note.lastText) return;
+    note.lastText = text;
+    paintPlanningNote(note, text);
+  });
 }
 
 function makeTextPlate(text, color, width, height, x, y, z) {
@@ -1446,6 +1502,7 @@ function applyState(state) {
     if (!seen.has(key)) { robot.dispose(); robots.delete(key); }
   }
   renderPanels(state, agents);
+  updatePlanningNotes(state.events || []);
   if (panelKey) refreshAgentPanel();
 }
 
@@ -1490,6 +1547,7 @@ const VIEW_PRESETS = {
   window: { position: [-380, 190, -40], target: [520, 130, 40] },
   ops: { position: [10, 300, 480], target: [0, 40, 40] },
   desk: { position: [-95, 95, 390], target: [-185, 30, 215] },
+  wall: { position: [0, 160, 30], target: [0, 150, -320] },
 };
 const viewPreset = VIEW_PRESETS[params.get('view')];
 if (viewPreset) {
@@ -1574,6 +1632,9 @@ function demoState(phaseIndex) {
       { kind: 'message', agent_key: 'code', text: 'Deployed the new build to Railway', timestamp: new Date().toISOString() },
       { kind: 'activity', agent_key: 'research', text: 'Scanned 14 subreddits for leads', timestamp: new Date(Date.now() - 240000).toISOString() },
       { kind: 'error', agent_key: 'finance', text: 'Stripe webhook needs a retry', timestamp: new Date(Date.now() - 480000).toISOString() },
+      { kind: 'activity', agent_key: 'marketing', text: 'Scheduled 5 posts for launch week', timestamp: new Date(Date.now() - 720000).toISOString() },
+      { kind: 'activity', agent_key: 'write', text: 'Release notes drafted for review', timestamp: new Date(Date.now() - 960000).toISOString() },
+      { kind: 'message', agent_key: 'manager', text: 'Daily brief sent to the group', timestamp: new Date(Date.now() - 1200000).toISOString() },
     ],
   };
 }
