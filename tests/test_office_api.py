@@ -67,6 +67,25 @@ class OfficeAPITests(unittest.TestCase):
     def test_3d_office_page_asset_is_packaged(self):
         self.assertTrue(office_api.OFFICE_PAGE_FILE.is_file())
 
+    def test_metrics_endpoint_requires_the_same_bearer_token(self):
+        url = f"http://127.0.0.1:{self.server.server_port}{office_api.OFFICE_METRICS_PATH}"
+        with self.assertRaises(HTTPError) as missing:
+            urlopen(Request(url), timeout=3)
+        self.assertEqual(missing.exception.code, 401)
+        with self.assertRaises(HTTPError) as incorrect:
+            urlopen(Request(url, headers={"Authorization": "Bearer nope"}), timeout=3)
+        self.assertEqual(incorrect.exception.code, 403)
+
+    def test_authorized_metrics_request_returns_the_dashboard_payload(self):
+        url = f"http://127.0.0.1:{self.server.server_port}{office_api.OFFICE_METRICS_PATH}"
+        fake = {"generated_at": "now", "sales": {"configured": False},
+                "linear": {"configured": False}, "team": {"team_size": 1}}
+        with patch.object(office_api.office_metrics, "get_metrics", return_value=fake):
+            with urlopen(Request(url, headers={"Authorization": "Bearer office-test-token"}), timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload, fake)
+
 
 if __name__ == "__main__":
     unittest.main()

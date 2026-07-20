@@ -18,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_FILENAME = "office_state.json"
 MAX_EVENTS = 30
 MAX_AGENT_HISTORY = 8
+MAX_COUNTED_AGENTS = 24
 MAX_PREVIEW_CHARS = 180
 VALID_STATUSES = {"idle", "thinking", "speaking", "delegated", "error"}
 
@@ -41,8 +42,39 @@ def _timestamp(value=None):
     return (value or _now()).isoformat()
 
 
+def _today():
+    return _now().date().isoformat()
+
+
+def _empty_counters():
+    """One small rolling day of activity totals for the KPI wall (UTC dates)."""
+    return {"date": _today(), "messages": 0, "events": 0, "agent_events": {}}
+
+
+def _clean_counters(raw):
+    if not isinstance(raw, dict):
+        return _empty_counters()
+    agent_events = {}
+    if isinstance(raw.get("agent_events"), dict):
+        for key, value in list(raw["agent_events"].items())[:MAX_COUNTED_AGENTS]:
+            if isinstance(value, int) and value >= 0:
+                agent_events[str(key)] = value
+    return {
+        "date": raw.get("date") if isinstance(raw.get("date"), str) else _today(),
+        "messages": raw.get("messages") if isinstance(raw.get("messages"), int) else 0,
+        "events": raw.get("events") if isinstance(raw.get("events"), int) else 0,
+        "agent_events": agent_events,
+    }
+
+
 def _empty_state():
-    return {"version": 1, "updated_at": _timestamp(), "agents": {}, "events": []}
+    return {
+        "version": 1,
+        "updated_at": _timestamp(),
+        "agents": {},
+        "events": [],
+        "counters": _empty_counters(),
+    }
 
 
 def _preview(text):
@@ -79,6 +111,7 @@ def _read_unlocked(path=None):
         if isinstance(agents, dict) else {}
     )
     state["events"] = [event for event in events if isinstance(event, dict)][:MAX_EVENTS] if isinstance(events, list) else []
+    state["counters"] = _clean_counters(raw.get("counters"))
     return state
 
 
@@ -177,6 +210,15 @@ def add_event(kind, agent_key, text, path=None):
         agent = state["agents"].get(agent_key) if agent_key else None
         if isinstance(agent, dict):
             agent["history"] = [event, *_clean_history(agent.get("history"))][:MAX_AGENT_HISTORY]
+        counters = state["counters"]
+        if counters["date"] != _today():
+            counters = _empty_counters()
+            state["counters"] = counters
+        counters["events"] += 1
+        if event["kind"] == "message":
+            counters["messages"] += 1
+        if agent_key and (agent_key in counters["agent_events"] or len(counters["agent_events"]) < MAX_COUNTED_AGENTS):
+            counters["agent_events"][agent_key] = counters["agent_events"].get(agent_key, 0) + 1
         _write_unlocked(state, path)
         return event
 
@@ -212,4 +254,7 @@ def get_state(path=None):
         elif agent.get("status") not in VALID_STATUSES:
             agent["status"] = "idle"
         agent["history"] = _clean_history(agent.get("history"))
+    if state["counters"]["date"] != _today():
+        # yesterday's totals never masquerade as today's
+        state["counters"] = _empty_counters()
     return state

@@ -7,10 +7,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import office_metrics
 import office_state
 
 
 OFFICE_STATE_PATH = "/api/office-state"
+OFFICE_METRICS_PATH = "/api/office-metrics"
 OFFICE_PAGE_PATHS = {"/", "/office", "/office3d"}
 OFFICE_PAGE_FILE = Path(__file__).resolve().parent / "assets" / "office" / "office3d.html"
 
@@ -53,7 +55,7 @@ class OfficeAPIRequestHandler(BaseHTTPRequestHandler):
         if path in OFFICE_PAGE_PATHS:
             self._send_office_page()
             return
-        if path != OFFICE_STATE_PATH:
+        if path not in (OFFICE_STATE_PATH, OFFICE_METRICS_PATH):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
         if not self.headers.get("Authorization"):
@@ -61,6 +63,9 @@ class OfficeAPIRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._is_authorized():
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid office API token"})
+            return
+        if path == OFFICE_METRICS_PATH:
+            self._send_json(HTTPStatus.OK, office_metrics.get_metrics())
             return
         self._send_json(HTTPStatus.OK, office_state.get_state())
 

@@ -113,6 +113,45 @@ class OfficeStateTests(unittest.TestCase):
         state = office_state.get_state()
         self.assertEqual(state["agents"]["code"]["history"], [])
 
+    def test_daily_counters_track_messages_and_agent_events(self):
+        office_state.configure_agents({"code": {"name": "Patch", "role": "Engineering"}})
+        office_state.mark_message_received("hello team")
+        office_state.add_event("reply", "code", "shipped a fix")
+        office_state.add_event("reply", "code", "and another")
+        counters = office_state.get_state()["counters"]
+        self.assertEqual(counters["messages"], 1)
+        self.assertEqual(counters["events"], 3)
+        self.assertEqual(counters["agent_events"], {"code": 2})
+
+    def test_counters_reset_when_the_day_rolls_over(self):
+        yesterday = datetime(2026, 7, 18, 23, 50, tzinfo=timezone.utc)
+        today = datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc)
+        with patch.object(office_state, "_now", return_value=yesterday):
+            office_state.mark_message_received("late night message")
+        with patch.object(office_state, "_now", return_value=today):
+            office_state.add_event("reply", None, "first of the day")
+            counters = office_state.get_state()["counters"]
+        self.assertEqual(counters["date"], "2026-07-19")
+        self.assertEqual(counters["events"], 1)
+        self.assertEqual(counters["messages"], 0)
+
+    def test_stale_counters_read_as_zero_without_new_events(self):
+        yesterday = datetime(2026, 7, 18, 23, 50, tzinfo=timezone.utc)
+        with patch.object(office_state, "_now", return_value=yesterday):
+            office_state.mark_message_received("late night message")
+        with patch.object(office_state, "_now", return_value=yesterday + timedelta(hours=1)):
+            counters = office_state.get_state()["counters"]
+        self.assertEqual(counters["messages"], 0)
+        self.assertEqual(counters["events"], 0)
+
+    def test_corrupted_counters_are_sanitized_on_read(self):
+        raw = office_state._read_unlocked()
+        raw["counters"] = ["nonsense"]
+        office_state._write_unlocked(raw)
+        counters = office_state.get_state()["counters"]
+        self.assertEqual(counters["messages"], 0)
+        self.assertEqual(counters["agent_events"], {})
+
 
 if __name__ == "__main__":
     unittest.main()
