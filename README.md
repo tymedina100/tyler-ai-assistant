@@ -313,14 +313,23 @@ Telegram bot, and the multi-bot group all show the same characters:
   Calendar, your reminders, and the weather desk.
 - **Piper** — Communications & Support Lead. Brisk and discreet; triages, drafts, and
   sends email, including customer-support triage for the company's products.
+- **Dash** — Sales Lead. Energetic but honest; drafts outreach that names a real pain,
+  tracks every lead's stage and next follow-up in memory, and reports the pipeline.
+  Drafts only — sending stays with you (or Piper, for email).
+- **Vega** — Analytics Lead. Crisp and zero-fluff; pulls the real revenue, budget, and
+  task numbers and compresses them into a short digest with exactly one recommendation.
 - **Robin** — the general assistant (the all-rounder for anything that doesn't fit a
   specialist).
 
-Sway, Vera, and Ledger are the newest hires from the roster reorg (which also merged
-the old News Agent into Scout, the old Tasks Agent into Sage, and retired the Weather
-Agent's seat — the weather *tool* moved to Cadence). Cadence and Piper still work via
-Miles's delegation until you create their bots and add `"calendar"` / `"gmail"` to
-`BOT_KEYS`.
+Dash and Vega are the newest hires, added because a traffic/sales-focused solo
+business needs someone who owns outreach and someone who owns the numbers (a
+dedicated support seat was considered and skipped — Piper already owns customer
+email). Like Cadence and Piper before them, they work via Miles's delegation out of
+the box and become @mentionable group bots as soon as you create their Telegram bots
+and set `TELEGRAM_SALES_BOT_TOKEN` / `TELEGRAM_ANALYTICS_BOT_TOKEN`. Earlier
+roster changes: Sway, Vera, and Ledger arrived in the reorg that merged the old News
+Agent into Scout and the old Tasks Agent into Sage, and retired the Weather Agent's
+seat (the weather *tool* moved to Cadence).
 
 Personalities are just prompt text, so they're easy to retune: edit the `persona`
 field on each `SPECIALISTS` entry (or `MANAGER_INSTRUCTIONS` / `ASSISTANT_INSTRUCTIONS`

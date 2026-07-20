@@ -37,7 +37,7 @@ class RosterConsistencyTests(unittest.TestCase):
     def test_retired_keys_gone_and_new_keys_present(self):
         keys = set(self.main.SPECIALISTS)
         self.assertTrue({"news", "tasks", "weather"}.isdisjoint(keys))
-        self.assertTrue({"marketing", "editor", "finance"} <= keys)
+        self.assertTrue({"marketing", "editor", "finance", "sales", "analytics"} <= keys)
 
     def test_every_delegation_tool_has_a_matching_branch(self):
         # execute_tool must have a branch for each delegation tool AND use the

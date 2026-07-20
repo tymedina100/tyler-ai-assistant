@@ -186,11 +186,13 @@ const AGENT_COLORS = {
   manager: '#ff9d4d', code: '#3e8cff', research: '#48b78a', write: '#ad70e8',
   task: '#ef7278', marketing: '#f7ba3f', editor: '#9a70d8', finance: '#4bb3c5',
   calendar: '#f07898', gmail: '#ef8062', linear: '#6174e8', general: '#64748b',
+  sales: '#d4589e', analytics: '#c0ca33',
 };
 const HOME_SLOTS = [
   [150, 170], [300, 145], [700, 145], [850, 170],
   [120, 360], [885, 355], [170, 505], [315, 535],
   [680, 535], [835, 505], [440, 550], [560, 550],
+  [65, 470], [925, 470],
 ];
 const ZONE_ANCHORS = { planning: [500, 210], operations: [500, 392], response: [745, 432], support: [185, 280] };
 const ZONE_OFFSETS = [[0, 0], [-50, 22], [50, 22], [-78, 46], [78, 46], [0, 55]];
@@ -1707,6 +1709,8 @@ const DEMO_ROSTER = {
   write: ['Writer', 'Content Writer'],
   finance: ['Penny', 'Finance'],
   marketing: ['Mara', 'Marketing Lead'],
+  sales: ['Dash', 'Sales Lead'],
+  analytics: ['Vega', 'Analytics Lead'],
 };
 const DEMO_HISTORY = {
   manager: ['Dispatched the launch checklist', 'Reviewed the daily brief'],
@@ -1715,11 +1719,13 @@ const DEMO_HISTORY = {
   write: ['Drafted the release notes'],
   finance: ['Reconciled Gumroad payouts'],
   marketing: ['Scheduled 5 posts for the week'],
+  sales: ['Sent 6 outreach messages', 'Logged 2 new leads'],
+  analytics: ['Published the morning numbers digest'],
 };
 const DEMO_PHASES = [
   { code: ['thinking', 'Refactoring the parser'], research: ['speaking', 'Found three qualified leads'], manager: ['delegated', 'Assigning the launch work'] },
   { manager: ['delegated', 'Coordinating the launch push'], marketing: ['delegated', 'Preparing launch assets'], write: ['delegated', 'Newsletter draft assigned'] },
-  { code: ['speaking', 'Deploy is green across the board'], finance: ['error', 'Stripe webhook failed twice'] },
+  { code: ['speaking', 'Deploy is green across the board'], finance: ['error', 'Stripe webhook failed twice'], sales: ['thinking', 'Qualifying two new leads'] },
   {},
 ];
 

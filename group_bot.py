@@ -100,7 +100,7 @@ BOT_KEYS = ["manager", "code", "research", "write", "task", "marketing", "editor
 # Optional bots: enabled only if their token env var (TELEGRAM_<KEY>_BOT_TOKEN) is
 # set - never required, so a missing token can't hard-exit startup. When disabled
 # the agent still works via Miles's delegation; it just isn't @mentionable.
-OPTIONAL_BOT_KEYS = ["linear", "calendar", "gmail", "general"]
+OPTIONAL_BOT_KEYS = ["linear", "calendar", "gmail", "general", "sales", "analytics"]
 BOT_KEYS += [key for key in OPTIONAL_BOT_KEYS
              if os.environ.get(f"TELEGRAM_{key.upper()}_BOT_TOKEN")]
 
@@ -135,6 +135,8 @@ AGENT_INFO = {
     "calendar": {"env_var": "TELEGRAM_CALENDAR_BOT_TOKEN", "tagline": "@mention me about your calendar, a reminder, or the weather."},
     "gmail": {"env_var": "TELEGRAM_GMAIL_BOT_TOKEN", "tagline": "@mention me to check or send email, or handle a customer message."},
     "linear": {"env_var": "TELEGRAM_LINEAR_BOT_TOKEN", "tagline": "@mention me to turn ideas into Linear issues."},
+    "sales": {"env_var": "TELEGRAM_SALES_BOT_TOKEN", "tagline": "@mention me to draft outreach or check the sales pipeline."},
+    "analytics": {"env_var": "TELEGRAM_ANALYTICS_BOT_TOKEN", "tagline": "@mention me for a numbers digest and the one move to make next."},
     # Robin (the general assistant) isn't a main.SPECIALISTS entry - it's the
     # all-rounder fallback that runs through main.ask_ai with the full toolset. So,
     # like the manager, it carries its own label/welcome here and is skipped in the
