@@ -793,7 +793,10 @@ most recent events, and each agent's 8 most recent events) through an authentica
 
 1. Set a long random `OFFICE_API_TOKEN` secret on the Telegram worker service.
 2. Give that service a Railway public domain. The worker then listens on Railway's
-   assigned `$PORT` and serves `GET /api/office-state` with bearer-token authentication.
+   assigned `$PORT` and serves `GET /api/office-state` plus `GET /api/office-metrics`
+   (aggregated Gumroad sales, Linear issues completed today, and daily team activity
+   counters — each source degrades gracefully when unconfigured) with bearer-token
+   authentication.
 3. Redeploy the worker. Keep the token private; it grants read access to office previews.
 
 **On your Windows desktop:**
