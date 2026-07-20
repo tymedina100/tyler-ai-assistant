@@ -818,8 +818,10 @@ art, carpeted desk pods, and rounded furniture with proper desk legs, monitor ar
 and task chairs — and the robots physically walk around the furniture, sit down at
 their desks, and type while they work. When Miles delegates work to two or more
 teammates at once, the whole group walks to the rug beside the operations desk and
-huddles in a circle facing each other until the work is done. The robots are fully
-articulated — knees
+huddles in a circle facing each other until the work is done. The sticky notes on
+the planning whiteboard are real: each one shows the text of one of the newest
+office events, so the wall reads like a live kanban of what just happened. The
+robots are fully articulated — knees
 and elbows bend, they turn to face their chair and settle into it instead of
 teleporting, their heads track where they're walking or whoever is speaking, they
 blink — and between tasks they stretch, sip coffee, swivel their chairs, or wander
