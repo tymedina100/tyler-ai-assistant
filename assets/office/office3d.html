@@ -25,6 +25,11 @@
   #title-chip .name { font-size: 20px; font-weight: 700; }
   #connection-chip { top: 18px; right: 18px; font-size: 12px; font-weight: 600; }
   #connection-dot { width: 9px; height: 9px; border-radius: 50%; background: #f7b844; }
+  #quality-chip {
+    top: 64px; right: 18px; font-size: 10px; font-weight: 700; letter-spacing: 1.2px;
+    color: var(--muted); cursor: pointer; user-select: none; padding: 7px 13px;
+  }
+  #quality-chip:hover { color: var(--text); }
   #event-panel {
     position: absolute; left: 18px; bottom: 18px; width: min(430px, 44vw);
     background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px;
@@ -84,6 +89,7 @@
 <body>
 <div id="title-chip" class="chip"><span class="kicker">TYLER AI ASSISTANT</span><span class="name">Virtual Office 3D</span></div>
 <div id="connection-chip" class="chip"><span id="connection-dot"></span><span id="connection-text">Connecting…</span></div>
+<div id="quality-chip" class="chip" title="Cycle render quality">QUALITY AUTO</div>
 <div id="demo-badge">DEMO MODE</div>
 <div id="event-panel">
   <h2>ACTIVITY CONSOLE</h2>
@@ -107,6 +113,12 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 /* ------------------------------------------------------------------ *
  * Shared layout contract — keep in sync with office_desktop.py.      *
@@ -273,7 +285,7 @@ renderer.toneMappingExposure = 1.05;
 document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = buildSkyGradientTexture();
+// background + fog colors are painted by the day/night cycle further down
 scene.fog = new THREE.Fog('#131b30', 1500, 2600);
 
 // image-based lighting so plastics and metals pick up soft studio reflections
@@ -291,7 +303,8 @@ controls.maxPolarAngle = Math.PI * 0.46;
 controls.minDistance = 260;
 controls.maxDistance = 1600;
 
-scene.add(new THREE.HemisphereLight('#dbe8ff', '#9b8d7a', 0.55));
+const hemi = new THREE.HemisphereLight('#dbe8ff', '#9b8d7a', 0.55);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight('#fff4e0', 1.9);
 sun.position.set(420, 640, 260);
 sun.castShadow = true;
@@ -320,6 +333,10 @@ const SCREEN_OFF = new THREE.MeshStandardMaterial({ color: '#141c28', emissive: 
 const CEILING_MAT = new THREE.MeshStandardMaterial({ color: '#e9e9ef', roughness: 0.92 });
 const CARPET = new THREE.MeshStandardMaterial({ color: '#3c4d68', roughness: 0.97 });
 const FRAME_MAT = new THREE.MeshStandardMaterial({ color: '#2b3442', roughness: 0.5 });
+// shared by every desk lamp; the day/night cycle turns them up after dark
+const LAMP_BULB = new THREE.MeshStandardMaterial({ color: '#fff4d6', emissive: '#ffdf9e', emissiveIntensity: 0.1 });
+// materials and meshes the day/night cycle drives, registered as the room is built
+const lighting = {};
 
 // desks and chairs repeat 12x, so identical part dimensions share one geometry
 const boxGeometryCache = new Map();
@@ -371,39 +388,30 @@ function buildFloorTexture() {
   return texture;
 }
 
-function buildSkyGradientTexture() {
-  const canvas = document.createElement('canvas');
-  canvas.width = 64; canvas.height = 512;
-  const context = canvas.getContext('2d');
-  const gradient = context.createLinearGradient(0, 0, 0, 512);
-  gradient.addColorStop(0, '#060a18');
-  gradient.addColorStop(0.55, '#131b30');
-  gradient.addColorStop(1, '#2a3a5e');
-  context.fillStyle = gradient;
-  context.fillRect(0, 0, 64, 512);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  return texture;
-}
-
-function buildSkylineTexture() {
+function buildSkylineTexture(night) {
   const canvas = document.createElement('canvas');
   canvas.width = 1024; canvas.height = 320;
   const context = canvas.getContext('2d');
   const sky = context.createLinearGradient(0, 0, 0, 320);
-  sky.addColorStop(0, '#141f3d');
-  sky.addColorStop(0.72, '#33436e');
-  sky.addColorStop(1, '#5a5a7d');
+  if (night) {
+    sky.addColorStop(0, '#141f3d');
+    sky.addColorStop(0.72, '#33436e');
+    sky.addColorStop(1, '#5a5a7d');
+  } else {
+    sky.addColorStop(0, '#7fb0e0');
+    sky.addColorStop(0.72, '#b5d2ec');
+    sky.addColorStop(1, '#e3edf6');
+  }
   context.fillStyle = sky;
   context.fillRect(0, 0, 1024, 320);
-  const random = seededRandom(20260717);
+  const random = seededRandom(20260717);   // same seed: identical skyline day and night
   let x = 0;
   while (x < 1024) {
     const width = 34 + random() * 60;
     const height = 70 + random() * 190;
-    context.fillStyle = '#101830';
+    context.fillStyle = night ? '#101830' : '#8fa3c4';
     context.fillRect(x, 320 - height, width, height);
-    context.fillStyle = '#ffd98a';
+    context.fillStyle = night ? '#ffd98a' : '#7d92b5';
     for (let wx = x + 5; wx < x + width - 6; wx += 9) {
       for (let wy = 320 - height + 8; wy < 308; wy += 12) {
         if (random() < 0.28) context.fillRect(wx, wy, 4, 6);
@@ -483,6 +491,7 @@ function buildCeiling() {
   const panelTexture = buildLightPanelTexture();
   const panelMaterial = new THREE.MeshStandardMaterial({
     map: panelTexture, emissive: '#ffffff', emissiveMap: panelTexture, emissiveIntensity: 0.85, roughness: 0.6 });
+  lighting.panelMaterial = panelMaterial;
   const panelGeometry = new THREE.PlaneGeometry(120, 80);
   for (const column of [-375, -125, 125, 375]) {
     for (const row of [-200, 0, 200]) {
@@ -495,6 +504,7 @@ function buildCeiling() {
 
   // pendant cluster hanging over the operations table
   const bulbMaterial = new THREE.MeshStandardMaterial({ color: '#fff2d0', emissive: '#ffe7b0', emissiveIntensity: 1.6 });
+  lighting.pendantBulb = bulbMaterial;
   for (const x of [-130, 0, 130]) {
     scene.add(box(1.2, 34, 1.2, DARK_PANEL, x, 232, 41, false, false));
     const shade = new THREE.Mesh(new THREE.CylinderGeometry(9, 13, 10, 20), DARK_PANEL);
@@ -558,11 +568,19 @@ function buildRoom() {
   scene.add(box(10, 250, 650, glassMaterial, 506, 125, 0, false, false));
   for (let z = -325; z <= 325; z += 130) scene.add(box(6, 250, 8, METAL, 506, 125, z, false, false));
   scene.add(box(6, 6, 650, METAL, 506, 246, 0, false, false));
-  const skyline = new THREE.Mesh(new THREE.PlaneGeometry(1400, 360),
-    new THREE.MeshBasicMaterial({ map: buildSkylineTexture(), fog: false }));
-  skyline.position.set(900, 165, 0);
-  skyline.rotation.y = -Math.PI / 2;
-  scene.add(skyline);
+  // day skyline behind, night skyline in front; its opacity follows the night factor
+  const skylineGeometry = new THREE.PlaneGeometry(1400, 360);
+  const skylineDay = new THREE.Mesh(skylineGeometry,
+    new THREE.MeshBasicMaterial({ map: buildSkylineTexture(false), fog: false }));
+  skylineDay.position.set(900, 165, 0);
+  skylineDay.rotation.y = -Math.PI / 2;
+  scene.add(skylineDay);
+  const skylineNight = new THREE.Mesh(skylineGeometry,
+    new THREE.MeshBasicMaterial({ map: buildSkylineTexture(true), fog: false, transparent: true, depthWrite: false }));
+  skylineNight.position.set(899, 165, 0);
+  skylineNight.rotation.y = -Math.PI / 2;
+  scene.add(skylineNight);
+  lighting.skylineNight = skylineNight.material;
 
   // half-lowered blinds at staggered heights along the curtain wall
   const blindsTexture = buildBlindsTexture();
@@ -693,6 +711,21 @@ function buildWorkstationTemplate() {
     new THREE.MeshStandardMaterial({ color: '#f5f7fa', roughness: 0.4 }));
   mug.position.set(28, 33, -8); mug.castShadow = true;
   desk.add(mug);
+  // desk lamp; the shared bulb material brightens after dark
+  const lamp = new THREE.Group();
+  const lampBase = new THREE.Mesh(new THREE.CylinderGeometry(3, 3.6, 1.6, 12), DARK_PANEL);
+  lampBase.position.y = 0.8;
+  const lampArm = box(1.4, 13, 1.4, DARK_PANEL, -1.8, 7, 0, false, true);
+  lampArm.rotation.z = 0.35;
+  const lampHead = new THREE.Mesh(new THREE.ConeGeometry(3.6, 5.5, 12, 1, true), DARK_PANEL);
+  lampHead.position.set(-5.2, 13.6, 0);
+  lampHead.rotation.z = 0.55;
+  lampHead.castShadow = true;
+  const lampGlow = new THREE.Mesh(new THREE.SphereGeometry(1.6, 10, 8), LAMP_BULB);
+  lampGlow.position.set(-6.2, 12.4, 0);
+  lamp.add(lampBase, lampArm, lampHead, lampGlow);
+  lamp.position.set(-32, 30, 4);
+  desk.add(lamp);
   // monitor sits on the desk facing the seat (which is north of the desk)
   buildMonitor(desk, 0, 30, 6, Math.PI);
   desk.position.z = 27;      // desk footprint mirrors the collision rect: x±44, y+2..y+52
@@ -920,6 +953,17 @@ class Robot {
     this.path = [];
     this.walkDistance = 0;
     this.heading = 0;
+    // articulation + behavior state
+    this.rand = seededRandom(Array.from(key).reduce((sum, c) => sum + c.charCodeAt(0) * 31, 7));
+    this.seedPhase = this.rand() * Math.PI * 2;
+    this.sitProgress = 0;
+    this.nextBlinkAt = 2 + this.rand() * 4;
+    this.blinkUntil = 0;
+    this.idleAction = null;
+    this.nextIdleAt = 6 + this.rand() * 10;
+    this.glanceDirection = 0;
+    this.excursion = null;
+    this.placementTarget = null;
     this.group = new THREE.Group();
 
     const color = agentColor(key);
@@ -932,15 +976,22 @@ class Robot {
 
     this.legs = [];
     for (const side of [-1, 1]) {
-      const leg = new THREE.Group();
-      leg.position.set(side * 6.5, 0, 0);
-      const limb = new THREE.Mesh(new THREE.CapsuleGeometry(4, 11, 6, 12), bodyMaterial);
-      limb.position.y = -10; limb.castShadow = true;
-      const foot = new THREE.Mesh(new THREE.BoxGeometry(8, 4, 12), jointMaterial);
-      foot.position.set(0, -18, 2); foot.castShadow = true;
-      leg.add(limb); leg.add(foot);
-      this.hips.add(leg);
-      this.legs.push(leg);
+      const hip = new THREE.Group();
+      hip.position.set(side * 6.5, 0, 0);
+      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(4, 7, 6, 12), bodyMaterial);
+      thigh.position.y = -5.5; thigh.castShadow = true;
+      hip.add(thigh);
+      const knee = new THREE.Group();
+      knee.position.y = -10;
+      hip.add(knee);
+      const shin = new THREE.Mesh(new THREE.CapsuleGeometry(3.4, 6, 6, 12), bodyMaterial);
+      shin.position.y = -4.5; shin.castShadow = true;
+      knee.add(shin);
+      const foot = new THREE.Mesh(new THREE.BoxGeometry(7.5, 3.5, 11), jointMaterial);
+      foot.position.set(0, -8.4, 2.5); foot.castShadow = true;
+      knee.add(foot);
+      this.hips.add(hip);
+      this.legs.push({ hip, knee });
     }
 
     this.torso = new THREE.Group();
@@ -955,16 +1006,22 @@ class Robot {
 
     this.arms = [];
     for (const side of [-1, 1]) {
-      const arm = new THREE.Group();
-      arm.position.set(side * 15, 7, 0);
-      const limb = new THREE.Mesh(new THREE.CapsuleGeometry(3.6, 12, 6, 12), bodyMaterial);
-      limb.position.y = -8; limb.castShadow = true;
-      const hand = new THREE.Mesh(new THREE.SphereGeometry(4.4, 12, 10), jointMaterial);
-      hand.position.y = -17;
-      limb.castShadow = true;
-      arm.add(limb); arm.add(hand);
-      this.torso.add(arm);
-      this.arms.push(arm);
+      const shoulder = new THREE.Group();
+      shoulder.position.set(side * 15, 7, 0);
+      const upper = new THREE.Mesh(new THREE.CapsuleGeometry(3.6, 6, 6, 12), bodyMaterial);
+      upper.position.y = -5; upper.castShadow = true;
+      shoulder.add(upper);
+      const elbow = new THREE.Group();
+      elbow.position.y = -9.5;
+      shoulder.add(elbow);
+      const forearm = new THREE.Mesh(new THREE.CapsuleGeometry(3.1, 5, 6, 12), bodyMaterial);
+      forearm.position.y = -4; forearm.castShadow = true;
+      elbow.add(forearm);
+      const hand = new THREE.Mesh(new THREE.SphereGeometry(4, 12, 10), jointMaterial);
+      hand.position.y = -8.5;
+      elbow.add(hand);
+      this.torso.add(shoulder);
+      this.arms.push({ shoulder, elbow });
     }
 
     this.head = new THREE.Group();
@@ -977,11 +1034,13 @@ class Robot {
     visor.scale.set(1, 0.72, 0.62);
     visor.position.set(0, 0.5, 5.4);
     this.head.add(visor);
+    this.eyes = [];
     for (const side of [-1, 1]) {
       const eye = new THREE.Mesh(new THREE.SphereGeometry(1.8, 10, 8),
         new THREE.MeshStandardMaterial({ color: '#9beaff', emissive: '#7ef0ff', emissiveIntensity: 1.4 }));
       eye.position.set(side * 3.6, 1.2, 13.4);
       this.head.add(eye);
+      this.eyes.push(eye);
     }
     const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 7, 8), jointMaterial);
     antenna.position.y = 14;
@@ -1033,7 +1092,8 @@ class Robot {
   }
 
   retarget(placement) {
-    const changed = this.status !== placement.status || this.name !== (placement.agent.name || this.key)
+    const statusChanged = this.status !== placement.status;
+    const changed = statusChanged || this.name !== (placement.agent.name || this.key)
       || this.message !== (placement.agent.message || '');
     this.status = placement.status;
     this.zone = placement.zone;
@@ -1041,22 +1101,32 @@ class Robot {
     this.message = placement.agent.message || '';
     if (changed) this.refreshLabel();
     const target = [placement.x, placement.y];
+    this.placementTarget = target;
     if (!this.scenePosition) {
       this.setScenePosition(target[0], target[1]);
       this.target = target;
       return;
     }
+    if (statusChanged && (this.excursion || this.idleAction)) {
+      // real work interrupts coffee breaks and stretches immediately
+      this.excursion = null;
+      this.idleAction = null;
+      this.path = walkPath(this.scenePosition, target);
+      this.target = target;
+      return;
+    }
     if (!this.target || this.target[0] !== target[0] || this.target[1] !== target[1]) {
       this.target = target;
-      this.path = walkPath(this.scenePosition, target);
+      if (!this.excursion) this.path = walkPath(this.scenePosition, target);
     }
   }
 
   get walking() { return this.path.length > 0; }
-  get seated() { return this.zone === 'home' && !this.walking; }
+  get seated() { return this.zone === 'home' && !this.walking && !this.excursion; }
 
   advance(dt) {
     if (!this.walking) return;
+    if (this.sitProgress > 0.45) return;   // stand up from the chair before stepping off
     let step = WALK_SPEED * dt;
     let [x, y] = this.scenePosition;
     while (this.path.length && step > 0) {
@@ -1079,9 +1149,88 @@ class Robot {
     this.setScenePosition(x, y);
   }
 
-  pose(time) {
+  updateBlink(time) {
+    if (time > this.nextBlinkAt) {
+      this.blinkUntil = time + 0.13;
+      this.nextBlinkAt = time + 2.5 + this.rand() * 4;
+    }
+    const lidScale = time < this.blinkUntil ? 0.12 : 1;
+    for (const eye of this.eyes) {
+      eye.scale.y += (lidScale - eye.scale.y) * 0.55;
+    }
+  }
+
+  updateIdle(time) {
+    if (this.status !== 'idle') return;
+    if (this.excursion) {
+      if (!this.walking && time > this.excursion.returnAt) {
+        this.excursion = null;
+        if (this.placementTarget) this.path = walkPath(this.scenePosition, this.placementTarget);
+      }
+      return;
+    }
+    if (this.idleAction) {
+      if ((time - this.idleAction.start) / this.idleAction.duration >= 1) {
+        this.idleAction = null;
+        this.nextIdleAt = time + 5 + this.rand() * 9;
+      }
+      return;
+    }
+    if (!this.seated || this.sitProgress < 0.9) {
+      // only fidget after settling into the chair for a few seconds
+      this.nextIdleAt = Math.max(this.nextIdleAt, time + 3);
+      return;
+    }
+    if (time < this.nextIdleAt) return;
+    const roll = this.rand();
+    if (roll < 0.08 && this.zone === 'home') {
+      // wander to the open floor beside the lounge table (clear of every obstacle rect)
+      const point = [185 + this.rand() * 55, 575 + this.rand() * 45];
+      this.excursion = { returnAt: time + 7 + this.rand() * 5 };
+      this.path = walkPath(this.scenePosition, point);
+    } else {
+      const pick = this.rand();
+      const name = pick < 0.28 ? 'stretch' : pick < 0.56 ? 'sip' : pick < 0.78 ? 'swivel' : 'glance';
+      this.glanceDirection = (this.rand() < 0.5 ? -1 : 1) * (0.6 + this.rand() * 0.5);
+      this.idleAction = { name, start: time, duration: name === 'swivel' ? 3.2 : 2.4 };
+    }
+  }
+
+  updateHead(time, dt) {
+    let targetYaw = 0;
+    if (this.idleAction && this.idleAction.name === 'glance') {
+      targetYaw = this.glanceDirection;
+    } else if (this.walking && this.path.length) {
+      const desired = Math.atan2(this.path[0][0] - this.scenePosition[0], this.path[0][1] - this.scenePosition[1]);
+      targetYaw = clampValue(angleDelta(desired, this.group.rotation.y), -0.9, 0.9) * 0.6;
+    } else if (speakingKey && speakingKey !== this.key && robots.has(speakingKey)) {
+      const speaker = robots.get(speakingKey).group.position;
+      const desired = Math.atan2(speaker.x - this.group.position.x, speaker.z - this.group.position.z);
+      targetYaw = clampValue(angleDelta(desired, this.group.rotation.y), -1.15, 1.15);
+    } else {
+      targetYaw = Math.sin(time * 0.35 + this.seedPhase) * 0.12;
+    }
+    this.head.rotation.y += (targetYaw - this.head.rotation.y) * Math.min(1, 5 * dt);
+  }
+
+  applyLimbs(pose) {
+    this.hips.position.y = pose.hipsY;
+    this.legs[0].hip.rotation.x = pose.hipL;
+    this.legs[1].hip.rotation.x = pose.hipR;
+    this.legs[0].knee.rotation.x = pose.kneeL;
+    this.legs[1].knee.rotation.x = pose.kneeR;
+    this.arms[0].shoulder.rotation.x = pose.shoulderL;
+    this.arms[1].shoulder.rotation.x = pose.shoulderR;
+    this.arms[0].elbow.rotation.x = pose.elbowL;
+    this.arms[1].elbow.rotation.x = pose.elbowR;
+    this.torso.rotation.x = pose.torsoRotX;
+    this.torso.rotation.y = pose.torsoRotY;
+    this.torso.position.y = pose.torsoY;
+  }
+
+  pose(time, dt) {
     const active = this.status === 'thinking' || this.status === 'speaking' || this.status === 'delegated';
-    const phase = time * 2 + this.key.length;
+    const phase = time * 2 + this.seedPhase;
     const orbColor = new THREE.Color(STATUS_COLORS[this.status] || STATUS_COLORS.idle);
     this.statusOrb.material.color.copy(orbColor);
     this.statusOrb.material.emissive.copy(orbColor);
@@ -1112,42 +1261,94 @@ class Robot {
       this.group.position.y = 0;
     }
 
-    if (this.walking) {
+    this.updateBlink(time);
+    this.updateIdle(time);
+
+    // sit-down sequence: arrive, turn to face the desk, then settle into the chair
+    // (chair swivels rotate the body on purpose, so they bypass the facing gate)
+    const swiveling = this.idleAction && this.idleAction.name === 'swivel';
+    const facingDesk = swiveling || Math.abs(angleDelta(0, this.group.rotation.y)) < 0.35;
+    const sitTarget = this.seated && facingDesk ? 1 : 0;
+    const sitRate = sitTarget > this.sitProgress ? 3.2 : 5.5;
+    this.sitProgress += (sitTarget - this.sitProgress) * Math.min(1, sitRate * dt);
+    const sit = this.sitProgress;
+
+    let base;
+    if (this.walking && sit < 0.45) {
       const stride = (this.walkDistance / STRIDE_LENGTH) * Math.PI;
-      this.group.rotation.y = dampAngle(this.group.rotation.y, this.heading, 12, 1 / 60);
-      this.hips.position.y = 20 + Math.abs(Math.sin(stride)) * 2.4;
-      this.legs[0].rotation.x = Math.sin(stride) * 0.7;
-      this.legs[1].rotation.x = -Math.sin(stride) * 0.7;
-      this.arms[0].rotation.x = -Math.sin(stride) * 0.55;
-      this.arms[1].rotation.x = Math.sin(stride) * 0.55;
-      this.torso.rotation.x = 0.08;
-      this.torso.rotation.y = Math.sin(stride) * 0.05;
-    } else if (this.seated) {
-      this.group.rotation.y = dampAngle(this.group.rotation.y, 0, 8, 1 / 60);
-      this.hips.position.y = 17.5;
-      this.legs[0].rotation.x = 1.45;
-      this.legs[1].rotation.x = 1.45;
-      this.arms[0].rotation.x = 0.85 + Math.sin(phase * 5) * 0.07;
-      this.arms[1].rotation.x = 0.85 - Math.sin(phase * 5) * 0.07;
-      this.torso.rotation.x = 0.12;
-      this.torso.rotation.y = 0;
-      this.torso.position.y = 14 + Math.sin(phase * 2.2) * 0.35;
+      this.group.rotation.y = dampAngle(this.group.rotation.y, this.heading, 12, dt);
+      const swing = Math.sin(stride);
+      base = {
+        hipsY: 20 + Math.abs(swing) * 2.2,
+        hipL: swing * 0.65, hipR: -swing * 0.65,
+        kneeL: -Math.max(0, Math.sin(stride + 0.7)) * 0.85,
+        kneeR: -Math.max(0, Math.sin(stride + Math.PI + 0.7)) * 0.85,
+        shoulderL: -swing * 0.5, shoulderR: swing * 0.5,
+        elbowL: 0.3, elbowR: 0.3,
+        torsoRotX: 0.08, torsoRotY: swing * 0.05, torsoY: 14,
+      };
+    } else if (this.seated || sit > 0.05) {
+      this.group.rotation.y = dampAngle(this.group.rotation.y, 0, 8, dt);
+      base = {
+        hipsY: 20, hipL: 0, hipR: 0, kneeL: 0, kneeR: 0,
+        shoulderL: 0.05, shoulderR: 0.05, elbowL: 0.15, elbowR: 0.15,
+        torsoRotX: 0, torsoRotY: 0, torsoY: 14,
+      };
+      const typeBob = Math.sin(phase * 5) * 0.08;
+      const seatedPose = {
+        hipsY: 16.6, hipL: 1.5, hipR: 1.5, kneeL: -1.35, kneeR: -1.35,
+        shoulderL: 0.5 + typeBob, shoulderR: 0.5 - typeBob,
+        elbowL: 1.05 - typeBob, elbowR: 1.05 + typeBob,
+        torsoRotX: 0.12, torsoRotY: 0, torsoY: 14 + Math.sin(phase * 2.2) * 0.35,
+      };
+      for (const field of Object.keys(base)) {
+        base[field] += (seatedPose[field] - base[field]) * sit;
+      }
     } else {
-      this.group.rotation.y = dampAngle(this.group.rotation.y, 0, 6, 1 / 60);
-      this.hips.position.y = 20 + (active ? Math.sin(phase) * 1.6 : 0);
-      this.legs[0].rotation.x = 0;
-      this.legs[1].rotation.x = 0;
-      this.arms[0].rotation.x = active ? Math.sin(phase) * 0.18 : 0;
-      this.arms[1].rotation.x = active ? -Math.sin(phase) * 0.18 : 0;
-      this.torso.rotation.x = 0;
-      this.torso.rotation.y = 0;
-      this.torso.position.y = 14;
+      this.group.rotation.y = dampAngle(this.group.rotation.y, this.excursion ? this.heading : 0, 6, dt);
+      base = {
+        hipsY: 20 + (active ? Math.sin(phase) * 1.6 : 0),
+        hipL: 0, hipR: 0, kneeL: -0.06, kneeR: -0.06,
+        shoulderL: active ? Math.sin(phase) * 0.18 : 0.04,
+        shoulderR: active ? -Math.sin(phase) * 0.18 : 0.04,
+        elbowL: 0.18, elbowR: 0.18,
+        torsoRotX: 0, torsoRotY: 0, torsoY: 14,
+      };
     }
+
+    // idle micro-behaviors layer on top of whatever the body is doing
+    if (this.idleAction) {
+      const progress = Math.min(1, (time - this.idleAction.start) / this.idleAction.duration);
+      const envelope = Math.sin(progress * Math.PI);
+      if (this.idleAction.name === 'stretch') {
+        base.shoulderL += (-2.7 - base.shoulderL) * envelope;
+        base.shoulderR += (-2.7 - base.shoulderR) * envelope;
+        base.elbowL += (-0.2 - base.elbowL) * envelope;
+        base.elbowR += (-0.2 - base.elbowR) * envelope;
+        base.torsoRotX += -0.1 * envelope;
+      } else if (this.idleAction.name === 'sip') {
+        base.shoulderR += (0.55 - base.shoulderR) * envelope;
+        base.elbowR += (2.05 - base.elbowR) * envelope;
+      } else if (this.idleAction.name === 'swivel') {
+        this.group.rotation.y = Math.sin(progress * Math.PI * 2) * 0.45 * this.glanceDirection;
+      }
+    }
+
+    this.applyLimbs(base);
+    this.updateHead(time, dt);
   }
 
   dispose() {
     scene.remove(this.group);
   }
+}
+
+function clampValue(value, low, high) {
+  return Math.min(high, Math.max(low, value));
+}
+
+function angleDelta(target, current) {
+  return ((target - current + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
 }
 
 function dampAngle(current, target, lambda, dt) {
@@ -1158,10 +1359,12 @@ function dampAngle(current, target, lambda, dt) {
 /* --------------------------- live state --------------------------- */
 const robots = new Map();
 let latestState = { agents: {}, events: [] };
+let speakingKey = null;   // seated neighbors turn their heads toward the speaker
 
 function applyState(state) {
   latestState = state;
   const agents = Object.entries(state.agents || {});
+  speakingKey = (agents.find(([, agent]) => agent.status === 'speaking') || [null])[0];
   const placements = assignScenePositions(agents);
   const seen = new Set();
   for (const placement of placements) {
@@ -1215,6 +1418,7 @@ const VIEW_PRESETS = {
   low: { position: [-420, 120, 700], target: [80, 60, -40] },
   window: { position: [-380, 190, -40], target: [520, 130, 40] },
   ops: { position: [10, 300, 480], target: [0, 40, 40] },
+  desk: { position: [-95, 95, 390], target: [-185, 30, 215] },
 };
 const viewPreset = VIEW_PRESETS[params.get('view')];
 if (viewPreset) {
@@ -1297,24 +1501,197 @@ if (demoMode) {
   setInterval(pollState, POLL_MS);
 }
 
+/* --------------------------- day / night --------------------------- */
+const skyCanvas = document.createElement('canvas');
+skyCanvas.width = 64; skyCanvas.height = 512;
+const skyTexture = new THREE.CanvasTexture(skyCanvas);
+skyTexture.colorSpace = THREE.SRGBColorSpace;
+scene.background = skyTexture;
+
+const hourOverride = parseFloat(params.get('hour'));   // e.g. ?hour=22 to preview night
+
+const colorScratch = new THREE.Color();
+function hexLerp(dayHex, nightHex, t) {
+  return colorScratch.set(dayHex).lerp(new THREE.Color(nightHex), t);
+}
+
+function paintSky(nightFactor) {
+  const context = skyCanvas.getContext('2d');
+  const gradient = context.createLinearGradient(0, 0, 0, 512);
+  gradient.addColorStop(0, '#' + hexLerp('#79a8dd', '#060a18', nightFactor).getHexString());
+  gradient.addColorStop(0.55, '#' + hexLerp('#a8c6e8', '#131b30', nightFactor).getHexString());
+  gradient.addColorStop(1, '#' + hexLerp('#d9e6f4', '#2a3a5e', nightFactor).getHexString());
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 64, 512);
+  skyTexture.needsUpdate = true;
+}
+
+function currentHour() {
+  if (Number.isFinite(hourOverride)) return ((hourOverride % 24) + 24) % 24;
+  const now = new Date();
+  return now.getHours() + now.getMinutes() / 60;
+}
+
+function nightFactorAt(hour) {
+  // 0 in daylight, 1 after dark, smooth ramps at dawn (5:30-7:30) and dusk (17:30-19:30)
+  let linear;
+  if (hour < 5.5 || hour >= 19.5) linear = 1;
+  else if (hour < 7.5) linear = 1 - (hour - 5.5) / 2;
+  else if (hour < 17.5) linear = 0;
+  else linear = (hour - 17.5) / 2;
+  return linear * linear * (3 - 2 * linear);
+}
+
+const MOON_POSITION = new THREE.Vector3(-380, 520, -140);
+const sunArc = new THREE.Vector3();
+let paintedNight = -1;
+
+function updateDayNight() {
+  const hour = currentHour();
+  const nf = nightFactorAt(hour);
+  const day = 1 - nf;
+  // sun sweeps east (glass wall) to west between 5:30 and 19:30, then hands off to the moon
+  const t = Math.min(Math.max((hour - 5.5) / 14, 0), 1);
+  const elevation = Math.sin(t * Math.PI);
+  sunArc.set(Math.cos(t * Math.PI) * 620, 240 + elevation * 430, 260).lerp(MOON_POSITION, nf);
+  sun.position.copy(sunArc);
+  sun.intensity = 0.28 + day * 1.62;
+  const warmth = Math.min(1, (1 - elevation) * 0.85);          // low sun goes amber
+  sun.color.copy(hexLerp('#fff4e0', '#ff9e5e', warmth * day)).lerp(new THREE.Color('#9db8e8'), nf);
+  hemi.intensity = 0.2 + day * 0.35;
+  fillLight.intensity = 0.45 + nf * 0.4;                       // interior lamps carry the night
+  windowGlow.intensity = 0.15 + day * 0.45;
+  windowGlow.color.copy(hexLerp('#bcd9ff', '#7d95c9', nf));
+  if (lighting.panelMaterial) lighting.panelMaterial.emissiveIntensity = 0.55 + nf * 0.75;
+  if (lighting.pendantBulb) lighting.pendantBulb.emissiveIntensity = 0.9 + nf * 1.2;
+  LAMP_BULB.emissiveIntensity = 0.08 + nf * 1.8;
+  if (lighting.skylineNight) lighting.skylineNight.opacity = nf;
+  if (Math.abs(nf - paintedNight) > 0.02) {
+    paintedNight = nf;
+    paintSky(nf);
+    scene.fog.color.copy(hexLerp('#b9c9e2', '#131b30', nf));
+  }
+}
+
+/* --------------------- post-processing & quality --------------------- */
+const QUALITY_TIERS = ['low', 'medium', 'high'];
+let composer = null;
+let activeTier = 'low';
+let autoQuality = true;
+
+function buildComposer(tier) {
+  if (composer) {
+    try { composer.dispose(); } catch { /* older three builds lack dispose */ }
+    composer = null;
+  }
+  if (tier === 'low') return;   // low = direct MSAA rendering, no passes
+  try {
+    const next = new EffectComposer(renderer);
+    next.setPixelRatio(renderer.getPixelRatio());
+    next.setSize(window.innerWidth, window.innerHeight);
+    next.addPass(new RenderPass(scene, camera));
+    if (tier === 'high') {
+      const ssao = new SSAOPass(scene, camera, window.innerWidth, window.innerHeight);
+      ssao.kernelRadius = 20;
+      ssao.minDistance = 0.0008;
+      ssao.maxDistance = 0.12;
+      next.addPass(ssao);
+    }
+    next.addPass(new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight), 0.3, 0.55, 0.72));
+    next.addPass(new OutputPass());
+    next.addPass(new SMAAPass(window.innerWidth, window.innerHeight));
+    composer = next;
+  } catch (error) {
+    console.warn('Post-processing unavailable; using direct rendering.', error);
+    composer = null;
+  }
+}
+
+const qualityChip = document.getElementById('quality-chip');
+function updateQualityChip() {
+  const label = activeTier.toUpperCase();
+  qualityChip.textContent = autoQuality ? `QUALITY AUTO · ${label}` : `QUALITY ${label}`;
+}
+
+function applyQuality(tier) {
+  activeTier = tier;
+  buildComposer(tier);
+  updateQualityChip();
+}
+
+function defaultTier() {
+  return (navigator.hardwareConcurrency || 4) >= 6 ? 'high' : 'medium';
+}
+
+qualityChip.addEventListener('click', () => {
+  if (autoQuality) { autoQuality = false; applyQuality('high'); }
+  else if (activeTier === 'high') applyQuality('medium');
+  else if (activeTier === 'medium') applyQuality('low');
+  else { autoQuality = true; applyQuality(defaultTier()); }
+  try { localStorage.setItem('office_quality', autoQuality ? 'auto' : activeTier); } catch { /* private mode */ }
+});
+
+{
+  const requested = params.get('quality') || localStorage.getItem('office_quality') || 'auto';
+  if (QUALITY_TIERS.includes(requested)) { autoQuality = false; applyQuality(requested); }
+  else applyQuality(defaultTier());
+}
+
+// step quality down (never up, to avoid flapping) when sustained fps dips
+let frameSamples = [];
+function autoAdjustQuality(dt, time) {
+  if (!autoQuality || activeTier === 'low' || time < 3) return;
+  frameSamples.push(dt);
+  if (frameSamples.length < 90) return;
+  const average = frameSamples.reduce((total, value) => total + value, 0) / frameSamples.length;
+  frameSamples = [];
+  if (average > 1 / 38) {
+    applyQuality(QUALITY_TIERS[QUALITY_TIERS.indexOf(activeTier) - 1]);
+  }
+}
+
 /* ----------------------------- render loop ----------------------------- */
 const frameClock = new THREE.Clock();
 let renderPaused = false;
-window.__office = { renderer, scene, camera, setPaused: (value) => { renderPaused = Boolean(value); } };
-function animate() {
-  requestAnimationFrame(animate);
-  if (renderPaused) return;
-  const dt = Math.min(frameClock.getDelta(), 0.1);
-  const time = frameClock.elapsedTime;
+let sceneTime = 0;
+
+function stepScene(dt) {
+  sceneTime += dt;
+  const time = sceneTime;
+  updateDayNight();
+  autoAdjustQuality(dt, time);
   for (const robot of robots.values()) {
     robot.advance(dt);
-    robot.pose(time);
+    robot.pose(time, dt);
   }
   workstationScreens.forEach((screen, index) => {
     screen.material.emissiveIntensity = 0.75 + Math.sin(time * 2.2 + index * 1.7) * 0.15;
   });
   controls.update();
-  renderer.render(scene, camera);
+  if (composer) composer.render();
+  else renderer.render(scene, camera);
+}
+
+window.__office = {
+  renderer, scene, camera,
+  setPaused: (value) => { renderPaused = Boolean(value); },
+  getQuality: () => ({ tier: activeTier, auto: autoQuality, composer: Boolean(composer) }),
+  stepFrame: (dt = 1 / 60) => stepScene(dt),   // manual stepping for debugging
+  debugRobots: () => Array.from(robots.values()).map((robot) => ({
+    key: robot.key, status: robot.status, zone: robot.zone,
+    walking: robot.walking, sit: Number(robot.sitProgress.toFixed(2)),
+    yaw: Number(robot.group.rotation.y.toFixed(2)),
+    position: robot.scenePosition && robot.scenePosition.map(Math.round),
+    idle: robot.idleAction && robot.idleAction.name,
+    excursion: Boolean(robot.excursion),
+  })),
+};
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (renderPaused) return;
+  stepScene(Math.min(frameClock.getDelta(), 0.1));
 }
 animate();
 
@@ -1322,6 +1699,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  if (composer) composer.setSize(window.innerWidth, window.innerHeight);
 });
 </script>
 </body>
