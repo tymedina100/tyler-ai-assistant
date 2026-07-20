@@ -812,9 +812,11 @@ You can also pass `--api-url` and `--token` directly. The desktop client polls e
 
 The same Railway service also serves a real-time 3D office at `/office3d` (also `/`
 and `/office`). Open `https://your-railway-service.up.railway.app/office3d` in any
-browser: it renders the room with three.js — walls, whiteboard, the operations desk,
-every teammate's workstation — and the robots physically walk around the furniture,
-sit down at their desks, and type while they work. Drag to orbit, scroll to zoom.
+browser: it renders a full room with three.js — ceiling with recessed light panels,
+a night skyline behind the glass curtain wall with half-lowered blinds, framed wall
+art, carpeted desk pods, and rounded furniture with proper desk legs, monitor arms,
+and task chairs — and the robots physically walk around the furniture, sit down at
+their desks, and type while they work. Drag to orbit, scroll to zoom.
 On first load the page asks for the `OFFICE_API_TOKEN` value and keeps it only in
 that browser's local storage; the state API itself stays token-protected. Add
 `?demo=1` to the URL to watch scripted office activity without a token.
