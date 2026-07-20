@@ -31,11 +31,13 @@ AGENT_COLORS = {
     "write": "#ad70e8", "task": "#ef7278", "marketing": "#f7ba3f",
     "editor": "#9a70d8", "finance": "#4bb3c5", "calendar": "#f07898",
     "gmail": "#ef8062", "linear": "#6174e8", "general": "#64748b",
+    "sales": "#d4589e", "analytics": "#c0ca33",
 }
 HOME_SLOTS = [
     (150, 170), (300, 145), (700, 145), (850, 170),
     (120, 360), (885, 355), (170, 505), (315, 535),
     (680, 535), (835, 505), (440, 550), (560, 550),
+    (65, 470), (925, 470),
 ]
 ZONE_ANCHORS = {
     "planning": (500, 210), "operations": (500, 392), "response": (745, 432),
@@ -182,8 +184,14 @@ def agent_color(key):
 
 
 def robot_sprite_path(key, frame_name):
-    """Return the packaged colored 3D sprite frame for one teammate."""
-    return ROBOT_SPRITE_DIRECTORY / f"{key}-{frame_name}.png"
+    """Return the packaged colored 3D sprite frame for one teammate.
+
+    New hires without a rendered sprite set fall back to the neutral 'general'
+    frames so the desktop app never draws a missing image."""
+    path = ROBOT_SPRITE_DIRECTORY / f"{key}-{frame_name}.png"
+    if path.is_file():
+        return path
+    return ROBOT_SPRITE_DIRECTORY / f"general-{frame_name}.png"
 
 
 def sprite_frame_for_status(status, animation_step):

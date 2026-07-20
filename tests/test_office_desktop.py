@@ -55,6 +55,16 @@ class OfficeDesktopLayoutTests(unittest.TestCase):
             for frame_name in office_desktop.SPRITE_FRAME_NAMES + office_desktop.WALK_FRAME_NAMES:
                 self.assertTrue(office_desktop.robot_sprite_path(key, frame_name).is_file())
 
+    def test_new_hires_fall_back_to_the_general_sprite_set(self):
+        path = office_desktop.robot_sprite_path("brand-new-hire", "idle")
+        self.assertEqual(path.name, "general-idle.png")
+        self.assertTrue(path.is_file())
+
+    def test_every_agent_color_is_unique_and_every_agent_has_a_desk(self):
+        colors = list(office_desktop.AGENT_COLORS.values())
+        self.assertEqual(len(colors), len(set(colors)))
+        self.assertLessEqual(len(office_desktop.AGENT_COLORS), len(office_desktop.HOME_SLOTS))
+
     def test_live_statuses_select_distinct_sprite_animation_sequences(self):
         self.assertEqual(office_desktop.sprite_frame_for_status("idle", 0), "idle")
         self.assertEqual(office_desktop.sprite_frame_for_status("idle", 3), "blink")

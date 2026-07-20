@@ -495,6 +495,12 @@ DELEGATION_TOOLS = [
     {"type": "function", "name": "delegate_to_finance_agent", "strict": False,
      "description": "Delegate budget, spend, P&L, or revenue questions about the company to the CFO.",
      "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
+    {"type": "function", "name": "delegate_to_sales_agent", "strict": False,
+     "description": "Delegate sales work to the Sales Lead: drafting cold or warm outreach messages, qualifying and tracking leads and follow-ups, and reporting the state of the sales pipeline.",
+     "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}},
+    {"type": "function", "name": "delegate_to_analytics_agent", "strict": False,
+     "description": "Delegate number-crunching to the Analytics Lead: turning traffic, sales, and task data into a short digest with one concrete recommendation, or answering 'how are the numbers trending' questions.",
+     "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
     {"type": "function", "name": "delegate_to_personal_assistant", "strict": False,
      "description": "Delegate remembering a personal fact or preference in long-term memory, keeping notes, or creating/checking actual to-do items in the user's real Todoist account to the Operations Manager.",
      "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"]}},
@@ -554,6 +560,10 @@ agents using tool calls - never answer the user directly yourself:
 - delegate_to_editor_agent: reviewing a finished deliverable for quality before
   it ships - returns an approval or a list of required revisions
 - delegate_to_finance_agent: the company's budget, spend, P&L, and revenue
+- delegate_to_sales_agent: drafting outreach messages, qualifying and tracking
+  leads and follow-ups, and reporting the sales pipeline
+- delegate_to_analytics_agent: turning traffic/sales/task numbers into a short
+  digest with one concrete recommendation
 - delegate_to_personal_assistant: remembering personal facts and preferences in
   long-term memory, keeping notes, AND creating or checking actual to-do items
   in the user's real Todoist account
@@ -2427,6 +2437,20 @@ def execute_tool(name, arguments):
                 on_delegation("finance", arguments["request"], answer)
             return answer
 
+        if name == "delegate_to_sales_agent":
+            notify_delegation_started("sales", arguments["task"])
+            answer = ask_specialist("sales", arguments["task"], record_history=False)
+            if on_delegation:
+                on_delegation("sales", arguments["task"], answer)
+            return answer
+
+        if name == "delegate_to_analytics_agent":
+            notify_delegation_started("analytics", arguments["request"])
+            answer = ask_specialist("analytics", arguments["request"], record_history=False)
+            if on_delegation:
+                on_delegation("analytics", arguments["request"], answer)
+            return answer
+
         if name == "delegate_to_personal_assistant":
             notify_delegation_started("task", arguments["request"])
             answer = ask_specialist("task", arguments["request"], record_history=False)
@@ -2756,6 +2780,63 @@ decisions worth keeping and recall_memories to check them.
         "persona": """
 You are Ledger, the team's CFO. Voice: dry, numerate, unhurried. Lead with the
 number, then the one-sentence takeaway. Sign off with "- Ledger".
+"""
+    },
+    "sales": {
+        "name": "Dash",
+        "label": "Dash (Sales Lead)",
+        "model": PREMIUM_MODEL,
+        "tool_names": ["search_the_web", "read_file", "write_file", "recall_memories",
+                       "remember_fact", "get_revenue_report"],
+        "role": """
+You own outbound sales for the company's products: outreach, leads, and follow-ups.
+Your three jobs:
+1. DRAFT OUTREACH - short, specific cold/warm messages (email, DM, or reply) that
+   name a real pain the prospect has and offer one clear next step. No hype walls,
+   no "I hope this finds you well", no fake urgency. Write like one busy founder
+   messaging another. Use search_the_web to ground a message in something true and
+   current about the prospect before drafting.
+2. TRACK THE PIPELINE - use remember_fact to record each lead's state as a single
+   compact fact ("LEAD: <name/company> - <stage: new/contacted/replied/won/lost> -
+   <next step + date>") and recall_memories to pull the pipeline back. When asked
+   for a pipeline report, list leads by stage with the single next action for each,
+   and flag follow-ups that look overdue.
+3. KNOW THE PRODUCT - use get_revenue_report to see what's actually selling before
+   recommending what to pitch. Never invent product claims, prices, or checkout
+   links; if there is no live link, say so plainly.
+You draft messages; you never send anything yourself. Hand finished drafts back so
+the user (or Piper, for email) can send them.
+""",
+        "persona": """
+You are Dash, the team's Sales Lead. Voice: energetic but honest - a closer who
+hates sleaze. Short sentences. Always end a pipeline report with the one follow-up
+you'd do next. Sign off with "- Dash".
+"""
+    },
+    "analytics": {
+        "name": "Vega",
+        "label": "Vega (Analytics Lead)",
+        "model": FAST_MODEL,
+        "tool_names": ["get_revenue_report", "get_company_status", "linear_list_issues",
+                       "recall_memories", "remember_fact"],
+        "role": """
+You turn the company's numbers into decisions. Pull real data - get_revenue_report
+for sales and per-product P&L, get_company_status for today's budget and open work,
+linear_list_issues for what's shipping - and compress it into a short digest:
+3-5 bullet facts, each with the number first, then ONE concrete recommendation
+("do X next because Y"). Rules:
+- Report only numbers the tools actually return; if a source isn't configured,
+  say which one and move on with what you have. Never estimate silently.
+- Compare against the last digest when you can: use remember_fact to store a
+  one-line snapshot ("DIGEST <date>: revenue $X, sales N, tasks done M") and
+  recall_memories to fetch the previous ones for trend lines.
+- One recommendation, not five. The user is a solo founder; pick the single
+  highest-leverage next move the numbers support.
+""",
+        "persona": """
+You are Vega, the team's Analytics Lead. Voice: crisp, curious, zero fluff -
+a scientist who loves a good chart but loves a decision more. Numbers first,
+verdict last. Sign off with "- Vega".
 """
     },
     "linear": {
