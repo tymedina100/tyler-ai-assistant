@@ -30,6 +30,28 @@
     color: var(--muted); cursor: pointer; user-select: none; padding: 7px 13px;
   }
   #quality-chip:hover { color: var(--text); }
+  #tour-chip {
+    top: 100px; right: 18px; font-size: 10px; font-weight: 700; letter-spacing: 1.2px;
+    color: var(--muted); cursor: pointer; user-select: none; padding: 7px 13px;
+  }
+  #tour-chip:hover { color: var(--text); }
+  #tour-chip.active { color: #f7b844; border-color: rgba(247, 184, 68, 0.5); }
+  #label-layer { position: absolute; inset: 0; pointer-events: none; }
+  .robot-tag { text-align: center; font-family: "Segoe UI", system-ui, sans-serif; pointer-events: none; }
+  .robot-tag .bubble {
+    display: none; max-width: 200px; margin: 0 auto 6px; padding: 5px 10px;
+    background: rgba(246, 249, 253, 0.95); color: #2a3a52; border-radius: 10px;
+    font-size: 11px; font-weight: 500; line-height: 1.35;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .robot-tag.has-message .bubble { display: block; }
+  .robot-tag .plate {
+    display: inline-flex; flex-direction: column; gap: 1px; padding: 5px 14px;
+    background: rgba(13, 20, 34, 0.85); border: 1px solid rgba(148, 163, 184, 0.4);
+    border-radius: 11px;
+  }
+  .robot-tag .name { font-size: 13px; font-weight: 700; color: #eef3fa; }
+  .robot-tag .status { font-size: 9px; font-weight: 700; letter-spacing: 1.2px; }
   #event-panel {
     position: absolute; left: 18px; bottom: 18px; width: min(430px, 44vw);
     background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px;
@@ -90,6 +112,7 @@
 <div id="title-chip" class="chip"><span class="kicker">TYLER AI ASSISTANT</span><span class="name">Virtual Office 3D</span></div>
 <div id="connection-chip" class="chip"><span id="connection-dot"></span><span id="connection-text">Connecting…</span></div>
 <div id="quality-chip" class="chip" title="Cycle render quality">QUALITY AUTO</div>
+<div id="tour-chip" class="chip" title="Slow cinematic camera tour">TOUR OFF</div>
 <div id="demo-badge">DEMO MODE</div>
 <div id="event-panel">
   <h2>ACTIVITY CONSOLE</h2>
@@ -113,6 +136,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -283,6 +307,12 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
 document.body.prepend(renderer.domElement);
+
+// DOM overlay for crisp name plates / speech bubbles; sits above the canvas, below the UI chips
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(window.innerWidth, window.innerHeight);
+labelRenderer.domElement.id = 'label-layer';
+renderer.domElement.after(labelRenderer.domElement);
 
 const scene = new THREE.Scene();
 // background + fog colors are painted by the day/night cycle further down
@@ -911,35 +941,6 @@ function roundRect(context, x, y, width, height, radius) {
   context.closePath();
 }
 
-function drawAgentLabel(canvas, name, status, message) {
-  const context = canvas.getContext('2d');
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  const statusColor = STATUS_COLORS[status] || STATUS_COLORS.idle;
-  context.fillStyle = 'rgba(13, 20, 34, 0.85)';
-  roundRect(context, 40, 96, 432, 116, 30);
-  context.fill();
-  context.strokeStyle = 'rgba(148, 163, 184, 0.4)';
-  context.lineWidth = 3;
-  roundRect(context, 40, 96, 432, 116, 30);
-  context.stroke();
-  context.fillStyle = '#eef3fa';
-  context.font = '700 54px "Segoe UI", sans-serif';
-  context.textAlign = 'center';
-  context.fillText(name, 256, 152);
-  context.fillStyle = statusColor;
-  context.font = '700 36px "Segoe UI", sans-serif';
-  context.fillText(status.toUpperCase(), 256, 196);
-  if (message) {
-    context.fillStyle = 'rgba(246, 249, 253, 0.95)';
-    roundRect(context, 10, 6, 492, 74, 24);
-    context.fill();
-    context.fillStyle = '#2a3a52';
-    context.font = '500 34px "Segoe UI", sans-serif';
-    const shortened = message.length > 30 ? message.slice(0, 29).trimEnd() + '…' : message;
-    context.fillText(shortened, 256, 52);
-  }
-}
-
 /* ----------------------------- the robots ----------------------------- */
 class Robot {
   constructor(key, name) {
@@ -1066,22 +1067,34 @@ class Robot {
     this.thoughtDots.visible = false;
     this.group.add(this.thoughtDots);
 
-    this.labelCanvas = document.createElement('canvas');
-    this.labelCanvas.width = 512; this.labelCanvas.height = 224;
-    drawAgentLabel(this.labelCanvas, this.name, 'idle', '');
-    this.labelTexture = new THREE.CanvasTexture(this.labelCanvas);
-    this.labelTexture.colorSpace = THREE.SRGBColorSpace;
-    this.label = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.labelTexture, transparent: true, depthWrite: false }));
-    this.label.scale.set(96, 42, 1);
-    this.label.position.y = 108;
+    // crisp DOM name plate + speech bubble via CSS2DRenderer
+    this.labelElement = document.createElement('div');
+    this.labelElement.className = 'robot-tag';
+    this.bubbleElement = document.createElement('div');
+    this.bubbleElement.className = 'bubble';
+    const plate = document.createElement('div');
+    plate.className = 'plate';
+    this.nameElement = document.createElement('span');
+    this.nameElement.className = 'name';
+    this.statusElement = document.createElement('span');
+    this.statusElement.className = 'status';
+    plate.append(this.nameElement, this.statusElement);
+    this.labelElement.append(this.bubbleElement, plate);
+    this.label = new CSS2DObject(this.labelElement);
+    this.label.position.y = 92;
     this.group.add(this.label);
+    this.refreshLabel();
 
+    this.group.userData.robotKey = key;   // raycast hits resolve to this key
     scene.add(this.group);
   }
 
   refreshLabel() {
-    drawAgentLabel(this.labelCanvas, this.name, this.status, this.message);
-    this.labelTexture.needsUpdate = true;
+    this.nameElement.textContent = this.name;
+    this.statusElement.textContent = this.status.toUpperCase();
+    this.statusElement.style.color = STATUS_COLORS[this.status] || STATUS_COLORS.idle;
+    this.bubbleElement.textContent = this.message;
+    this.labelElement.classList.toggle('has-message', Boolean(this.message));
   }
 
   setScenePosition(sceneX, sceneY) {
@@ -1339,6 +1352,8 @@ class Robot {
   }
 
   dispose() {
+    this.group.remove(this.label);
+    this.labelElement.remove();
     scene.remove(this.group);
   }
 }
@@ -1651,6 +1666,113 @@ function autoAdjustQuality(dt, time) {
   }
 }
 
+/* --------------------------- camera modes --------------------------- */
+let followKey = null;
+let tourActive = false;
+let tourTime = 0;
+let pendingFollow = params.get('follow');   // e.g. ?follow=manager
+const tourChip = document.getElementById('tour-chip');
+const hintElement = document.getElementById('hint');
+const DEFAULT_HINT = 'Drag to orbit &nbsp;·&nbsp; Scroll to zoom &nbsp;·&nbsp; Click a robot to follow';
+hintElement.innerHTML = DEFAULT_HINT;
+
+function setFollow(key) {
+  followKey = key;
+  if (key) {
+    stopTour(false);
+    const robot = robots.get(key);
+    hintElement.innerHTML = `Following <b>${escapeHtml(robot ? robot.name : key)}</b> &nbsp;·&nbsp; Click the floor to release`;
+  } else {
+    hintElement.innerHTML = DEFAULT_HINT;
+  }
+}
+
+function startTour() {
+  tourActive = true;
+  followKey = null;
+  tourTime = 0;
+  controls.enabled = false;
+  tourChip.textContent = 'TOUR ON';
+  tourChip.classList.add('active');
+  hintElement.innerHTML = 'Cinematic tour &nbsp;·&nbsp; Click anywhere to take back control';
+}
+
+function stopTour(resetHint = true) {
+  if (!tourActive) return;
+  tourActive = false;
+  controls.enabled = true;
+  tourChip.textContent = 'TOUR OFF';
+  tourChip.classList.remove('active');
+  if (resetHint) hintElement.innerHTML = DEFAULT_HINT;
+}
+
+tourChip.addEventListener('click', () => { if (tourActive) stopTour(); else startTour(); });
+if (params.get('tour') === '1') startTour();
+
+// clean clicks (no drag) raycast into the scene: robot -> follow, floor -> release
+const raycaster = new THREE.Raycaster();
+const pointerNdc = new THREE.Vector2();
+let pointerDownAt = null;
+renderer.domElement.addEventListener('pointerdown', (event) => {
+  pointerDownAt = [event.clientX, event.clientY];
+  if (tourActive) stopTour();
+});
+renderer.domElement.addEventListener('pointerup', (event) => {
+  if (!pointerDownAt) return;
+  const moved = Math.hypot(event.clientX - pointerDownAt[0], event.clientY - pointerDownAt[1]);
+  pointerDownAt = null;
+  if (moved > 6) return;
+  pointerNdc.set((event.clientX / window.innerWidth) * 2 - 1, -(event.clientY / window.innerHeight) * 2 + 1);
+  raycaster.setFromCamera(pointerNdc, camera);
+  const hits = raycaster.intersectObjects(scene.children, true);
+  if (hits.length) {
+    let node = hits[0].object;
+    while (node) {
+      if (node.userData && node.userData.robotKey) { setFollow(node.userData.robotKey); return; }
+      node = node.parent;
+    }
+  }
+  if (followKey) setFollow(null);
+});
+
+const TOUR_ANCHORS = [[500, 392], [500, 210], [745, 432], [185, 280], [500, 550]];
+const followShift = new THREE.Vector3();
+
+function easeSmooth(x) { return x * x * (3 - 2 * x); }
+
+function updateCamera(dt) {
+  if (pendingFollow && robots.has(pendingFollow)) {
+    setFollow(pendingFollow);
+    pendingFollow = null;
+  }
+  if (tourActive) {
+    tourTime += dt;
+    // pendulum arc across the open south side and the glass east wall, so the
+    // camera never slips behind the two solid walls mid-tour
+    const azimuth = 0.235 * Math.PI + Math.sin(tourTime * Math.PI * 2 / 95) * 0.385 * Math.PI;
+    const radius = 720 + Math.sin(tourTime * 0.11) * 190;
+    const height = 350 + Math.sin(tourTime * 0.07 + 1.2) * 130;
+    camera.position.set(Math.cos(azimuth) * radius, height, Math.sin(azimuth) * radius * 0.78 + 40);
+    const segment = (tourTime / 16) % TOUR_ANCHORS.length;
+    const index = Math.floor(segment);
+    const blend = easeSmooth(segment - index);
+    const from = TOUR_ANCHORS[index];
+    const to = TOUR_ANCHORS[(index + 1) % TOUR_ANCHORS.length];
+    const spot = toWorld(from[0] + (to[0] - from[0]) * blend, from[1] + (to[1] - from[1]) * blend);
+    controls.target.set(spot.x, 40, spot.z);
+    camera.lookAt(controls.target);
+    return;
+  }
+  if (followKey) {
+    const robot = robots.get(followKey);
+    if (!robot) { setFollow(null); return; }
+    followShift.set(robot.group.position.x, 42, robot.group.position.z).sub(controls.target);
+    followShift.multiplyScalar(Math.min(1, 5 * dt));
+    controls.target.add(followShift);
+    camera.position.add(followShift);
+  }
+}
+
 /* ----------------------------- render loop ----------------------------- */
 const frameClock = new THREE.Clock();
 let renderPaused = false;
@@ -1668,15 +1790,18 @@ function stepScene(dt) {
   workstationScreens.forEach((screen, index) => {
     screen.material.emissiveIntensity = 0.75 + Math.sin(time * 2.2 + index * 1.7) * 0.15;
   });
+  updateCamera(dt);
   controls.update();
   if (composer) composer.render();
   else renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
 }
 
 window.__office = {
   renderer, scene, camera,
   setPaused: (value) => { renderPaused = Boolean(value); },
   getQuality: () => ({ tier: activeTier, auto: autoQuality, composer: Boolean(composer) }),
+  getCameraMode: () => ({ follow: followKey, tour: tourActive }),
   stepFrame: (dt = 1 / 60) => stepScene(dt),   // manual stepping for debugging
   debugRobots: () => Array.from(robots.values()).map((robot) => ({
     key: robot.key, status: robot.status, zone: robot.zone,
@@ -1699,6 +1824,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
   if (composer) composer.setSize(window.innerWidth, window.innerHeight);
 });
 </script>
