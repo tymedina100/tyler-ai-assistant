@@ -680,6 +680,7 @@ function buildRoom() {
   scene.add(box(390, 130, 6, new THREE.MeshStandardMaterial({ color: '#f7f9fb', roughness: 0.35 }), 0, 150, -323.5, true, false));
   scene.add(box(400, 140, 4, WOOD_DARK, 0, 150, -326.4, true, false));
   buildPlanningNotes();
+  buildDashboard();
 
   // wall clock + logo
   const clock = new THREE.Mesh(new THREE.CylinderGeometry(16, 16, 4, 32), new THREE.MeshStandardMaterial({ color: '#f2f5f8' }));
@@ -771,6 +772,102 @@ function updatePlanningNotes(events) {
     note.lastText = text;
     paintPlanningNote(note, text);
   });
+}
+
+/* ------------- wall-mounted company dashboard (the KPI wall) ------------- */
+let dashboardScreen = null;
+
+function buildDashboard() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1024; canvas.height = 538;
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  scene.add(rbox(214, 119, 5, 1.5, DARK_PANEL, -345, 125, -322.5, false, false));   // bezel
+  const screen = new THREE.Mesh(new THREE.PlaneGeometry(202, 106),
+    new THREE.MeshStandardMaterial({
+      map: texture, emissive: '#ffffff', emissiveMap: texture, emissiveIntensity: 0.55, roughness: 0.4 }));
+  screen.position.set(-345, 125, -319.7);
+  scene.add(screen);
+  dashboardScreen = { canvas, texture, lastJson: null };
+  paintDashboard(null);
+}
+
+function formatMoney(value) {
+  const amount = Number(value) || 0;
+  return amount >= 1000 ? Math.round(amount).toLocaleString('en-US') : String(Math.round(amount * 100) / 100);
+}
+
+function dashboardTiles(metrics) {
+  const sales = metrics && metrics.sales;
+  const linear = metrics && metrics.linear;
+  const team = metrics && metrics.team;
+  const salesReady = sales && sales.configured && !sales.error;
+  const linearReady = linear && linear.configured && !linear.error;
+  const agentEvents = (team && team.agent_events_today) || {};
+  const topAgent = Object.entries(agentEvents).sort((a, b) => b[1] - a[1])[0];
+  return [
+    {
+      label: 'REVENUE', color: '#f7b844',
+      value: salesReady ? `$${formatMoney(sales.revenue_usd)}` : '—',
+      sub: salesReady ? `${sales.sales_count || 0} sales · ${sales.products || 0} products`
+        : sales && sales.error ? 'source error' : 'connect Gumroad',
+    },
+    {
+      label: 'TASKS DONE TODAY', color: '#28b681',
+      value: linearReady ? String(linear.completed_today || 0) : '—',
+      sub: linearReady ? `${linear.in_progress || 0} in progress`
+        : linear && linear.error ? 'source error' : 'connect Linear',
+    },
+    {
+      label: 'MESSAGES TODAY', color: '#5e7df6',
+      value: team ? String(team.messages_today || 0) : '—',
+      sub: team ? `${team.events_today || 0} team events` : 'waiting for data',
+    },
+    {
+      label: 'TEAM ACTIVE', color: '#ad70e8',
+      value: team ? `${team.active_now || 0}/${team.team_size || 0}` : '—',
+      sub: topAgent ? `busiest: ${topAgent[0]} · ${topAgent[1]}` : 'all quiet so far',
+    },
+  ];
+}
+
+function paintDashboard(metrics) {
+  if (!dashboardScreen) return;
+  const json = JSON.stringify(metrics && { s: metrics.sales, l: metrics.linear, t: metrics.team });
+  if (json === dashboardScreen.lastJson) return;
+  dashboardScreen.lastJson = json;
+  const context = dashboardScreen.canvas.getContext('2d');
+  context.fillStyle = '#0d1524';
+  context.fillRect(0, 0, 1024, 538);
+  context.fillStyle = '#94a3b8';
+  context.font = '700 30px "Segoe UI", sans-serif';
+  context.textAlign = 'left';
+  context.fillText('C O M P A N Y   D A S H B O A R D', 36, 56);
+  const stamp = new Date(metrics && metrics.generated_at ? metrics.generated_at : Date.now());
+  context.textAlign = 'right';
+  context.font = '500 24px "Segoe UI", sans-serif';
+  context.fillText(Number.isNaN(stamp.getTime()) ? '' :
+    `updated ${stamp.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`, 988, 56);
+  dashboardTiles(metrics).forEach((tile, index) => {
+    const x = 36 + (index % 2) * 490;
+    const y = 96 + Math.floor(index / 2) * 212;
+    context.fillStyle = '#131f33';
+    context.beginPath();
+    if (context.roundRect) context.roundRect(x, y, 462, 190, 14); else context.rect(x, y, 462, 190);
+    context.fill();
+    context.textAlign = 'left';
+    context.fillStyle = '#94a3b8';
+    context.font = '700 25px "Segoe UI", sans-serif';
+    context.fillText(tile.label, x + 26, y + 48);
+    context.fillStyle = tile.color;
+    context.font = '700 84px "Segoe UI", sans-serif';
+    context.fillText(tile.value, x + 26, y + 132);
+    context.fillStyle = '#7d8ba1';
+    context.font = '500 26px "Segoe UI", sans-serif';
+    context.fillText(tile.sub, x + 26, y + 170);
+  });
+  dashboardScreen.texture.needsUpdate = true;
 }
 
 function makeTextPlate(text, color, width, height, x, y, z) {
@@ -1583,12 +1680,23 @@ async function pollState() {
   }
 }
 
+async function pollMetrics() {
+  const token = localStorage.getItem('office_token') || '';
+  if (!token) return;
+  try {
+    const response = await fetch('api/office-metrics', { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' });
+    if (!response.ok) return;
+    paintDashboard(await response.json());
+  } catch { /* keep the last numbers on a flaky connection */ }
+}
+
 document.getElementById('token-save').addEventListener('click', () => {
   const value = document.getElementById('token-input').value.trim();
   if (!value) return;
   localStorage.setItem('office_token', value);
   tokenModal.style.display = 'none';
   pollState();
+  pollMetrics();
 });
 
 /* ----------------------------- demo mode ----------------------------- */
@@ -1642,15 +1750,28 @@ function demoState(phaseIndex) {
 // optional scene-clock offset, e.g. ?demo=1&t=12 opens mid-way through phase 1
 const startTimeOffset = Math.max(0, parseFloat(params.get('t')) || 0);
 let demoPhase = Math.floor(startTimeOffset / 8);
+const DEMO_METRICS = {
+  generated_at: new Date().toISOString(),
+  sales: { configured: true, products: 2, sales_count: 14, revenue_usd: 386 },
+  linear: { configured: true, completed_today: 6, in_progress: 3 },
+  team: {
+    team_size: 6, active_now: 3, messages_today: 24, events_today: 41,
+    agent_events_today: { code: 9, research: 7, marketing: 5 },
+  },
+};
+
 if (demoMode) {
   document.getElementById('demo-badge').style.display = 'block';
   setConnection('#5e7df6', 'Demo activity');
   applyState(demoState(demoPhase));
+  paintDashboard(DEMO_METRICS);
   // phase advancement happens on the render clock (see stepScene), so demo
   // activity stays deterministic and survives background-tab timer throttling
 } else {
   pollState();
   setInterval(pollState, POLL_MS);
+  pollMetrics();
+  setInterval(pollMetrics, 60000);
 }
 
 /* --------------------------- day / night --------------------------- */
