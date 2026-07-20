@@ -37,6 +37,27 @@
   #tour-chip:hover { color: var(--text); }
   #tour-chip.active { color: #f7b844; border-color: rgba(247, 184, 68, 0.5); }
   #label-layer { position: absolute; inset: 0; pointer-events: none; }
+  #agent-panel {
+    position: absolute; right: 18px; top: 140px; width: 272px; display: none;
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 14px;
+    padding: 14px 16px; backdrop-filter: blur(10px);
+  }
+  #agent-panel .head { display: flex; align-items: center; gap: 9px; margin-bottom: 2px; }
+  #agent-panel .dot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+  #agent-panel .who { min-width: 0; }
+  #agent-panel .agent-name { font-size: 16px; font-weight: 700; }
+  #agent-panel .agent-role { font-size: 11px; color: var(--muted); }
+  #agent-panel .close {
+    margin-left: auto; color: var(--muted); cursor: pointer; font-size: 15px;
+    line-height: 1; padding: 4px 6px; border-radius: 7px;
+  }
+  #agent-panel .close:hover { color: var(--text); background: rgba(148, 163, 184, 0.14); }
+  #agent-panel .status-row { font-size: 11px; font-weight: 700; letter-spacing: 1.2px; margin: 8px 0 2px; }
+  #agent-panel .now { font-size: 12px; color: #c3cede; line-height: 1.45; }
+  #agent-panel h3 { font-size: 10px; letter-spacing: 2px; color: var(--muted); margin: 12px 0 6px; }
+  #agent-panel .history-row { display: flex; align-items: baseline; gap: 7px; font-size: 11.5px; padding: 2.5px 0; }
+  #agent-panel .history-text { color: #c3cede; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #agent-panel .history-empty { font-size: 11.5px; color: var(--muted); }
   .robot-tag { text-align: center; font-family: "Segoe UI", system-ui, sans-serif; pointer-events: none; }
   .robot-tag .bubble {
     display: none; max-width: 200px; margin: 0 auto 6px; padding: 5px 10px;
@@ -113,6 +134,17 @@
 <div id="connection-chip" class="chip"><span id="connection-dot"></span><span id="connection-text">Connecting…</span></div>
 <div id="quality-chip" class="chip" title="Cycle render quality">QUALITY AUTO</div>
 <div id="tour-chip" class="chip" title="Slow cinematic camera tour">TOUR OFF</div>
+<div id="agent-panel">
+  <div class="head">
+    <span class="dot"></span>
+    <div class="who"><div class="agent-name"></div><div class="agent-role"></div></div>
+    <span class="close" title="Close">✕</span>
+  </div>
+  <div class="status-row"></div>
+  <div class="now"></div>
+  <h3>RECENT ACTIVITY</h3>
+  <div class="history"></div>
+</div>
 <div id="demo-badge">DEMO MODE</div>
 <div id="event-panel">
   <h2>ACTIVITY CONSOLE</h2>
@@ -1397,6 +1429,7 @@ function dampAngle(current, target, lambda, dt) {
 const robots = new Map();
 let latestState = { agents: {}, events: [] };
 let speakingKey = null;   // seated neighbors turn their heads toward the speaker
+let panelKey = null;      // agent whose side panel is open (set by the camera section)
 
 function applyState(state) {
   latestState = state;
@@ -1413,6 +1446,7 @@ function applyState(state) {
     if (!seen.has(key)) { robot.dispose(); robots.delete(key); }
   }
   renderPanels(state, agents);
+  if (panelKey) refreshAgentPanel();
 }
 
 function renderPanels(state, agents) {
@@ -1501,7 +1535,20 @@ document.getElementById('token-save').addEventListener('click', () => {
 
 /* ----------------------------- demo mode ----------------------------- */
 const DEMO_ROSTER = {
-  manager: 'Miles', code: 'Coder', research: 'Scout', write: 'Writer', finance: 'Penny', marketing: 'Mara',
+  manager: ['Miles', 'General Manager'],
+  code: ['Coder', 'Head of Engineering'],
+  research: ['Scout', 'Research Lead'],
+  write: ['Writer', 'Content Writer'],
+  finance: ['Penny', 'Finance'],
+  marketing: ['Mara', 'Marketing Lead'],
+};
+const DEMO_HISTORY = {
+  manager: ['Dispatched the launch checklist', 'Reviewed the daily brief'],
+  code: ['Deployed the new build to Railway', 'Refactored the Telegram router', 'Closed 3 Linear issues'],
+  research: ['Scanned 14 subreddits for leads', 'Summarized two competitor launches'],
+  write: ['Drafted the release notes'],
+  finance: ['Reconciled Gumroad payouts'],
+  marketing: ['Scheduled 5 posts for the week'],
 };
 const DEMO_PHASES = [
   { code: ['thinking', 'Refactoring the parser'], research: ['speaking', 'Found three qualified leads'], manager: ['delegated', 'Assigning the launch work'] },
@@ -1513,9 +1560,13 @@ const DEMO_PHASES = [
 function demoState(phaseIndex) {
   const phase = DEMO_PHASES[phaseIndex % DEMO_PHASES.length];
   const agents = {};
-  for (const [key, name] of Object.entries(DEMO_ROSTER)) {
+  for (const [key, [name, role]] of Object.entries(DEMO_ROSTER)) {
     const [status, message] = phase[key] || ['idle', ''];
-    agents[key] = { name, status, message };
+    const history = (DEMO_HISTORY[key] || []).map((text, index) => ({
+      kind: 'activity', agent_key: key, text,
+      timestamp: new Date(Date.now() - (index + 1) * 420000).toISOString(),
+    }));
+    agents[key] = { name, role, status, message, history };
   }
   return {
     agents,
@@ -1707,9 +1758,49 @@ function setFollow(key) {
     stopTour(false);
     const robot = robots.get(key);
     hintElement.innerHTML = `Following <b>${escapeHtml(robot ? robot.name : key)}</b> &nbsp;·&nbsp; Click the floor to release`;
+    openAgentPanel(key);
   } else {
     hintElement.innerHTML = DEFAULT_HINT;
+    closeAgentPanel();
   }
+}
+
+/* --------------------------- agent side panel --------------------------- */
+const agentPanel = document.getElementById('agent-panel');
+agentPanel.querySelector('.close').addEventListener('click', () => setFollow(null));
+
+function openAgentPanel(key) {
+  panelKey = key;
+  refreshAgentPanel();
+}
+
+function closeAgentPanel() {
+  panelKey = null;
+  agentPanel.style.display = 'none';
+}
+
+function refreshAgentPanel() {
+  const agent = latestState.agents ? latestState.agents[panelKey] : null;
+  if (!agent) { closeAgentPanel(); return; }
+  agentPanel.style.display = 'block';
+  agentPanel.querySelector('.dot').style.background = agentColor(panelKey);
+  agentPanel.querySelector('.agent-name').textContent = agent.name || panelKey;
+  agentPanel.querySelector('.agent-role').textContent = agent.role || 'Team member';
+  const status = agent.status || 'idle';
+  const statusRow = agentPanel.querySelector('.status-row');
+  statusRow.textContent = status.toUpperCase();
+  statusRow.style.color = STATUS_COLORS[status] || STATUS_COLORS.idle;
+  agentPanel.querySelector('.now').textContent = agent.message || 'Nothing in progress right now.';
+  const history = Array.isArray(agent.history) ? agent.history : [];
+  const rows = history.map((event) => {
+    const kind = event.kind || 'activity';
+    const dot = kind === 'error' ? '#ef6461' : kind === 'message' ? '#f7b844' : '#28b681';
+    return `<div class="history-row"><span class="event-dot" style="background:${dot}"></span>` +
+      `<span class="history-text">${escapeHtml(event.text || '')}</span>` +
+      `<span class="event-time">${eventTime(event.timestamp)}</span></div>`;
+  });
+  agentPanel.querySelector('.history').innerHTML = rows.join('') ||
+    '<div class="history-empty">No recent activity from this teammate.</div>';
 }
 
 function startTour() {
