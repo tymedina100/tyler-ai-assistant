@@ -116,6 +116,51 @@ class OfficeDesktopLayoutTests(unittest.TestCase):
         self.assertFalse(office_desktop.seated_pose("planning", False))
         self.assertFalse(office_desktop.seated_pose("operations", False))
 
+    def test_two_delegates_pull_the_operations_group_into_a_huddle(self):
+        agents = [
+            ("manager", {"status": "delegated", "name": "Miles"}),
+            ("marketing", {"status": "delegated", "name": "Mara"}),
+            ("write", {"status": "delegated", "name": "Quill"}),
+            ("code", {"status": "idle", "name": "Patch"}),
+        ]
+        placed = {item["key"]: item for item in office_desktop.assign_scene_positions(agents)}
+        center_x, center_y = office_desktop.HUDDLE_CENTER
+        for key in ("manager", "marketing", "write"):
+            item = placed[key]
+            distance = ((item["x"] - center_x) ** 2 + (item["y"] - center_y) ** 2) ** 0.5
+            self.assertAlmostEqual(distance, office_desktop.HUDDLE_RADIUS, delta=0.2)
+            self.assertIsNotNone(item["face"])
+        positions = {(placed[key]["x"], placed[key]["y"]) for key in ("manager", "marketing", "write")}
+        self.assertEqual(len(positions), 3)
+        self.assertIsNone(placed["code"]["face"])
+
+    def test_huddle_members_face_the_center_of_the_circle(self):
+        import math
+        x, y, face = office_desktop.huddle_position(0, 3)
+        center_x, center_y = office_desktop.HUDDLE_CENTER
+        expected = math.atan2(center_x - x, center_y - y)
+        self.assertAlmostEqual(face, expected, places=2)
+
+    def test_single_delegation_keeps_the_legacy_wedge_layout(self):
+        agents = [
+            ("manager", {"status": "delegated", "name": "Miles"}),
+            ("code", {"status": "delegated", "name": "Patch"}),
+        ]
+        wedge = office_desktop.assign_scene_positions([agents[0]])
+        self.assertEqual((wedge[0]["x"], wedge[0]["y"]), office_desktop.ZONE_ANCHORS["operations"])
+        self.assertIsNone(wedge[0]["face"])
+
+    def test_huddle_spots_stay_walkable_for_any_realistic_group_size(self):
+        for total in range(2, 9):
+            for slot in range(total):
+                x, y, _ = office_desktop.huddle_position(slot, total)
+                self.assertFalse(
+                    office_desktop.point_blocked(x, y),
+                    f"huddle slot {slot}/{total} at ({x}, {y}) is inside furniture",
+                )
+                path = office_desktop.walk_path((150, 170), (x, y))
+                self.assertEqual(path[-1], (x, y))
+
 
 if __name__ == "__main__":
     unittest.main()

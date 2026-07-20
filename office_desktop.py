@@ -42,6 +42,10 @@ ZONE_ANCHORS = {
     "support": (185, 280),
 }
 ZONE_OFFSETS = [(0, 0), (-50, 22), (50, 22), (-78, 46), (78, 46), (0, 55)]
+# When Miles delegates to 2+ teammates the operations group meets in a circle on
+# the open rug south of the desk instead of the wedge above.
+HUDDLE_CENTER = (500, 487)
+HUDDLE_RADIUS = 42
 ROBOT_SPRITE_PATH = Path(__file__).resolve().parent / "assets" / "office" / "coworker-3d.png"
 ROBOT_SPRITE_DIRECTORY = Path(__file__).resolve().parent / "assets" / "office" / "sprites"
 OFFICE_ROOM_PATH = Path(__file__).resolve().parent / "assets" / "office" / "office-room.png"
@@ -264,21 +268,39 @@ def home_position(key, index):
     return HOME_SLOTS[index % len(HOME_SLOTS)]
 
 
+def huddle_position(slot, total):
+    """Evenly spaced spot on the huddle circle, slot 0 nearest the desk."""
+    angle = -math.pi / 2 + slot * 2 * math.pi / max(total, 1)
+    x = HUDDLE_CENTER[0] + math.cos(angle) * HUDDLE_RADIUS
+    y = HUDDLE_CENTER[1] + math.sin(angle) * HUDDLE_RADIUS
+    face = math.atan2(HUDDLE_CENTER[0] - x, HUDDLE_CENTER[1] - y)
+    return round(x, 1), round(y, 1), round(face, 3)
+
+
 def assign_scene_positions(agents):
     """Return stable, non-overlapping room positions for the current API roster."""
     placed = []
     zone_counts = {"planning": 0, "operations": 0, "response": 0, "support": 0}
+    entries = []
     for index, (key, agent) in enumerate(agents):
         status = agent.get("status", "idle")
-        zone = scene_zone(key, status)
+        entries.append((index, key, agent, status, scene_zone(key, status)))
+    delegate_total = sum(1 for entry in entries if entry[3] == "delegated")
+    operations_total = sum(1 for entry in entries if entry[4] == "operations")
+    huddling = delegate_total >= 2
+    for index, key, agent, status, zone in entries:
+        face = None
         if zone == "home":
             x, y = home_position(key, index)
+        elif zone == "operations" and huddling:
+            x, y, face = huddle_position(zone_counts[zone], operations_total)
+            zone_counts[zone] += 1
         else:
             base_x, base_y = ZONE_ANCHORS[zone]
             offset_x, offset_y = ZONE_OFFSETS[zone_counts[zone] % len(ZONE_OFFSETS)]
             zone_counts[zone] += 1
             x, y = base_x + offset_x, base_y + offset_y
-        placed.append({"key": key, "agent": agent, "status": status, "zone": zone, "x": x, "y": y})
+        placed.append({"key": key, "agent": agent, "status": status, "zone": zone, "x": x, "y": y, "face": face})
     return placed
 
 
