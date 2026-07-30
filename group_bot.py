@@ -263,6 +263,20 @@ async def post_agent_answer_to_group(key, answer):
     await send_chunks(bot, GROUP_CHAT_ID, answer)
 
 
+def _strip_bot_suffix(text):
+    """Telegram appends the bot's @username to a command picked from the command menu
+    in a multi-bot group (e.g. "/confirm@TyManagerBot"). Strip that suffix from the
+    LEADING command token so exact-match checks like "/confirm" and "/today" still
+    recognize the command - the same normalization parse_company_command does. Only
+    a leading slash command is touched, so an @mention or email address in ordinary
+    text is never altered."""
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return stripped
+    command, sep, rest = stripped.partition(" ")
+    return command.split("@", 1)[0] + sep + rest
+
+
 async def _handle_pending_confirmation(update, text):
     """If the CURRENT conversation (main.set_conversation must already be called for
     this chat) has a sensitive action staged, resolve it with this message - /confirm
@@ -275,12 +289,13 @@ async def _handle_pending_confirmation(update, text):
 
     main.clear_pending_action()  # resolved either way - confirm or cancel
     description = main.describe_pending_action(pending)
+    command = _strip_bot_suffix(text)
 
     # A "publish" approval is resolved here (in group_bot) rather than via
     # main.confirm_pending_action, since publishing is a Company Mode concept and
     # main.py stays independent of company_mode.
     if pending.get("type") == "publish":
-        if text.strip() == "/confirm":
+        if command == "/confirm":
             msg = await asyncio.to_thread(company_mode.mark_project_published)
             main.logger.info(f"Telegram user {update.effective_user.id} confirmed {description}")
             await reply_chunks(update.message, f"{msg}\n\n{GUMROAD_GO_LIVE_STEPS}")
@@ -289,7 +304,7 @@ async def _handle_pending_confirmation(update, text):
             await update.message.reply_text(f"Cancelled the {description}. Nothing was marked published.")
         return True
 
-    if text.strip() == "/confirm":
+    if command == "/confirm":
         # confirm_pending_action can do blocking I/O (Gmail send) - keep it off the loop.
         result = await asyncio.to_thread(main.confirm_pending_action, pending)
         main.logger.info(f"Telegram user {update.effective_user.id} confirmed {description}")
@@ -406,7 +421,7 @@ async def _maybe_handle_project_linear_command(update, text):
     The handlers may hit the Linear API or the model (planning commands), so run them
     off the event loop in a thread. Not company-metered - same as the CLI slash
     commands."""
-    stripped = (text or "").strip()
+    stripped = _strip_bot_suffix(text)
     lowered = stripped.lower()
 
     if lowered == "/today":
@@ -464,7 +479,7 @@ async def handle_group_message(update: Update):
             _office_call("set_agent_status", "manager", "idle")
             return  # addressed to a specific specialist - their own handler owns this
 
-    if text.strip() in ("/start", f"@{bot_usernames['manager']}", f"@{bot_usernames['manager']} /start"):
+    if _strip_bot_suffix(text) in ("/start", f"@{bot_usernames['manager']}", f"@{bot_usernames['manager']} /start"):
         await update.message.reply_text(AGENT_INFO["manager"]["welcome"])
         return
 
