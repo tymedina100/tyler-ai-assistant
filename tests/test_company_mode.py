@@ -1,7 +1,11 @@
+import json
 import os
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import company_mode
 
@@ -57,7 +61,8 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(len(state["projects"]), 1)
         self.assertEqual(len(state["tasks"]), 4)
         self.assertEqual(state["company"]["reserved_today_usd"], 4.0)  # 4 tasks x $1 reserve
-        self.assertEqual(company_mode.remaining_budget(state), 16.0)
+        # The configured emergency reserve is intentionally unavailable to ordinary tasks.
+        self.assertEqual(company_mode.remaining_budget(state), 15.75)
 
     def test_assign_blocks_when_budget_is_too_small(self):
         company_mode.set_daily_budget(2, self.state_path)
@@ -449,6 +454,24 @@ class CompanyModeTests(unittest.TestCase):
         # ...but a still-planned task contributes nothing yet.
         self.assertNotIn(second["title"], summary)
 
+    def test_editor_receives_the_bounded_full_worker_result(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project = company_mode.active_project(state)
+        tasks = company_mode.project_tasks(state, project["id"])
+        worker = next(task for task in tasks if task["owner"] != "editor")
+        editor = next(task for task in tasks if task["owner"] == "editor")
+        long_result = "start-" + ("x" * 3500) + "-review-tail"
+
+        company_mode.update_task_status(
+            worker["id"], "done", result=long_result, path=self.state_path
+        )
+        state = company_mode.load_state(self.state_path)
+        summary = company_mode.prior_work_summary(state, project["id"], editor["id"])
+
+        self.assertIn("review-tail", summary)
+        self.assertNotIn("...[truncated]", summary)
+
     def test_prior_work_summary_empty_when_nothing_done(self):
         self._assign()
         state = company_mode.load_state(self.state_path)
@@ -491,6 +514,298 @@ class CompanyModeTests(unittest.TestCase):
         )
         state = company_mode.load_state(self.state_path)
         self.assertEqual(state["company"]["spent_today_usd"], 0.3)
+
+    # --- hardened persistence, atomic budget ledger, and bounded review ---
+
+    def test_corrupt_state_is_quarantined_and_never_resets_budget_silently(self):
+        self.state_path.write_text('{"company": ', encoding="utf-8")
+
+        with self.assertRaises(company_mode.StateCorruptionError) as caught:
+            company_mode.load_state(self.state_path)
+
+        self.assertFalse(self.state_path.exists())
+        self.assertTrue(caught.exception.quarantine_path.exists())
+        self.assertEqual(caught.exception.quarantine_path.read_text(encoding="utf-8"), '{"company": ')
+
+    def test_budget_date_uses_configured_timezone(self):
+        instant = datetime(2026, 1, 1, 7, 30, tzinfo=timezone.utc)
+        with mock.patch.dict(os.environ, {"TIMEZONE": "America/Phoenix"}):
+            self.assertEqual(company_mode.today_key(instant), "2026-01-01")
+        with mock.patch.dict(os.environ, {"TIMEZONE": "Pacific/Honolulu"}):
+            self.assertEqual(company_mode.today_key(instant), "2025-12-31")
+
+    def test_emergency_reserve_is_excluded_from_ordinary_work(self):
+        with mock.patch.dict(os.environ, {"COMPANY_EMERGENCY_RESERVE_USD": "0.25"}):
+            company_mode.set_daily_budget(1.0, self.state_path)
+            self.assertEqual(company_mode.remaining_budget(company_mode.load_state(self.state_path)), 0.75)
+            company_mode.reserve_budget(0.75, self.state_path, context="task")
+            with self.assertRaises(company_mode.BudgetExceededError):
+                company_mode.reserve_budget(0.01, self.state_path, context="task")
+            emergency = company_mode.reserve_budget(
+                0.25, self.state_path, context="escalation", allow_emergency=True
+            )
+            self.assertTrue(emergency["uses_emergency_reserve"])
+
+    def test_reserve_reconcile_and_release_persist_attribution_usage_and_precision(self):
+        company_mode.set_daily_budget(10, self.state_path)
+        reservation = company_mode.reserve_budget(
+            1.1234564,
+            self.state_path,
+            context="task",
+            project_id="project-a",
+            task_id="task-a",
+            agent="engineer",
+            model="small-model",
+            reason="implementation",
+        )
+        self.assertEqual(reservation["amount_usd"], 1.123456)
+
+        cost = company_mode.reconcile_budget(
+            reservation["id"],
+            0.2345678,
+            self.state_path,
+            usage_records=[{"prompt_tokens": 11, "completion_tokens": 7}],
+        )
+        self.assertEqual(cost["amount_usd"], 0.234568)
+        self.assertEqual(cost["cost_basis"], "actual")
+        self.assertEqual(cost["total_tokens"], 18)
+        self.assertEqual(cost["project_id"], "project-a")
+        self.assertEqual(cost["model"], "small-model")
+
+        released = company_mode.reserve_budget(0.5, self.state_path, reason="optional")
+        company_mode.release_budget(released["id"], self.state_path, reason="deferred")
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(state["company"]["reserved_today_usd"], 0.0)
+        self.assertEqual(state["company"]["spent_today_usd"], 0.234568)
+        self.assertEqual(state["budget_reservations"][-1]["status"], "released")
+
+    def test_concurrent_reservations_cannot_overspend(self):
+        company_mode.set_daily_budget(2.25, self.state_path)  # $2 ordinary + $0.25 emergency
+
+        def attempt(_):
+            try:
+                return company_mode.reserve_budget(0.5, self.state_path)["id"]
+            except company_mode.BudgetExceededError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(attempt, range(12)))
+
+        self.assertEqual(sum(value is not None for value in results), 4)
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(state["company"]["reserved_today_usd"], 2.0)
+        self.assertEqual(len([r for r in state["budget_reservations"] if r["status"] == "reserved"]), 4)
+
+    def test_concurrent_approval_cannot_overwrite_a_budget_reservation(self):
+        company_mode.set_daily_budget(3.0, self.state_path)
+        self._assign()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            approval = pool.submit(company_mode.approve_project, self.state_path, notify_hooks=False)
+            reservation = pool.submit(
+                company_mode.reserve_budget,
+                0.10,
+                self.state_path,
+                context="concurrent-check",
+            )
+            approval.result()
+            held = reservation.result()
+
+        state = company_mode.load_state(self.state_path)
+        self.assertEqual(company_mode.active_project(state)["status"], "active")
+        self.assertTrue(any(value["id"] == held["id"] for value in state["budget_reservations"]))
+        self.assertGreaterEqual(state["company"]["reserved_today_usd"], 0.10)
+
+    def test_persisted_company_output_redacts_common_github_credentials(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        task_id = state["tasks"][0]["id"]
+        company_mode.update_task_status(
+            task_id,
+            "done",
+            "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123456",
+            spent_usd=0.0,
+            path=self.state_path,
+        )
+
+        raw = self.state_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("ghp_", raw)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", raw)
+        self.assertIn("[REDACTED]", raw)
+
+    def test_assign_goal_accepts_rich_task_metadata_and_old_tuples(self):
+        company_mode.set_daily_budget(10, self.state_path)
+        plan = [
+            ("research", "Legacy tuple"),
+            {
+                "owner": "code",
+                "title": "Implement guarded change",
+                "estimate_usd": 0.1256789,
+                "acceptance_criteria": ["Focused tests pass"],
+                "authorization_level": "modify_locally",
+                "model": "standard-model",
+                "model_reason": "Moderate coding task",
+                "prior_model_fingerprint": "prior-1",
+                "feedback_fingerprint": "feedback-1",
+            },
+        ]
+        company_mode.assign_goal(
+            "Harden one workflow", ["manager", "code", "research"], path=self.state_path, tasks=plan
+        )
+        state = company_mode.load_state(self.state_path)
+        legacy, rich = state["tasks"]
+        self.assertEqual(legacy["execution_attempts"], 0)
+        self.assertEqual(rich["estimate_usd"], 0.125679)
+        self.assertEqual(rich["acceptance_criteria"], ["Focused tests pass"])
+        self.assertEqual(rich["authorization_level"], "modify_locally")
+        self.assertEqual(rich["model_reason"], "Moderate coding task")
+        self.assertEqual(rich["prior_model_fingerprints"], ["prior-1"])
+        self.assertEqual(rich["feedback_fingerprints"], ["feedback-1"])
+
+    def test_update_task_status_persists_usage_and_estimated_label(self):
+        self._assign()
+        task_id = company_mode.load_state(self.state_path)["tasks"][0]["id"]
+        company_mode.update_task_status(
+            task_id,
+            "done",
+            path=self.state_path,
+            usage_records={"input_tokens": 9, "output_tokens": 4},
+            model="small-model",
+            model_reason="Routine extraction",
+        )
+        state = company_mode.load_state(self.state_path)
+        task = next(item for item in state["tasks"] if item["id"] == task_id)
+        cost = next(item for item in state["cost_entries"] if item["task_id"] == task_id)
+        self.assertEqual(task["total_tokens"], 13)
+        self.assertEqual(task["model"], "small-model")
+        self.assertEqual(cost["cost_basis"], "estimated")
+        self.assertEqual(cost["total_tokens"], 13)
+
+    def test_failure_classifier_covers_actionable_categories(self):
+        cases = {
+            "API key is missing": "missing_access",
+            "Need more information about the target": "missing_information",
+            "Required tool is unavailable": "unavailable_tool",
+            "403 permission denied": "permission",
+            "Daily budget exhausted": "budget",
+            "Request timed out": "transient",
+            "Needs approval from the owner": "decision",
+            "Unexpected parser failure": "technical",
+        }
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(company_mode.classify_failure(message), expected)
+
+    def test_repeated_substantially_identical_editor_feedback_blocks_no_progress(self):
+        self._assign()
+        project_id = company_mode.load_state(self.state_path)["company"]["active_project_id"]
+        first = "REVISIONS REQUIRED: fix the missing source and clarify the conclusion."
+        second = "Revisions required - please fix missing source and clarify the conclusion!"
+        self.assertEqual(company_mode.set_project_revision_flag(project_id, first, self.state_path), "revise")
+        self.assertEqual(company_mode.set_project_revision_flag(project_id, second, self.state_path), "blocked")
+        project = company_mode.active_project(company_mode.load_state(self.state_path))
+        self.assertEqual(project["status"], "blocked")
+        self.assertEqual(project["failure_classification"], "no_progress")
+        self.assertFalse(project["needs_revision"])
+
+    def test_start_revision_round_enforces_cap_itself(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project_id = state["company"]["active_project_id"]
+        company_mode.active_project(state)["revision_round"] = company_mode.MAX_REVISION_ROUNDS
+        company_mode.save_state(state, self.state_path)
+
+        created, note = company_mode.start_revision_round(project_id, ["manager", "code"], self.state_path)
+
+        self.assertFalse(created)
+        self.assertIn("maximum revision rounds", note)
+        project = company_mode.active_project(company_mode.load_state(self.state_path))
+        self.assertEqual(project["status"], "blocked")
+        self.assertEqual(project["failure_classification"], "no_progress")
+
+    def test_autonomous_revision_preserves_authorization_routing_and_criteria(self):
+        company_mode.set_daily_budget(5, self.state_path)
+        criteria = ["No external action", "The validation result is explicit"]
+        plan = [
+            {
+                "owner": "code",
+                "title": "Inspect the configuration",
+                "estimate_usd": 0.10,
+                "acceptance_criteria": criteria,
+                "authorization_level": "observe",
+                "enforce_authorization": True,
+                "task_type": "status_update",
+                "complexity": "lightweight",
+                "risk": "low",
+                "required_capabilities": ["text"],
+                "model": "small-model",
+                "model_reason": "Least-cost capable model",
+            },
+            {
+                "owner": "editor",
+                "title": "Review the result",
+                "estimate_usd": 0.12,
+                "acceptance_criteria": criteria,
+                "authorization_level": "observe",
+                "enforce_authorization": True,
+                "task_type": "review",
+                "complexity": "standard",
+                "risk": "low",
+                "required_capabilities": ["review"],
+                "model": "review-model",
+                "model_reason": "Bounded review route",
+            },
+        ]
+        company_mode.assign_goal(
+            "Validate safely", ["manager", "code", "editor"],
+            path=self.state_path, tasks=plan,
+            project_metadata={"autonomous_run_id": "run-1", "source": "autonomous_daily_run"},
+        )
+        project_id = company_mode.load_state(self.state_path)["company"]["active_project_id"]
+        company_mode.set_project_revision_flag(
+            project_id, "REVISIONS REQUIRED: make the validation result explicit.", self.state_path
+        )
+
+        hook = mock.Mock()
+        with mock.patch.object(company_mode, "on_project_activated", hook):
+            created, _note = company_mode.start_revision_round(
+                project_id, ["manager", "code", "editor"], self.state_path
+            )
+        self.assertTrue(created)
+        hook.assert_not_called()
+        revised = company_mode.project_tasks(company_mode.load_state(self.state_path), project_id)[-2:]
+        self.assertEqual([task["estimate_usd"] for task in revised], [0.10, 0.12])
+        self.assertEqual([task["model"] for task in revised], ["small-model", "review-model"])
+        self.assertTrue(all(task["enforce_authorization"] for task in revised))
+        self.assertTrue(all(task["acceptance_criteria"] == criteria for task in revised))
+
+    def test_autonomous_task_prompt_makes_acceptance_and_authorization_explicit(self):
+        prompt = company_mode.build_task_prompt(
+            {"id": "p", "goal": "Validate safely"},
+            {
+                "id": "t",
+                "owner": "manager",
+                "title": "Inspect only",
+                "acceptance_criteria": ["Report the timezone"],
+                "authorization_level": "observe",
+                "enforce_authorization": True,
+            },
+        )
+        self.assertIn("Acceptance criteria", prompt)
+        self.assertIn("Report the timezone", prompt)
+        self.assertIn("Authorization level: observe", prompt)
+        self.assertIn("Do not create or modify files", prompt)
+
+    def test_execution_attempt_cap_moves_task_to_blocked(self):
+        self._assign()
+        task_id = company_mode.load_state(self.state_path)["tasks"][0]["id"]
+        with mock.patch.object(company_mode, "MAX_EXECUTION_ATTEMPTS", 1):
+            company_mode.update_task_status(task_id, "in_progress", path=self.state_path)
+            company_mode.update_task_status(task_id, "in_progress", path=self.state_path)
+        task = next(item for item in company_mode.load_state(self.state_path)["tasks"] if item["id"] == task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["failure_classification"], "no_progress")
 
 
 if __name__ == "__main__":

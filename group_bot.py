@@ -28,8 +28,10 @@ Architecture:
   configured group, ignore anyone not on the allowlist.
 """
 import asyncio
+import contextvars
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -41,10 +43,13 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 import main
+import autonomous_workflow
+import autonomy_team
 import company_mode
 import company_linear
 import gumroad_helpers
 import linear_helpers
+import model_router
 import office_api
 import office_state
 
@@ -120,9 +125,8 @@ AGENT_INFO = {
             "Hi, I'm Miles, the Chief of Staff. Message me (or just talk in the "
             "group) and I'll route your request to the right agent - or @mention "
             "an agent directly to skip me entirely. If anyone stages a sensitive "
-            "action (a file write or sending an email), reply /confirm to me "
-            "specifically to approve it, even if you were talking to another agent "
-            "directly."
+            "action (a file write or sending an email), reply /confirm in the same "
+            "chat where it was staged."
         ),
     },
     "code": {"env_var": "TELEGRAM_CODE_BOT_TOKEN", "tagline": "@mention me with a coding task."},
@@ -174,6 +178,11 @@ main_loop = None
 # The single in-flight Company Mode plan runner (Feature: v2 checkpointed autonomy).
 # One at a time - /approve refuses to start a second while this is running.
 company_runner_task = None
+autonomy_runner_task = None
+_autonomy_workflow_instance = None
+AUTONOMY_CONFIG = autonomous_workflow.AutonomyConfig.from_env()
+AUTONOMY_ROUTER = model_router.ModelRouter()
+_suppress_company_updates = contextvars.ContextVar("suppress_company_updates", default=False)
 office_api_server = None
 
 # Transient office states remain visible long enough for the browser's 1.5-second
@@ -248,6 +257,8 @@ async def post_agent_answer_to_group(key, answer):
     """Post an agent's answer to the group under its own bot identity, falling back
     to Miles for agents that don't have their own bot yet (e.g. Quill/Robin).
     Chunked so a long answer isn't silently dropped (see send_chunks below)."""
+    if _suppress_company_updates.get():
+        return
     bot = bots.get(key, bots["manager"])
     await send_chunks(bot, GROUP_CHAT_ID, answer)
 
@@ -465,6 +476,10 @@ async def handle_group_message(update: Update):
         if await _handle_pending_confirmation(update, text):
             return
 
+        if re.match(r"^/autorun(?:@[A-Za-z0-9_]+)?(?:\s|$)", text.strip(), flags=re.I):
+            await handle_autorun_command(update, text, allow_live=True)
+            return
+
         # /project and /linear slash commands are handled directly (not routed to Miles).
         if await _maybe_handle_project_linear_command(update, text):
             return
@@ -503,7 +518,14 @@ async def handle_group_message(update: Update):
 
         _office_call("set_agent_status", "manager", "thinking", text)
         try:
-            responders = await asyncio.to_thread(main.select_group_responders, text)
+            responders = await _run_metered(
+                main.select_group_responders,
+                text,
+                estimate_usd=0.02,
+                context="group message routing",
+                agent="manager",
+                meter_model=main.FAST_MODEL,
+            )
         except Exception as e:
             main.logger.error(f"Group router error, falling back to Miles: {e}")
             responders = ["manager"]
@@ -570,6 +592,10 @@ async def handle_manager_dm(update: Update):
         main.set_reply_context({"kind": "manager_dm", "user_id": user_id, "chat_id": chat_id})
 
         if await _handle_pending_confirmation(update, text):
+            return
+
+        if re.match(r"^/autorun(?:@[A-Za-z0-9_]+)?(?:\s|$)", text.strip(), flags=re.I):
+            await handle_autorun_command(update, text, allow_live=False)
             return
 
         # /project and /linear slash commands are handled directly (not routed to Miles).
@@ -656,13 +682,45 @@ def on_delegation(specialist_key, request_text, answer_text):
 # between tasks, and linking each finished task to a real deliverable (artifact).
 # --------------------------------------------------------------------------- #
 
-async def _run_metered(fn, *args):
-    """Run a blocking main.ask_* call with a cost sink attached, then bill the real
-    token spend (and any artifacts) against today's budget as ad-hoc chat spend. Used
-    for reactive Miles delegations so the daily ledger reflects all delegated work,
-    not just the autonomous engine. Does NOT set company_execution, so normal
-    /confirm gating for file writes/email is unchanged in ad-hoc chat."""
-    sink = {"cost_usd": 0.0, "artifacts": [], "context": "ad-hoc chat"}
+async def _run_metered(
+    fn,
+    *args,
+    estimate_usd=None,
+    context="ad-hoc chat",
+    agent="manager",
+    meter_model=None,
+    project_id=None,
+    task_id=None,
+    return_receipt=False,
+):
+    """Reserve before a paid call, then reconcile measured usage atomically.
+
+    This is intentionally used by reactive chat and idle ideation as well as the
+    autonomous runner.  It does not enable Company Mode's produce bypass, so normal
+    confirmation behavior remains unchanged outside a persisted company task.
+    """
+    if estimate_usd is None:
+        try:
+            estimate_usd = max(0.001, float(os.environ.get("ADHOC_RESERVATION_USD", "0.10")))
+        except (TypeError, ValueError):
+            estimate_usd = 0.10
+    reservation = await asyncio.to_thread(
+        company_mode.reserve_budget,
+        estimate_usd,
+        company_mode.COMPANY_STATE_FILE,
+        context=context,
+        project_id=project_id,
+        task_id=task_id,
+        agent=agent,
+        model=meter_model or "",
+        reason=f"Pre-call estimate for {context}",
+    )
+    sink = {
+        "cost_usd": 0.0,
+        "artifacts": [],
+        "usage_records": [],
+        "context": context,
+    }
 
     def work():
         main.set_execution_sink(sink)
@@ -671,12 +729,58 @@ async def _run_metered(fn, *args):
         finally:
             main.set_execution_sink(None)
 
-    answer = await asyncio.to_thread(work)
+    result = None
+    receipt = None
+    worker_task = asyncio.create_task(asyncio.to_thread(work))
     try:
-        await asyncio.to_thread(company_mode.record_adhoc_spend, sink["cost_usd"], sink["artifacts"])
-    except Exception as e:
-        main.logger.error(f"Failed to record ad-hoc spend: {e}")
-    return answer
+        # A Python worker thread cannot be force-cancelled safely. Shield it so a
+        # task cancellation waits for the paid call to finish before reconciling
+        # usage; otherwise the reservation could be released while spend continues.
+        result = await asyncio.shield(worker_task)
+    except asyncio.CancelledError:
+        try:
+            await worker_task
+        except Exception as exc:
+            main.logger.error(f"Metered work failed while cancellation was pending: {exc}")
+        raise
+    finally:
+        try:
+            reconciled_actual = sink["cost_usd"] if sink["usage_records"] else None
+            receipt = await asyncio.to_thread(
+                company_mode.reconcile_budget,
+                reservation["id"],
+                reconciled_actual,
+                company_mode.COMPANY_STATE_FILE,
+                usage_records=sink["usage_records"],
+                estimated=not bool(sink["usage_records"]),
+                context=context,
+                project_id=project_id,
+                task_id=task_id,
+                agent=agent,
+                model=meter_model or "",
+                reason=f"Measured usage for {context}",
+            )
+            if sink["artifacts"]:
+                await asyncio.to_thread(
+                    company_mode.record_adhoc_spend,
+                    0.0,
+                    sink["artifacts"],
+                    company_mode.COMPANY_STATE_FILE,
+                    context=context,
+                    project_id=project_id,
+                    task_id=task_id,
+                    agent=agent,
+                    model=meter_model or "",
+                    reason=f"Artifacts from {context}",
+                )
+        except Exception as e:
+            main.logger.error(f"Failed to reconcile metered spend: {e}")
+    if return_receipt:
+        receipt = dict(receipt or {})
+        receipt["artifacts"] = list(sink["artifacts"])
+        receipt["usage_records"] = list(sink["usage_records"])
+        return result, receipt
+    return result
 
 
 def _cancel_running_plan():
@@ -794,7 +898,13 @@ async def assign_from_linear(update, identifier):
         tasks = list(plan)
     else:
         try:
-            responders = await asyncio.to_thread(main.select_group_responders, f"{title}\n\n{description}")
+            responders = await _run_metered(
+                main.select_group_responders,
+                f"{title}\n\n{description}",
+                context=f"Linear fallback routing for {ident}",
+                agent="manager",
+                meter_model=main.FAST_MODEL,
+            )
         except Exception:
             responders = ["code"]
         owner = next((r for r in responders if r in main.SPECIALISTS), "code")
@@ -855,18 +965,16 @@ def _defer_remaining(project_id):
 
 
 def _complete_project(project_id):
-    state = company_mode.load_state()
-    for project in state["projects"]:
-        if project["id"] == project_id:
-            project["status"] = "completed"
-    company_mode.save_state(state)
+    return company_mode.complete_project(project_id, company_mode.COMPANY_STATE_FILE)
 
 
 async def _escalate_for_review(project, project_id, verdict, rounds, note=""):
     """Stop production on a project the team can't finish alone and hand it to the user.
     Marks it 'blocked' (not complete), escalates the source Linear issue (not Done), and
     posts the editor's requirements to the group so the user knows exactly what's needed."""
-    await asyncio.to_thread(company_mode.block_project, project_id)
+    await asyncio.to_thread(
+        company_mode.block_project, project_id, company_mode.COMPANY_STATE_FILE
+    )
     await asyncio.to_thread(company_linear.finalize_source_issue, project_id)
     state = await asyncio.to_thread(company_mode.load_state)
     blocked = next((p for p in state["projects"] if p["id"] == project_id), project)
@@ -895,12 +1003,348 @@ async def _escalate_for_review(project, project_id, verdict, rounds, note=""):
     await post_to_group(message, "manager")
 
 
+def _decision_value(decision, name, default=None):
+    if isinstance(decision, dict):
+        return decision.get(name, default)
+    return getattr(decision, name, default)
+
+
+def _company_budget_snapshot():
+    """Return Company Mode's ledger as the autonomous budget source of truth."""
+    state = company_mode.load_state()
+    company = state["company"]
+    today = company.get("budget_date")
+    estimated = any(
+        entry.get("budget_date") == today and entry.get("cost_basis") == "estimated"
+        for entry in state.get("cost_entries", [])
+    )
+    return {
+        "budget_date": company.get("budget_date"),
+        "budget_timezone": company_mode.budget_timezone_name(),
+        "daily_budget_usd": company["daily_budget_usd"],
+        "emergency_reserve_usd": company.get("emergency_reserve_usd", 0.0),
+        "spent_today_usd": company.get("spent_today_usd", 0.0),
+        "reserved_today_usd": company.get("reserved_today_usd", 0.0),
+        "remaining_usd": company_mode.remaining_budget(state),
+        "cost_is_estimated": estimated,
+    }
+
+
+def _company_task_route(task, *, previous_failures=0, previous_models=(), remaining_usd=None):
+    owner = str(task.get("owner") or "manager")
+    task_types = {
+        "code": "coding",
+        "research": "research",
+        "write": "documentation",
+        "editor": "review",
+        "marketing": "documentation",
+        "finance": "status_update",
+        "analytics": "status_update",
+        "task": "planning",
+        "manager": "planning",
+    }
+    required = list(task.get("required_capabilities", []) or [])
+    if owner == "editor" and "review" not in required:
+        required.append("review")
+    state = company_mode.load_state()
+    envelope = (
+        float(task.get("reserved_usd", task.get("estimate_usd", 0.0)) or 0.0)
+        + company_mode.remaining_budget(state)
+        if remaining_usd is None
+        else max(0.0, float(remaining_usd))
+    )
+    return AUTONOMY_ROUTER.route(model_router.RoutingRequest(
+        task_type=str(task.get("task_type") or task_types.get(owner, "planning")),
+        complexity=str(task.get("complexity") or "standard"),
+        risk=str(task.get("risk") or "low"),
+        required_capabilities=tuple(required),
+        estimated_input_tokens=int(task.get("estimated_input_tokens", 3000) or 3000),
+        estimated_output_tokens=int(task.get("estimated_output_tokens", 800) or 800),
+        remaining_budget_usd=envelope,
+        previous_failures=max(0, int(previous_failures or 0)),
+        previous_models=tuple(previous_models or ()),
+    ))
+
+
+def _task_allowed_tools(task, owner):
+    if not task.get("enforce_authorization"):
+        return None
+    if owner and owner in main.SPECIALISTS:
+        profile_names = main.SPECIALISTS[owner]["tool_names"]
+    else:
+        profile_names = [tool.get("name") for tool in main.TOOLS if tool.get("name")]
+    return autonomy_team.allowed_tool_names(profile_names, task.get("authorization_level"))
+
+
+def _answer_failure_classification(answer):
+    """Recognize only explicit provider/tool failures, not ordinary critical prose."""
+    text = str(answer or "").strip()
+    lowered = text.lower()
+    if lowered.startswith("blocked - needs human"):
+        return "decision"
+    hard_prefixes = (
+        "sorry, something went wrong",
+        "sorry, i couldn't",
+        "tool error:",
+        "openai_api_key is not set",
+        "missing required environment variable",
+    )
+    if lowered.startswith(hard_prefixes):
+        return company_mode.classify_failure(text)
+    if "isn't configured yet" in lowered or "is not configured" in lowered:
+        return "missing_access"
+    return None
+
+
+def _failure_action(classification):
+    actions = {
+        "missing_access": "Provide the named credential or access, then retry this task.",
+        "missing_information": "Provide the missing information or clarify the acceptance criteria.",
+        "unavailable_tool": "Configure the required integration/tool or approve a smaller scope.",
+        "permission": "Grant only the required permission or choose a lower-impact alternative.",
+        "budget": "Increase today's budget or defer the task to another day.",
+        "decision": "Approve, reject, or provide the owner decision described above.",
+        "no_progress": "Review the attempts and decide whether to rescope, accept, or stop.",
+    }
+    return actions.get(classification, "Inspect the run report, correct the failure, then retry.")
+
+
+def _sink_spend_for_reconciliation(sink):
+    """Use measured spend only when provider usage exists.
+
+    Some API responses omit usage.  In that case ``None`` tells Company Mode to
+    reconcile the conservative held estimate and label it estimated instead of
+    incorrectly reopening the budget as a zero-cost call.
+    """
+    return sink["cost_usd"] if sink.get("usage_records") else None
+
+
+async def _execute_routed_task(project, task, owner, prompt, sink):
+    allowed_tools = _task_allowed_tools(task, owner)
+    speaker_owner = owner or ("general" if task.get("owner") == "general" else "manager")
+    model = str(task.get("model") or "").strip()
+    model_reason = str(task.get("model_reason") or "").strip()
+    if not model:
+        decision = await asyncio.to_thread(_company_task_route, task)
+        if _decision_value(decision, "deferred", False):
+            reason = str(
+                _decision_value(decision, "deferral_reason")
+                or _decision_value(decision, "reason")
+            )
+            classification = "budget" if "budget" in reason else "no_progress"
+            await asyncio.to_thread(
+                company_mode.update_task_status,
+                task["id"], "needs_human", reason, [], 0.0,
+                company_mode.COMPANY_STATE_FILE,
+                failure_classification=classification,
+            )
+            await post_to_group(f"Task {task['id']} deferred: {reason}", "manager")
+            return "blocked"
+        model = str(
+            _decision_value(decision, "model_id") or _decision_value(decision, "model")
+        )
+        model_reason = str(
+            _decision_value(decision, "reason", "Routed for this Company Mode task.")
+        )
+
+    max_attempts = company_mode.MAX_EXECUTION_ATTEMPTS
+    attempts_already = int(task.get("execution_attempts", 0) or 0)
+    attempts_remaining = max(0, max_attempts - attempts_already)
+    previous_models = [
+        str(value.get("model"))
+        for value in task.get("attempt_history", [])
+        if isinstance(value, dict) and value.get("model")
+    ]
+    if attempts_remaining == 0:
+        reason = f"Execution attempt cap ({max_attempts}) was already reached."
+        await asyncio.to_thread(
+            company_mode.update_task_status,
+            task["id"], "needs_human", reason, [], 0.0,
+            company_mode.COMPANY_STATE_FILE,
+            failure_classification="no_progress",
+            model=model,
+            model_reason=model_reason,
+        )
+        return "blocked"
+
+    try:
+        timeout_seconds = max(
+            0.01, float(os.environ.get("AUTONOMY_TASK_TIMEOUT_SECONDS", "900"))
+        )
+    except (TypeError, ValueError):
+        timeout_seconds = 900.0
+    answer = ""
+    failure = None
+    _office_call("set_agent_status", "manager", "delegated", f"Assigned {task['owner']} a company task.")
+    _office_call("set_agent_status", speaker_owner, "thinking", task["title"])
+    _office_call("add_event", "delegated", "manager", f"Started company task: {task['owner']} - {task['title']}")
+    await post_to_group(f"Starting: {task['owner']} - {task['title']} [{model}]", "manager")
+
+    for attempt_index in range(attempts_remaining):
+        time_limit_exceeded = False
+        await asyncio.to_thread(
+            company_mode.update_task_status,
+            task["id"], "in_progress",
+            path=company_mode.COMPANY_STATE_FILE,
+            model=model,
+            model_reason=model_reason,
+        )
+
+        def work():
+            main.set_conversation("group")
+            main.set_reply_context({"kind": "group"})
+            main.set_execution_sink(sink)
+            main.set_company_execution(not bool(task.get("enforce_authorization")))
+            try:
+                if owner:
+                    return main.ask_specialist(
+                        owner, prompt, record_history=False, model=model,
+                        allowed_tool_names=allowed_tools,
+                        include_memories=not bool(task.get("enforce_authorization")),
+                    )
+                return main.ask_ai(
+                    prompt, record_history=False, model=model,
+                    allowed_tool_names=allowed_tools,
+                    include_memories=not bool(task.get("enforce_authorization")),
+                )
+            finally:
+                main.set_company_execution(False)
+                main.set_execution_sink(None)
+
+        try:
+            async with locks["manager"]:
+                started = time.monotonic()
+                worker_future = asyncio.create_task(asyncio.to_thread(work))
+                try:
+                    answer = await asyncio.shield(worker_future)
+                except asyncio.CancelledError:
+                    # A Python thread cannot be killed safely. Wait for it to finish so
+                    # no model/tool work escapes the run ledger, then propagate cancel.
+                    await worker_future
+                    raise
+                elapsed = time.monotonic() - started
+            answer = str(autonomous_workflow.redact_secrets(str(answer or ""))).strip()
+            failure = _answer_failure_classification(answer)
+            if elapsed > timeout_seconds and not failure:
+                time_limit_exceeded = True
+                failure = "transient"
+                answer = (
+                    f"Task finished after {elapsed:.1f}s, beyond its {timeout_seconds:.1f}s "
+                    "execution limit; no retry was started."
+                )
+        except Exception as exc:
+            main.logger.error(f"Company task {task['id']} errored: {exc}")
+            failure = company_mode.classify_failure(exc)
+            answer = str(autonomous_workflow.redact_secrets(str(exc))) or "Unexpected execution error."
+
+        if not failure:
+            break
+
+        previous_models.append(model)
+        can_retry = (
+            failure in {"technical", "transient"}
+            and not time_limit_exceeded
+            and attempt_index + 1 < attempts_remaining
+        )
+        if can_retry:
+            remaining_reservation = max(
+                0.0,
+                float(task.get("estimate_usd", 0.0) or 0.0) - float(sink["cost_usd"]),
+            )
+            next_decision = await asyncio.to_thread(
+                _company_task_route,
+                task,
+                previous_failures=len(previous_models),
+                previous_models=tuple(previous_models),
+                remaining_usd=remaining_reservation,
+            )
+            if not _decision_value(next_decision, "deferred", False):
+                model = str(
+                    _decision_value(next_decision, "model_id")
+                    or _decision_value(next_decision, "model")
+                )
+                model_reason = str(_decision_value(next_decision, "reason"))
+                await post_to_group(
+                    f"Retrying {task['id']} with {model}: the prior {failure} attempt failed.",
+                    "manager",
+                )
+                continue
+            route_reason = str(
+                _decision_value(next_decision, "deferral_reason")
+                or _decision_value(next_decision, "reason")
+            )
+            failure = "budget" if "budget" in route_reason else "no_progress"
+            answer = f"{answer} Stronger-model retry stopped: {route_reason}"
+        break
+
+    if failure:
+        _office_call(
+            "set_agent_status", speaker_owner, "error",
+            "Company task stopped and needs owner attention.", OFFICE_ERROR_SECONDS,
+        )
+        await asyncio.to_thread(
+            company_mode.update_task_status,
+            task["id"], "needs_human", str(answer)[:1500], sink["artifacts"],
+            _sink_spend_for_reconciliation(sink), company_mode.COMPANY_STATE_FILE,
+            usage_records=sink["usage_records"],
+            failure_classification=failure,
+            model=model,
+            model_reason=model_reason,
+        )
+        escalation = autonomous_workflow.format_escalation(
+            project,
+            task,
+            f"Ran {len(previous_models) or 1} bounded execution attempt(s).",
+            str(answer)[:1000],
+            autonomy_team.workflow_failure(failure),
+            _failure_action(failure),
+            True,
+        )
+        await post_to_group(escalation, "manager")
+        return "blocked"
+
+    _office_call("set_agent_status", speaker_owner, "speaking", answer, OFFICE_REPLY_SECONDS)
+    _office_call("add_event", "reply", speaker_owner, answer)
+    await post_agent_answer_to_group(speaker_owner, answer)
+
+    staged = main.pending_actions.get("group")
+    if staged is not None:
+        reason = f"Needs your approval: {main.describe_pending_action(staged)}. Reply /confirm to proceed."
+        await asyncio.to_thread(
+            company_mode.update_task_status,
+            task["id"], "needs_human", reason, sink["artifacts"],
+            _sink_spend_for_reconciliation(sink),
+            company_mode.COMPANY_STATE_FILE,
+            usage_records=sink["usage_records"],
+            failure_classification="decision",
+            model=model,
+            model_reason=model_reason,
+        )
+        await post_to_group(reason, "manager")
+        return "blocked"
+
+    await asyncio.to_thread(
+        company_mode.update_task_status,
+        task["id"], "done", answer[:company_mode.MAX_TASK_RESULT_CHARS], sink["artifacts"],
+        _sink_spend_for_reconciliation(sink),
+        company_mode.COMPANY_STATE_FILE,
+        usage_records=sink["usage_records"],
+        model=model,
+        model_reason=model_reason,
+        feedback=answer if owner == "editor" else None,
+    )
+    if owner == "editor":
+        await asyncio.to_thread(company_mode.set_project_revision_flag, project["id"], answer)
+    state = await asyncio.to_thread(company_mode.load_state)
+    await post_to_group(company_mode.render_money(state), "manager")
+    return "done"
+
+
 async def _run_one_task(project, task):
-    """Execute a single task through its owner agent under company-execution rules.
-    Returns "done" or "blocked" (a gated action needs the user's /confirm)."""
+    """Execute one task with a routed model, bounded retries, and hard tool scope."""
     owner = task["owner"] if task["owner"] in main.SPECIALISTS else None
     context = f"Project {project['id']} / task {task['id']}"
-    sink = {"cost_usd": 0.0, "artifacts": [], "context": context}
+    sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": context}
 
     # Feed earlier tasks' summaries AND the current deliverable's real content into this
     # task's prompt so the agent builds on the actual file (even one a teammate saved to
@@ -913,70 +1357,7 @@ async def _run_one_task(project, task):
     prompt = company_mode.build_task_prompt(
         project, task, prior_work, deliverable_name, deliverable_content
     )
-
-    await asyncio.to_thread(company_mode.update_task_status, task["id"], "in_progress")
-    _office_call("set_agent_status", "manager", "delegated", f"Assigned {task['owner']} a company task.")
-    _office_call("set_agent_status", owner or "general", "thinking", task["title"])
-    _office_call("add_event", "delegated", "manager", f"Started company task: {task['owner']} — {task['title']}")
-    await post_to_group(f"Starting: {task['owner']} - {task['title']}", "manager")
-
-    def work():
-        main.set_conversation("group")
-        main.set_reply_context({"kind": "group"})
-        main.set_execution_sink(sink)
-        main.set_company_execution(True)
-        try:
-            if owner:
-                return main.ask_specialist(owner, prompt, record_history=False)
-            return main.ask_ai(prompt, record_history=False)
-        finally:
-            main.set_company_execution(False)
-            main.set_execution_sink(None)
-
-    async with locks["manager"]:
-        try:
-            answer = await asyncio.to_thread(work)
-        except Exception as e:
-            main.logger.error(f"Company task {task['id']} errored: {e}")
-            _office_call(
-                "set_agent_status", owner or "general", "error", "Company task was parked after an error.", OFFICE_ERROR_SECONDS
-            )
-            _office_call("add_event", "error", owner or "general", f"Company task {task['id']} was parked.")
-            await asyncio.to_thread(
-                company_mode.mark_task_blocked, task["id"],
-                "Errored while running - see logs.", sink["cost_usd"], sink["artifacts"],
-            )
-            await post_to_group(f"Task {task['id']} hit an error and was parked.", "manager")
-            return "blocked"
-
-    _office_call("set_agent_status", owner or "general", "speaking", answer, OFFICE_REPLY_SECONDS)
-    _office_call("add_event", "reply", owner or "general", answer)
-    await post_agent_answer_to_group(owner or "manager", answer)
-
-    spent = sink["cost_usd"]
-    artifacts = sink["artifacts"]
-
-    # A gated action (send email / delete) staged during the run means the task needs
-    # your approval. It's keyed to the "group" conversation; leave it staged so
-    # /confirm resolves it, mark the task blocked, and stop so the next task can't
-    # overwrite the pending action.
-    staged = main.pending_actions.get("group")
-    if staged is not None:
-        reason = f"Needs your approval: {main.describe_pending_action(staged)}. Reply /confirm to proceed."
-        await asyncio.to_thread(
-            company_mode.mark_task_blocked, task["id"], reason, spent, artifacts
-        )
-        await post_to_group(reason, "manager")
-        return "blocked"
-
-    await asyncio.to_thread(
-        company_mode.update_task_status, task["id"], "done", answer[:1000], artifacts, spent
-    )
-    if owner == "editor":
-        await asyncio.to_thread(company_mode.set_project_revision_flag, project["id"], answer)
-    state = await asyncio.to_thread(company_mode.load_state)
-    await post_to_group(company_mode.render_money(state), "manager")
-    return "done"
+    return await _execute_routed_task(project, task, owner, prompt, sink)
 
 
 async def run_company_plan(project_id):
@@ -996,10 +1377,23 @@ async def run_company_plan(project_id):
                 )
                 return
 
-            if company_mode.remaining_budget(state) <= 0:
+            company = state["company"]
+            ordinary_limit = max(
+                0.0,
+                float(company["daily_budget_usd"])
+                - float(company.get("emergency_reserve_usd", 0.0)),
+            )
+            committed = (
+                float(company.get("spent_today_usd", 0.0))
+                + float(company.get("reserved_today_usd", 0.0))
+            )
+            # A task's existing reservation may consume the last available cent; that
+            # is safe to execute because reconciliation replaces the hold. Stop only
+            # when measured spend has pushed total commitments above the ordinary cap.
+            if committed > ordinary_limit + 0.000001:
                 await asyncio.to_thread(_defer_remaining, project_id)
                 await post_to_group(
-                    f"Daily budget exhausted - stopping. {company_mode.render_money(state)}. "
+                    f"Daily budget overcommitted - stopping. {company_mode.render_money(state)}. "
                     "Raise /setbudget and /approve to continue.",
                     "manager",
                 )
@@ -1042,13 +1436,427 @@ async def run_company_plan(project_id):
 
             outcome = await _run_one_task(project, task)
             if outcome == "blocked":
-                return  # wait for the user to resolve, then re-/approve
+                # Close the project and release every later task reservation. Leaving
+                # an active project here would block unrelated roadmap work forever.
+                await asyncio.to_thread(
+                    company_mode.block_project, project_id, company_mode.COMPANY_STATE_FILE
+                )
+                return
 
     except asyncio.CancelledError:
+        await asyncio.to_thread(
+            company_mode.block_project,
+            project_id,
+            company_mode.COMPANY_STATE_FILE,
+            reason="The Company plan runner was cancelled before completion.",
+            failure_classification="technical",
+        )
         raise
     except Exception as e:
         main.logger.error(f"Company plan runner crashed: {e}")
+        await asyncio.to_thread(
+            company_mode.block_project,
+            project_id,
+            company_mode.COMPANY_STATE_FILE,
+            reason=f"The Company plan runner stopped unexpectedly: {e}",
+            failure_classification="technical",
+        )
         await post_to_group("The work plan hit an unexpected error and stopped. Check the logs.", "manager")
+
+
+# --------------------------------------------------------------------------- #
+# Autonomous daily-run bridge. The control plane stays synchronous and offline-
+# testable; these callbacks hand paid/external-capable work back to this event loop,
+# where the existing Company Mode engine and Telegram transport already live.
+# --------------------------------------------------------------------------- #
+
+def _autonomy_goal(item):
+    lines = [str(item.get("title") or item.get("id") or "Complete roadmap item")]
+    description = str(item.get("description") or "").strip()
+    if description:
+        lines.append(description)
+    criteria = [str(value).strip() for value in item.get("acceptance_criteria", []) if str(value).strip()]
+    if criteria:
+        lines.append("Acceptance criteria:\n" + "\n".join(f"- {value}" for value in criteria))
+    lines.append(
+        "Allowlisted runtime autonomy configuration:\n"
+        f"- schedule: {AUTONOMY_CONFIG.schedule_days} at {AUTONOMY_CONFIG.schedule_time}\n"
+        f"- timezone: {AUTONOMY_CONFIG.timezone}\n"
+        f"- configured dry_run: {AUTONOMY_CONFIG.dry_run}\n"
+        f"- authorization ceiling: {AUTONOMY_CONFIG.max_authorization.value}\n"
+        "Do not infer or disclose any unlisted environment value."
+    )
+    return "\n\n".join(lines)
+
+
+async def _autonomy_runtime_deferral():
+    """Return a no-spend deferral while supervised owner state has precedence."""
+    if company_runner_task and not company_runner_task.done():
+        return {
+            "status": "deferred",
+            "failure_classification": "decision_required",
+            "reason": "A supervised Company Mode plan is already running.",
+            "actual_cost_usd": 0.0,
+            "model_invoked": False,
+        }
+    if main.pending_actions.get("group") is not None:
+        return {
+            "status": "deferred",
+            "failure_classification": "decision_required",
+            "reason": "A Telegram confirmation is already waiting for the owner.",
+            "actual_cost_usd": 0.0,
+            "model_invoked": False,
+        }
+    state = await asyncio.to_thread(company_mode.load_state)
+    if state["company"]["mode"] == "paused":
+        return {
+            "status": "deferred",
+            "failure_classification": "decision_required",
+            "reason": "Company Mode is paused; use /resumecompany before a live autonomous run.",
+            "actual_cost_usd": 0.0,
+            "model_invoked": False,
+        }
+    open_projects = company_mode.open_projects(state)
+    if open_projects:
+        current = open_projects[0]
+        return {
+            "status": "deferred",
+            "failure_classification": "decision_required",
+            "reason": f"Company project {current['id']} is still {current['status']}.",
+            "actual_cost_usd": 0.0,
+            "model_invoked": False,
+        }
+    return None
+
+
+async def _execute_autonomy_item(project, item, decision, run_id):
+    """Create and run one review-gated Company Mode project for a roadmap item."""
+    authorization = autonomy_team.normalize_authorization(item.get("authorization_level"))
+    if authorization in {"modify_local", "external_action"}:
+        label = "External actions" if authorization == "external_action" else "Local modification"
+        return {
+            "status": "needs_human",
+            "failure_classification": "decision_required",
+            "reason": (
+                f"{label} requires an isolated executor or explicit owner approval and is not "
+                "auto-executed by this vertical slice."
+            ),
+            "human_action": "Approve and supervise the action, or lower the item to observe/propose, then mark it ready.",
+            "attempted": "Checked the roadmap authorization level; no model or tool was invoked.",
+            "actual_cost_usd": 0.0,
+            "model_invoked": False,
+        }
+    runtime_deferral = await _autonomy_runtime_deferral()
+    if runtime_deferral:
+        return runtime_deferral
+
+    budget = _company_budget_snapshot()
+    plan = autonomy_team.build_company_plan(
+        item,
+        decision,
+        budget["remaining_usd"],
+        router=AUTONOMY_ROUTER,
+    )
+    if plan["deferred"]:
+        deferral_codes = {
+            str(value.get("deferral_reason") or "")
+            for value in plan.get("decisions", [])
+            if isinstance(value, dict) and value.get("deferred")
+        }
+        if plan.get("deferral_reason"):
+            deferral_codes.add(str(plan["deferral_reason"]))
+        budget_only = bool(deferral_codes) and deferral_codes <= {"insufficient_budget"}
+        return {
+            "status": "deferred" if budget_only else "needs_human",
+            "failure_classification": "budget_exhausted" if budget_only else "unavailable_tool",
+            "reason": plan["reason"],
+            "human_action": (
+                "Increase today's budget or wait for the next budget day."
+                if budget_only
+                else "Review the model catalog and required review capabilities, then retry."
+            ),
+            "actual_cost_usd": 0.0,
+            "model_invoked": False,
+        }
+
+    project_key = str(project.get("project_key") or project.get("id") or "").strip()
+    profile, project_error, project_tokens = main.projects.begin_scoped_project(project_key)
+    if project_error:
+        return {
+            "status": "needs_human",
+            "failure_classification": "decision_required",
+            "reason": project_error,
+            "human_action": f"Add project key {project_key!r} to projects.json with its repo, then retry.",
+            "attempted": "Tried to snapshot and activate the selected roadmap project's repository.",
+            "actual_cost_usd": 0.0,
+            "model_invoked": False,
+        }
+
+    suppression_token = _suppress_company_updates.set(True)
+    company_project_id = None
+    try:
+        assignment = await asyncio.to_thread(
+            company_mode.assign_goal,
+            _autonomy_goal(item),
+            BOT_KEYS,
+            list(main.SPECIALISTS.keys()),
+            company_mode.COMPANY_STATE_FILE,
+            plan["tasks"],
+            {
+                "source": "autonomous_daily_run",
+                "project_key": project_key,
+                "roadmap_project_id": project.get("id"),
+                "roadmap_item_id": item.get("id"),
+                "autonomous_run_id": run_id,
+                "authorization_level": item.get("authorization_level"),
+                "acceptance_criteria": list(item.get("acceptance_criteria", []) or []),
+            },
+        )
+        if assignment.startswith(("Blocked:", "Company Mode is paused", "Usage:")):
+            classification = "budget_exhausted" if "budget" in assignment.lower() else "decision_required"
+            return {
+                "status": "deferred",
+                "failure_classification": classification,
+                "reason": assignment,
+                "actual_cost_usd": 0.0,
+                "model_invoked": False,
+            }
+
+        assigned_state = await asyncio.to_thread(company_mode.load_state)
+        company_project = company_mode.active_project(assigned_state)
+        if not company_project or company_project.get("autonomous_run_id") != run_id:
+            raise RuntimeError("Autonomous assignment did not create the expected persisted project")
+        company_project_id = company_project["id"]
+        _message, approved_project_id = await asyncio.to_thread(
+            company_mode.approve_project,
+            company_mode.COMPANY_STATE_FILE,
+            notify_hooks=False,
+        )
+        if not approved_project_id:
+            raise RuntimeError("Autonomous Company Mode project could not be activated")
+        company_project_id = approved_project_id
+
+        await run_company_plan(company_project_id)
+        final_state = await asyncio.to_thread(company_mode.load_state)
+        return autonomy_team.aggregate_company_result(
+            final_state,
+            company_project_id,
+            fallback_model=_decision_value(decision, "model_id") or _decision_value(decision, "model"),
+        )
+    except asyncio.CancelledError:
+        if company_project_id:
+            await asyncio.to_thread(
+                company_mode.block_project,
+                company_project_id,
+                company_mode.COMPANY_STATE_FILE,
+                reason="The autonomous run was cancelled before completion.",
+                failure_classification="technical",
+            )
+        raise
+    except Exception:
+        if company_project_id:
+            await asyncio.to_thread(
+                company_mode.block_project,
+                company_project_id,
+                company_mode.COMPANY_STATE_FILE,
+                reason="The autonomous run failed before it could persist a final outcome.",
+                failure_classification="technical",
+            )
+        raise
+    finally:
+        _suppress_company_updates.reset(suppression_token)
+        main.projects.end_scoped_project(project_tokens)
+
+
+def _autonomy_executor_callback(project, item, decision, run_id):
+    if main_loop is None:
+        raise RuntimeError("Telegram event loop is unavailable for autonomous execution")
+    future = asyncio.run_coroutine_threadsafe(
+        _execute_autonomy_item(project, item, decision, run_id), main_loop
+    )
+    return future.result()
+
+
+async def _generate_autonomy_ideas(state, limit):
+    runtime_deferral = await _autonomy_runtime_deferral()
+    if runtime_deferral:
+        return {
+            "ideas": [],
+            "model": None,
+            "model_reason": "Creative routing was skipped because supervised owner state has priority.",
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "deferred": True,
+            "deferral_reason": runtime_deferral["reason"],
+        }
+    budget = _company_budget_snapshot()
+    decision = AUTONOMY_ROUTER.route(model_router.RoutingRequest(
+        task_type="creative_ideation",
+        complexity="standard",
+        risk="low",
+        required_capabilities=("text", "ideation"),
+        estimated_input_tokens=2000,
+        estimated_output_tokens=700,
+        remaining_budget_usd=budget["remaining_usd"],
+    ))
+    if decision.deferred or not decision.model_id:
+        return {
+            "ideas": [],
+            "model": decision.model_id,
+            "model_reason": decision.reason,
+            "estimated_cost_usd": decision.estimated_cost_usd,
+            "deferred": True,
+            "deferral_reason": decision.deferral_reason or "Creative work exceeds the ordinary remaining budget.",
+        }
+    try:
+        ideas, receipt = await _run_metered(
+            main.generate_controlled_ideas,
+            autonomy_team.idea_project_context(state),
+            limit,
+            decision.model_id,
+            estimate_usd=autonomy_team.reservation_estimate(decision),
+            context="controlled idle ideation",
+            agent="creative",
+            meter_model=decision.model_id,
+            project_id="idea_backlog",
+            task_id="controlled-idle-ideation",
+            return_receipt=True,
+        )
+        receipt = receipt or {}
+        return {
+            "ideas": ideas,
+            "model": decision.model_id,
+            "model_reason": decision.reason,
+            "estimated_cost_usd": autonomy_team.reservation_estimate(decision),
+            "actual_cost_usd": receipt.get("amount_usd", autonomy_team.reservation_estimate(decision)),
+            "cost_is_estimated": receipt.get("cost_basis") != "actual",
+            "token_usage": {
+                "input_tokens": receipt.get("input_tokens", 0),
+                "output_tokens": receipt.get("output_tokens", 0),
+                "total_tokens": receipt.get("total_tokens", 0),
+            },
+            "agent": "creative",
+            "project_id": "idea_backlog",
+            "task_id": "controlled-idle-ideation",
+        }
+    except company_mode.BudgetExceededError:
+        return {
+            "ideas": [],
+            "model": decision.model_id,
+            "model_reason": decision.reason,
+            "estimated_cost_usd": autonomy_team.reservation_estimate(decision),
+            "deferred": True,
+            "deferral_reason": "Creative work could not reserve the required ordinary budget.",
+        }
+
+
+def _autonomy_idea_callback(state, limit):
+    if main_loop is None:
+        raise RuntimeError("Telegram event loop is unavailable for controlled ideation")
+    future = asyncio.run_coroutine_threadsafe(_generate_autonomy_ideas(state, limit), main_loop)
+    return future.result()
+
+
+def _get_autonomy_workflow():
+    global _autonomy_workflow_instance
+    if _autonomy_workflow_instance is None:
+        _autonomy_workflow_instance = autonomous_workflow.AutonomousWorkflow(
+            AUTONOMY_CONFIG,
+            executor=_autonomy_executor_callback,
+            idea_generator=_autonomy_idea_callback,
+            budget_provider=_company_budget_snapshot,
+            router=AUTONOMY_ROUTER,
+        )
+    return _autonomy_workflow_instance
+
+
+async def _run_autonomy_cycle(trigger_source, *, dry_run=None):
+    workflow = _get_autonomy_workflow()
+    return await asyncio.to_thread(
+        workflow.run,
+        trigger_source=trigger_source,
+        dry_run=dry_run,
+    )
+
+
+async def _run_and_post_autonomy(trigger_source, *, dry_run=None):
+    global autonomy_runner_task
+    current = asyncio.current_task()
+    autonomy_runner_task = current
+    try:
+        report = await _run_autonomy_cycle(trigger_source, dry_run=dry_run)
+        # A configured dry run performs no outbound action. A user-invoked dry run
+        # is returned directly by its command handler instead of coming through here.
+        if not report.get("dry_run"):
+            for escalation in report.get("escalations", []) or []:
+                await post_to_group(str(escalation), "manager")
+            await post_to_group(report["telegram_summary"], "manager")
+        else:
+            main.logger.info(f"Autonomy dry run completed: {report.get('report_path')}")
+        return report
+    finally:
+        if autonomy_runner_task is current:
+            autonomy_runner_task = None
+
+
+async def post_autonomous_daily():
+    await _run_and_post_autonomy("scheduled", dry_run=None)
+
+
+def _autonomy_status_text():
+    workflow = _get_autonomy_workflow()
+    state = workflow.load_state()
+    recent = state.get("run_control", {}).get("recent_runs", [])
+    last = recent[-1] if recent else None
+    budget = _company_budget_snapshot()
+    next_item = workflow.select_actionable_item(state)
+    lines = [
+        "Autonomous Team",
+        f"Scheduler: {'enabled' if AUTONOMY_CONFIG.enabled else 'disabled'}; "
+        f"{AUTONOMY_CONFIG.schedule_days} at {AUTONOMY_CONFIG.schedule_time} ({AUTONOMY_CONFIG.timezone})",
+        f"Mode: {'dry-run' if AUTONOMY_CONFIG.dry_run else 'live'}; authorization ceiling {AUTONOMY_CONFIG.max_authorization.value}",
+        f"Budget: ${budget['spent_today_usd']:.4f} spent, ${budget['reserved_today_usd']:.4f} reserved, "
+        f"${budget['remaining_usd']:.4f} ordinary remaining of ${budget['daily_budget_usd']:.2f}",
+        f"Next actionable item: {next_item.get('id')} - {next_item.get('title')}" if next_item else "Next actionable item: none",
+        (
+            f"Last run: {last.get('run_id')} - {last.get('final_status')} ({last.get('finished_at')})"
+            if last else "Last run: none"
+        ),
+    ]
+    return autonomous_workflow.redact_secrets("\n".join(lines))
+
+
+async def handle_autorun_command(update, text, *, allow_live=True):
+    """Handle safe status/dry-run commands and explicitly gated live execution."""
+    global autonomy_runner_task
+    argument = re.sub(r"^/autorun(?:@[A-Za-z0-9_]+)?", "", str(text or "").strip(), flags=re.I).strip().lower()
+    if argument in {"", "dry", "dry-run", "plan"}:
+        if autonomy_runner_task and not autonomy_runner_task.done():
+            await update.message.reply_text("An autonomous run is already active; this trigger was not started.")
+            return
+        report = await _run_autonomy_cycle("telegram", dry_run=True)
+        await reply_chunks(update.message, report["telegram_summary"] + f"\nReport: {report['report_path']}")
+        return
+    if argument == "status":
+        await reply_chunks(update.message, await asyncio.to_thread(_autonomy_status_text))
+        return
+    if argument == "live":
+        if not allow_live:
+            await update.message.reply_text("Start live autonomous work from the group operating room, not a DM.")
+            return
+        if not AUTONOMY_CONFIG.enabled:
+            await update.message.reply_text("Live autonomy is disabled. Set AUTONOMY_ENABLED=true, restart, and run a dry-run first.")
+            return
+        if AUTONOMY_CONFIG.dry_run:
+            await update.message.reply_text("Live autonomy is still locked by AUTONOMY_DRY_RUN=true. Set it to false and restart only after reviewing a dry-run.")
+            return
+        if autonomy_runner_task and not autonomy_runner_task.done():
+            await update.message.reply_text("An autonomous run is already active; this trigger was not started.")
+            return
+        autonomy_runner_task = asyncio.create_task(_run_and_post_autonomy("telegram", dry_run=False))
+        await update.message.reply_text("Started one bounded autonomous run. Miles will post the final report or an exact owner action.")
+        return
+    await update.message.reply_text("Usage: /autorun dry-run | /autorun status | /autorun live")
 
 
 # --------------------------------------------------------------------------- #
@@ -1067,7 +1875,7 @@ GUMROAD_GO_LIVE_STEPS = (
     "3. Upload the *-product.md file as the content (export it to PDF first for a nicer buyer experience).\n"
     "4. Add a cover image (use the cover idea in the listing file).\n"
     "5. Set the permalink and hit Publish.\n"
-    "6. Paste the product link back here so we can track it (revenue tracking lands in v3)."
+    "6. Paste the product link back here, then use /link and /revenue to track it."
 )
 
 
@@ -1142,35 +1950,38 @@ async def run_publish(project, src_name, content):
     """Split the deliverable into a buyer-download file + a paste-ready Gumroad
     listing, then stage the gated publish approval."""
     slug = src_name.rsplit(".", 1)[0]
-    sink = {"cost_usd": 0.0, "artifacts": [], "context": f"Publish prep for {project['id']}"}
     prompt = _publish_prompt(slug, src_name, content)
+    write_model = main.SPECIALISTS.get("write", {}).get("model") or main.FAST_MODEL
 
     await post_to_group(f"Prepping the publish package for '{project['title']}'...", "manager")
 
     def work():
         main.set_conversation("group")
         main.set_reply_context({"kind": "group"})
-        main.set_execution_sink(sink)
         main.set_company_execution(True)
         try:
-            return main.ask_specialist("write", prompt, record_history=False)
+            return main.ask_specialist("write", prompt, record_history=False, model=write_model)
         finally:
             main.set_company_execution(False)
-            main.set_execution_sink(None)
 
     async with locks["manager"]:
         try:
-            answer = await asyncio.to_thread(work)
+            answer, receipt = await _run_metered(
+                work,
+                context=f"Publish prep for {project['id']}",
+                agent="write",
+                meter_model=write_model,
+                project_id=project["id"],
+                task_id="publish-prep",
+                return_receipt=True,
+            )
         except Exception as e:
             main.logger.error(f"Publish prep failed: {e}")
             await post_to_group("Publish prep hit an error - check the logs.", "manager")
             return
 
+    answer = str(autonomous_workflow.redact_secrets(str(answer or "")))
     await post_agent_answer_to_group("write", answer)
-    try:
-        await asyncio.to_thread(company_mode.record_adhoc_spend, sink["cost_usd"], sink["artifacts"])
-    except Exception as e:
-        main.logger.error(f"Failed to record publish spend: {e}")
 
     # Stage the gated publish approval in the group conversation.
     main.set_conversation("group")
@@ -1180,7 +1991,7 @@ async def run_publish(project, src_name, content):
         "title": project["title"],
         "company_context": f"Project {project['id']}",
     })
-    files = ", ".join(sink["artifacts"]) or "(no new files detected - check the message above)"
+    files = ", ".join(receipt.get("artifacts", [])) or "(no new files detected - check the message above)"
     await post_to_group(
         f"Publish package ready for '{project['title']}'.\nFiles: {files}\n\n"
         "Review them, then reply /confirm to approve publishing - I'll mark it published "
@@ -1237,37 +2048,40 @@ async def start_launch(update):
 
 async def run_launch(project, src_name, content):
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", (src_name or project["title"]).rsplit(".", 1)[0]).strip("-")
-    sink = {"cost_usd": 0.0, "artifacts": [], "context": f"Launch kit for {project['id']}"}
     prompt = _launch_prompt(slug, project["title"], content)
+    write_model = main.SPECIALISTS.get("write", {}).get("model") or main.FAST_MODEL
 
     await post_to_group(f"Drafting a launch kit for '{project['title']}'...", "manager")
 
     def work():
         main.set_conversation("group")
         main.set_reply_context({"kind": "group"})
-        main.set_execution_sink(sink)
         main.set_company_execution(True)
         try:
-            return main.ask_specialist("write", prompt, record_history=False)
+            return main.ask_specialist("write", prompt, record_history=False, model=write_model)
         finally:
             main.set_company_execution(False)
-            main.set_execution_sink(None)
 
     async with locks["manager"]:
         try:
-            answer = await asyncio.to_thread(work)
+            answer, receipt = await _run_metered(
+                work,
+                context=f"Launch kit for {project['id']}",
+                agent="write",
+                meter_model=write_model,
+                project_id=project["id"],
+                task_id="launch-kit",
+                return_receipt=True,
+            )
         except Exception as e:
             main.logger.error(f"Launch kit failed: {e}")
             await post_to_group("Launch kit drafting hit an error - check the logs.", "manager")
             return
 
+    answer = str(autonomous_workflow.redact_secrets(str(answer or "")))
     await post_agent_answer_to_group("write", answer)
-    try:
-        await asyncio.to_thread(company_mode.record_adhoc_spend, sink["cost_usd"], sink["artifacts"])
-    except Exception as e:
-        main.logger.error(f"Failed to record launch spend: {e}")
 
-    files = ", ".join(sink["artifacts"]) or "(see the message above)"
+    files = ", ".join(receipt.get("artifacts", [])) or "(see the message above)"
     await post_to_group(
         f"Launch kit ready for '{project['title']}'. Files: {files}\n"
         "It has LinkedIn/X posts, a launch email, and image prompts for your cover, "
@@ -1302,6 +2116,8 @@ def _now():
 async def post_to_group(text, bot_key="manager"):
     """Post a message to the group as the given agent's bot, falling back to Miles
     if that agent doesn't have its own bot yet (e.g. Cadence before you create it)."""
+    if _suppress_company_updates.get():
+        return
     bot = bots.get(bot_key, bots["manager"])
     try:
         await send_chunks(bot, GROUP_CHAT_ID, text)
@@ -1310,8 +2126,18 @@ async def post_to_group(text, bot_key="manager"):
 
 
 async def post_morning_briefing():
-    # build_morning_briefing does blocking work (LLM + HTTP) - run it off the loop.
-    text = await asyncio.to_thread(main.build_morning_briefing)
+    # The briefing includes an LLM call, so reserve before it just like chat work.
+    try:
+        text = await _run_metered(
+            main.build_morning_briefing,
+            estimate_usd=0.15,
+            context="scheduled morning briefing",
+            agent="manager",
+            meter_model=main.GENERAL_MODEL,
+        )
+    except company_mode.BudgetExceededError as exc:
+        await post_to_group(f"Morning briefing deferred: {exc}", "manager")
+        return
     await post_to_group(text, "manager")
     # Fresh day - (re)schedule today's event alerts right after the briefing.
     await schedule_todays_event_alerts()
@@ -1434,6 +2260,11 @@ async def start_scheduler():
         id="daily-company-report",
         replace_existing=True,
     )
+    autonomy_job = autonomous_workflow.register_scheduler(
+        scheduler,
+        post_autonomous_daily,
+        AUTONOMY_CONFIG,
+    )
     scheduler.start()
 
     # Live reminder scheduling comes through this hook from execute_tool/set_reminder.
@@ -1445,6 +2276,12 @@ async def start_scheduler():
         f"Scheduler running - morning briefing at {main.BRIEFING_TIME}, "
         f"daily company report at {DAILY_REPORT_TIME} ({main.TIMEZONE})."
     )
+    if autonomy_job is not None:
+        print(
+            f"Autonomous run scheduled {AUTONOMY_CONFIG.schedule_days} at "
+            f"{AUTONOMY_CONFIG.schedule_time} ({AUTONOMY_CONFIG.timezone}); "
+            f"mode={'dry-run' if AUTONOMY_CONFIG.dry_run else 'live'}."
+        )
 
 
 async def run_all():

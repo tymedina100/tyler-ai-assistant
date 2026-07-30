@@ -1,0 +1,181 @@
+{
+  "version": 1,
+  "pricing_basis": "usd_per_1m_tokens",
+  "snapshot_note": "Enabled-model pricing verified against official OpenAI model pages on 2026-07-27. Re-verify before deployment; context limits are conservative application routing limits.",
+  "pricing_sources": [
+    "https://developers.openai.com/api/docs/models/gpt-5.4-nano",
+    "https://developers.openai.com/api/docs/models/gpt-5.4-mini",
+    "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
+  ],
+  "models": [
+    {
+      "id": "gpt-5.4-nano",
+      "level": "lightweight",
+      "strength": 10,
+      "capabilities": [
+        "text",
+        "classification",
+        "formatting",
+        "summarization",
+        "extraction",
+        "routing",
+        "status_updates",
+        "reasoning"
+      ],
+      "context_limit_tokens": 64000,
+      "input_usd_per_million": 0.2,
+      "cached_input_usd_per_million": 0.02,
+      "output_usd_per_million": 1.25,
+      "enabled": true
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "level": "standard",
+      "strength": 20,
+      "capabilities": [
+        "text",
+        "classification",
+        "formatting",
+        "summarization",
+        "extraction",
+        "routing",
+        "status_updates",
+        "planning",
+        "coding",
+        "debugging",
+        "documentation",
+        "research",
+        "review",
+        "ideation",
+        "tool_use",
+        "reasoning"
+      ],
+      "context_limit_tokens": 128000,
+      "input_usd_per_million": 0.75,
+      "cached_input_usd_per_million": 0.075,
+      "output_usd_per_million": 4.5,
+      "enabled": true
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "level": "advanced",
+      "strength": 40,
+      "capabilities": [
+        "text",
+        "classification",
+        "formatting",
+        "summarization",
+        "extraction",
+        "routing",
+        "status_updates",
+        "planning",
+        "coding",
+        "debugging",
+        "documentation",
+        "research",
+        "review",
+        "ideation",
+        "tool_use",
+        "reasoning",
+        "architecture",
+        "cross_project_reasoning",
+        "security_review",
+        "long_context"
+      ],
+      "context_limit_tokens": 256000,
+      "input_usd_per_million": 5.0,
+      "cached_input_usd_per_million": 0.5,
+      "output_usd_per_million": 30.0,
+      "enabled": true
+    },
+    {
+      "id": "gpt-5.5-pro",
+      "level": "advanced",
+      "strength": 50,
+      "capabilities": [
+        "text",
+        "classification",
+        "formatting",
+        "summarization",
+        "extraction",
+        "routing",
+        "status_updates",
+        "planning",
+        "coding",
+        "debugging",
+        "documentation",
+        "research",
+        "review",
+        "ideation",
+        "tool_use",
+        "architecture",
+        "cross_project_reasoning",
+        "security_review",
+        "long_context"
+      ],
+      "context_limit_tokens": 256000,
+      "input_usd_per_million": 30.0,
+      "cached_input_usd_per_million": 3.0,
+      "output_usd_per_million": 180.0,
+      "enabled": false
+    },
+    {
+      "id": "gpt-5.4",
+      "level": "standard",
+      "strength": 30,
+      "capabilities": [
+        "text",
+        "classification",
+        "formatting",
+        "summarization",
+        "extraction",
+        "routing",
+        "status_updates",
+        "planning",
+        "coding",
+        "debugging",
+        "documentation",
+        "research",
+        "review",
+        "ideation",
+        "tool_use"
+      ],
+      "context_limit_tokens": 128000,
+      "input_usd_per_million": 2.5,
+      "cached_input_usd_per_million": 0.25,
+      "output_usd_per_million": 15.0,
+      "enabled": false
+    },
+    {
+      "id": "o4-mini",
+      "level": "standard",
+      "strength": 25,
+      "capabilities": [
+        "text",
+        "planning",
+        "coding",
+        "debugging",
+        "research",
+        "review"
+      ],
+      "context_limit_tokens": 128000,
+      "input_usd_per_million": 0.55,
+      "cached_input_usd_per_million": 0.055,
+      "output_usd_per_million": 2.2,
+      "enabled": false
+    },
+    {
+      "id": "text-embedding-3-small",
+      "level": "lightweight",
+      "strength": 5,
+      "capabilities": [
+        "embedding"
+      ],
+      "context_limit_tokens": 8192,
+      "input_usd_per_million": 0.02,
+      "cached_input_usd_per_million": 0.002,
+      "output_usd_per_million": 0.0,
+      "enabled": false
+    }
+  ]
+}

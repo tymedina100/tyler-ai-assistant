@@ -8,5 +8,11 @@ reminders.json
 company_state.json
 office_state.json
 active_project.json
+autonomy_state.json
+autonomy_state.json.recovery-required
+autonomous_runs/
+*.json.lock
+autonomous_daily.lock
+autonomy_run.lock
 token.json
 credentials.json

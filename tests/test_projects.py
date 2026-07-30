@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -62,6 +63,23 @@ class ProjectRegistryTests(unittest.TestCase):
             _token, repo, base = github_helpers._code_config()
         self.assertEqual(repo, "tymedina100/card-tracker")
         self.assertEqual(base, "main")
+
+    def test_scoped_project_target_does_not_rewrite_persisted_selection(self):
+        with patch.dict(os.environ, self._env(GITHUB_TOKEN="tok"), clear=False):
+            projects.set_active_project("vantage")
+            profile, err, tokens = projects.begin_scoped_project("card-tracker")
+            try:
+                self.assertIsNone(err)
+                self.assertEqual(profile["repo"], "tymedina100/card-tracker")
+                self.assertEqual(projects.get_active_project()[0], "card-tracker")
+                self.assertEqual(github_helpers._code_config()[1], "tymedina100/card-tracker")
+                persisted = json.loads((Path(self.tmp.name) / "active_project.json").read_text(encoding="utf-8"))
+                self.assertEqual(persisted["active"], "vantage")
+            finally:
+                projects.end_scoped_project(tokens)
+
+            self.assertEqual(projects.get_active_project()[0], "vantage")
+            self.assertEqual(github_helpers._code_config()[1], "tymedina100/vantage")
 
     def test_falls_back_to_env_without_active_project(self):
         env = self._env(GITHUB_TOKEN="tok", GITHUB_CODE_REPO="me/envrepo", GITHUB_CODE_BASE="dev")

@@ -13,6 +13,7 @@ loaded after import still works. If GITHUB_TOKEN/GITHUB_REPO aren't set, push_fi
 is a silent no-op and the explicit tools return a friendly "not configured" message.
 """
 import base64
+import contextvars
 import os
 import re
 
@@ -208,6 +209,7 @@ def delete_file(path):
 # breaks when no project is selected.
 _ACTIVE_CODE_REPO = None
 _ACTIVE_CODE_BASE = None
+_SCOPED_CODE_TARGET = contextvars.ContextVar("scoped_code_target", default=None)
 
 
 def set_active_code_repo(repo, base):
@@ -227,8 +229,26 @@ def clear_active_code_repo():
     set_active_code_repo(None, None)
 
 
+def set_scoped_code_repo(repo, base):
+    """Set a run-local code target and return a token for exact restoration.
+
+    Context variables propagate through ``asyncio.to_thread`` but do not alter the
+    user's persisted/global project selection, preventing concurrent chat work from
+    being redirected by an autonomous run.
+    """
+    target = (repo, base or "main") if repo else None
+    return _SCOPED_CODE_TARGET.set(target)
+
+
+def reset_scoped_code_repo(token):
+    _SCOPED_CODE_TARGET.reset(token)
+
+
 def active_code_repo():
     """Return (repo, base) if a project override is active, else None."""
+    scoped = _SCOPED_CODE_TARGET.get()
+    if scoped:
+        return scoped
     if _ACTIVE_CODE_REPO:
         return _ACTIVE_CODE_REPO, _ACTIVE_CODE_BASE
     return None
@@ -236,6 +256,10 @@ def active_code_repo():
 
 def _code_config():
     # An active project (if any) wins; otherwise the original env-var behavior.
+    scoped = _SCOPED_CODE_TARGET.get()
+    if scoped:
+        token, _, _ = _config()
+        return token, scoped[0], scoped[1]
     if _ACTIVE_CODE_REPO:
         token, _, _ = _config()
         return token, _ACTIVE_CODE_REPO, _ACTIVE_CODE_BASE

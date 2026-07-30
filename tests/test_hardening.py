@@ -70,6 +70,11 @@ class HardeningTests(unittest.TestCase):
     def test_safe_file_path_rejects_traversal(self):
         self.assertIsNone(self.main.get_safe_file_path("../.env"))
 
+    def test_group_dockerfile_packages_office_api_runtime_dependency(self):
+        dockerfile = (ROOT / "Dockerfile.group").read_text(encoding="utf-8")
+        self.assertIn("office_api.py", dockerfile)
+        self.assertIn("office_metrics.py", dockerfile)
+
     def test_safe_file_path_strips_redundant_files_prefix(self):
         # An agent passing "files/pack.md" should hit the same file as "pack.md",
         # not files/files/pack.md.
@@ -152,7 +157,7 @@ class HardeningTests(unittest.TestCase):
 
     def test_usage_to_usd_responses_shape(self):
         usage = FakeUsage(input_tokens=1000, output_tokens=1000)
-        # PREMIUM_MODEL gpt-5.5 priced (0.005, 0.030) per 1k → 0.005 + 0.030 = 0.035
+        # PREMIUM_MODEL gpt-5.6-sol priced (0.005, 0.030) per 1k -> 0.005 + 0.030 = 0.035
         self.assertAlmostEqual(self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.035, places=6)
 
     def test_usage_to_usd_embedding_shape(self):
@@ -302,6 +307,65 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(result, "Final synthesized answer.")
         self.assertEqual(len(calls), 3)          # 2 tool iterations + 1 synthesis
         self.assertNotIn("tools", calls[-1])     # synthesis call carried no tools
+
+    def test_run_with_tools_rejects_unadvertised_function_call(self):
+        main = self.main
+
+        class Item:
+            type = "function_call"
+            name = "send_email"
+            arguments = '{"to":"victim@example.com","subject":"x","body":"x"}'
+            call_id = "call-1"
+
+        class Response:
+            usage = None
+
+            def __init__(self, output, output_text=""):
+                self.output = output
+                self.output_text = output_text
+
+        class Responses:
+            def __init__(self):
+                self.calls = 0
+                self.inputs = []
+
+            def create(self, **kwargs):
+                self.inputs.append(kwargs["input"])
+                self.calls += 1
+                if self.calls == 1:
+                    return Response([Item()])
+                return Response([], "Continued safely without the tool.")
+
+        responses = Responses()
+        client = types.SimpleNamespace(responses=responses)
+        with patch.object(main, "get_openai_client", return_value=client), patch.object(
+            main, "execute_tool"
+        ) as execute:
+            result = main.run_with_tools(
+                "read only", [{"role": "user", "content": "inspect"}],
+                tools=[], max_iterations=2,
+            )
+
+        self.assertEqual(result, "Continued safely without the tool.")
+        execute.assert_not_called()
+        self.assertIn("Tool call denied", str(responses.inputs[-1]))
+
+    def test_autonomous_model_call_can_exclude_conversation_memories(self):
+        main = self.main
+        with patch.object(main, "build_augmented_prompt") as augment, patch.object(
+            main, "run_with_tools", return_value="safe result"
+        ) as run:
+            result = main.ask_ai(
+                "structured roadmap task",
+                record_history=False,
+                allowed_tool_names=set(),
+                include_memories=False,
+            )
+        self.assertEqual(result, "safe result")
+        augment.assert_not_called()
+        sent_input = run.call_args.args[1][0]["content"]
+        self.assertIn("structured roadmap task", sent_input)
+        self.assertNotIn("Relevant memories", sent_input)
 
     def test_company_execution_writes_file_directly_and_records_artifact(self):
         self.main.set_conversation("test:companywrite")

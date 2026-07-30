@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "schema_version": 1,
+  "projects": [
+    {
+      "id": "assistant",
+      "name": "Tyler AI Assistant",
+      "status": "active",
+      "priority": 100,
+      "goals": [
+        {
+          "id": "assistant-autonomy",
+          "title": "Operate as a safe, budget-aware AI team",
+          "description": "Select useful roadmap work without a new daily prompt while preserving human approval gates.",
+          "status": "active"
+        }
+      ],
+      "roadmap_items": [
+        {
+          "id": "AUTO-EXAMPLE-001",
+          "goal_id": "assistant-autonomy",
+          "title": "Validate the autonomous daily-run configuration",
+          "description": "Inspect the configured schedule, permission ceiling, and dry-run controls and produce a concise validation note.",
+          "priority": 100,
+          "status": "ready",
+          "dependencies": [],
+          "blockers": [],
+          "acceptance_criteria": [
+            "The configured schedule, timezone, and dry-run setting are reported.",
+            "No credentials or secret values appear in the output.",
+            "No external or destructive action is performed."
+          ],
+          "agent_owner": "manager",
+          "task_type": "status_update",
+          "complexity": "lightweight",
+          "risk": "low",
+          "required_capabilities": [
+            "text"
+          ],
+          "authorization_level": "observe",
+          "estimated_input_tokens": 1200,
+          "estimated_output_tokens": 300,
+          "previous_attempts": [],
+          "previous_models": [],
+          "human_decision_required": false,
+          "human_action": ""
+        },
+        {
+          "id": "AUTO-EXAMPLE-002",
+          "goal_id": "assistant-autonomy",
+          "title": "Propose the first production smoke-test checklist",
+          "description": "Draft a reviewable checklist for validating one scheduled dry run on Railway and one Telegram summary.",
+          "priority": 80,
+          "status": "ready",
+          "dependencies": [
+            "AUTO-EXAMPLE-001"
+          ],
+          "blockers": [],
+          "acceptance_criteria": [
+            "The checklist distinguishes local verification from live Railway and Telegram checks.",
+            "The checklist includes overlap prevention, idempotency, redaction, and budget reporting.",
+            "The output is a proposal only and starts no deployment."
+          ],
+          "agent_owner": "manager",
+          "task_type": "documentation",
+          "complexity": "standard",
+          "risk": "low",
+          "required_capabilities": [
+            "text",
+            "reasoning"
+          ],
+          "authorization_level": "propose",
+          "estimated_input_tokens": 2500,
+          "estimated_output_tokens": 700,
+          "previous_attempts": [],
+          "previous_models": [],
+          "human_decision_required": false,
+          "human_action": ""
+        }
+      ]
+    }
+  ],
+  "idea_backlog": [],
+  "run_control": {
+    "active_run": null,
+    "scheduled_dates": {},
+    "stale_recoveries": [],
+    "recent_runs": []
+  },
+  "budget_tracking": {
+    "date": null,
+    "actual_or_reconciled_cost_usd": 0.0,
+    "cost_is_estimated": true
+  }
+}

@@ -16,8 +16,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py group_bot.py office_api.py office_state.py company_mode.py company_linear.py google_helpers.py github_helpers.py gumroad_helpers.py linear_helpers.py deploy_helpers.py railway_helpers.py projects.py ./
+COPY main.py model_router.py autonomous_workflow.py autonomy_team.py group_bot.py office_api.py office_metrics.py office_state.py company_mode.py company_linear.py google_helpers.py github_helpers.py gumroad_helpers.py linear_helpers.py deploy_helpers.py railway_helpers.py projects.py ./
 COPY projects.json ./
+COPY config/ ./config/
 COPY files/ ./files/
 COPY assets/ ./assets/
 COPY scripts/ ./scripts/
