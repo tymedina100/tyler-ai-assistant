@@ -214,7 +214,8 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
                     company_mode.set_project_revision_flag(company_project["id"], result, path)
                 else:
                     company_mode.update_task_status(
-                        task["id"], "done", "Schedule verified.", [], 0.01, path,
+                        task["id"], "done", "Schedule verified.",
+                        ["file: files/config-note.md"], 0.01, path,
                         model=task.get("model"), model_reason=task.get("model_reason"),
                     )
                 return "done"
@@ -243,6 +244,9 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["review_outcome"], "approved")
+        self.assertEqual(result["result_text"], "Schedule verified.")
+        self.assertEqual(result["result_agent"], "general")
+        self.assertEqual(result["files_changed"], ["files/config-note.md"])
         self.assertEqual(result["models"], ["worker-model", "review-model"])
         self.assertEqual(result["actual_cost_usd"], 0.02)
         self.assertEqual(final["company"]["reserved_today_usd"], 0.0)
@@ -270,6 +274,49 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertIsNone(self.group.autonomy_runner_task)
+
+    async def test_completed_live_run_posts_deliverable_before_summary(self):
+        report = {
+            "dry_run": False,
+            "escalations": [],
+            "tasks_selected": [{
+                "id": "AUTO-1",
+                "title": "Produce checklist",
+                "status": "completed",
+                "agent_owner": "manager",
+            }],
+            "result_text": "1. Verify the Railway run.\n2. Verify the Telegram summary.",
+            "result_agent": "general",
+            "result_truncated": False,
+            "telegram_summary": "Autonomous run: completed",
+        }
+        with patch.object(
+            self.group, "_run_autonomy_cycle", new=AsyncMock(return_value=report)
+        ), patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
+            await self.group._run_and_post_autonomy("scheduled", dry_run=False)
+
+        self.assertEqual(len(post.await_args_list), 2)
+        deliverable_call, summary_call = post.await_args_list
+        self.assertIn("Autonomous deliverable", deliverable_call.args[0])
+        self.assertIn("Verify the Railway run", deliverable_call.args[0])
+        self.assertEqual(deliverable_call.args[1], "manager")
+        self.assertEqual(summary_call.args, ("Autonomous run: completed", "manager"))
+
+    async def test_scheduled_dry_run_posts_no_telegram_message(self):
+        report = {
+            "dry_run": True,
+            "escalations": [],
+            "tasks_selected": [],
+            "result_text": "",
+            "telegram_summary": "Autonomous run: dry_run",
+            "report_path": "C:/tmp/run.json",
+        }
+        with patch.object(
+            self.group, "_run_autonomy_cycle", new=AsyncMock(return_value=report)
+        ), patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
+            await self.group._run_and_post_autonomy("scheduled", dry_run=True)
+
+        post.assert_not_awaited()
 
     async def test_external_action_escalates_without_model_or_company_call(self):
         with patch.object(self.group, "_company_budget_snapshot") as budget, patch.object(

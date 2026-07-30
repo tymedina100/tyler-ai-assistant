@@ -70,7 +70,7 @@ Only `observe` and `propose` auto-execute in this slice. The existing `run_pytho
 9. In live mode it applies a context-scoped project target (without rewriting the owner's persisted selection), materializes one bounded worker task plus one reviewer task, attaches structured acceptance criteria and routing metadata, and reserves the full estimate atomically.
 10. Company Mode executes the tasks sequentially. Each task records model decision, tokens, actual/reconciled cost, attempts, artifacts, and failure classification.
 11. Vera evaluates mandatory explicit acceptance criteria. Repeated substantially identical feedback, repeated technical failure, unavailable tools, missing access, budget exhaustion, or the configured attempt limit produces a terminal `needs_human` state.
-12. The coordinator reconciles reservations, updates the roadmap item from the Company Mode result, persists the run report, releases the lock, and sends a concise Telegram summary.
+12. The coordinator reconciles reservations, updates the roadmap item from the Company Mode result, persists the worker result separately from reviewer feedback, releases the lock, sends the completed deliverable through the existing chunked Telegram transport, and then sends a concise summary.
 13. If no roadmap work is actionable, a controlled creative callback may add at most the configured number of deduplicated ideas to the backlog. Ideas are never executed automatically.
 
 ## Budget design

@@ -1824,6 +1824,9 @@ async def _run_and_post_autonomy(trigger_source, *, dry_run=None):
         if not report.get("dry_run"):
             for escalation in report.get("escalations", []) or []:
                 await post_to_group(str(escalation), "manager")
+            deliverable = autonomous_workflow.format_telegram_deliverable(report)
+            if deliverable:
+                await post_to_group(deliverable, "manager")
             await post_to_group(report["telegram_summary"], "manager")
         else:
             main.logger.info(f"Autonomy dry run completed: {report.get('report_path')}")

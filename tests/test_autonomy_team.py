@@ -110,14 +110,16 @@ class AutonomyTeamTests(unittest.TestCase):
                 {
                     "id": "t1", "project_id": "proj-1", "owner": "manager", "status": "done",
                     "title": "Inspect", "spent_usd": 0.01, "model": "gpt-5.4-nano",
-                    "execution_attempts": 1, "artifacts": [],
+                    "execution_attempts": 1,
+                    "result": "Schedule verified: mon-fri at 08:00 America/Phoenix.",
+                    "artifacts": ["file: files/report.md"],
                     "usage_records": [{"input_tokens": 100, "cached_input_tokens": 10, "output_tokens": 20}],
                 },
                 {
                     "id": "t2", "project_id": "proj-1", "owner": "editor", "status": "done",
                     "title": "Review", "result": "APPROVED: criteria met.", "spent_usd": 0.02,
                     "model": "gpt-5.4-mini", "execution_attempts": 1,
-                    "artifacts": ["file: files/report.md"],
+                    "artifacts": [],
                     "usage_records": [{"input_tokens": 200, "output_tokens": 30}],
                 },
             ],
@@ -134,6 +136,15 @@ class AutonomyTeamTests(unittest.TestCase):
         self.assertEqual(result["token_usage"]["total_tokens"], 350)
         self.assertEqual(result["files_changed"], ["files/report.md"])
         self.assertEqual(result["review_outcome"], "approved")
+        self.assertEqual(result["review_outcomes"], ["APPROVED: criteria met."])
+        self.assertEqual(
+            result["result_text"],
+            "Schedule verified: mon-fri at 08:00 America/Phoenix.",
+        )
+        self.assertEqual(result["result"], result["result_text"])
+        self.assertEqual(result["result_task_id"], "t1")
+        self.assertEqual(result["result_agent"], "manager")
+        self.assertFalse(result["result_truncated"])
         self.assertEqual(result["agents"], ["manager", "editor"])
         self.assertEqual(result["models"], ["gpt-5.4-nano", "gpt-5.4-mini"])
         self.assertEqual(result["costs"]["by_model"]["gpt-5.4-mini"], 0.02)

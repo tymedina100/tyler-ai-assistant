@@ -177,6 +177,11 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(report["final_status"], "dry_run")
         executor.assert_not_called()
         ideas.assert_not_called()
+        self.assertEqual(report["actual_cost_usd"], 0.0)
+        self.assertEqual(report["result_text"], "")
+        self.assertEqual(report["artifacts"], [])
+        self.assertEqual(report["files_changed"], [])
+        self.assertEqual(autonomy.format_telegram_deliverable(report), "")
         self.assertEqual(workflow.load_state()["projects"][0]["roadmap_items"][0]["status"], "ready")
 
     def test_creative_agent_runs_only_when_no_actionable_work_exists(self):
@@ -292,6 +297,51 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(report["final_status"], "completed")
         executor.assert_called_once()
         ideas.assert_not_called()
+
+    def test_completed_result_is_persisted_redacted_and_telegram_safe(self):
+        result_text = (
+            "Production checklist begins. OPENAI_API_KEY=top-secret. "
+            + "Verify overlap, idempotency, redaction, and budget reporting. " * 120
+        )
+        executor = Mock(return_value={
+            "status": "completed",
+            "result_text": result_text,
+            "result_task_id": "worker-1",
+            "result_agent": "general",
+            "review_outcomes": ["APPROVED: every criterion is satisfied."],
+            "actual_cost_usd": 0.01,
+            "artifacts": ["file: files/config-check.md"],
+            "files_changed": ["files/config-check.md"],
+        })
+        workflow = self.workflow([item()], executor=executor)
+
+        with patch.dict(os.environ, {"MAX_TASK_RESULT_CHARS": "5000"}):
+            report = workflow.run(dry_run=False)
+
+        self.assertEqual(report["final_status"], "completed")
+        self.assertEqual(report["result_task_id"], "worker-1")
+        self.assertEqual(report["result_agent"], "general")
+        self.assertTrue(report["result_truncated"])
+        self.assertLessEqual(len(report["result_text"]), 5000)
+        self.assertIn("Production checklist begins", report["result_text"])
+        self.assertIn("[REDACTED]", report["result_text"])
+        self.assertNotIn("top-secret", json.dumps(report))
+        self.assertEqual(
+            report["tasks_selected"][0]["result_summary"],
+            report["result_text"][:1000],
+        )
+        self.assertIn("Result:", report["telegram_summary"])
+        self.assertIn("[preview truncated]", report["telegram_summary"])
+        self.assertIn("Budget:", report["telegram_summary"])
+        self.assertIn("Your action:", report["telegram_summary"])
+        self.assertLessEqual(len(report["telegram_summary"]), autonomy.TELEGRAM_MESSAGE_LIMIT)
+        deliverable = autonomy.format_telegram_deliverable(report)
+        self.assertIn("Autonomous deliverable", deliverable)
+        self.assertIn("Agent: general", deliverable)
+        self.assertIn("configured storage limit", deliverable)
+        persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(persisted["result_text"], report["result_text"])
+        self.assertNotIn("top-secret", json.dumps(persisted))
 
     def test_shared_budget_provider_and_nested_execution_attribution_drive_report(self):
         before = {

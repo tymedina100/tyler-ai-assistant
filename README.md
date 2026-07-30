@@ -514,8 +514,10 @@ The autonomous layer extends the current system rather than replacing it:
    normal tool set with the roadmap authorization level.
 4. A live run uses the existing Company Mode sequential runner, artifact handoff,
    bounded revisions, budget ledger, and approval gates.
-5. The coordinator reconciles usage, updates state, writes a JSON run report, and posts
-   a concise Telegram summary or owner escalation.
+5. The coordinator reconciles usage, updates state, writes a JSON run report, posts the
+   substantive completed worker result through the existing chunked Telegram transport,
+   and then posts a concise summary or owner escalation. Reviewer feedback remains
+   separate from the worker deliverable in the audit record.
 6. Only when no roadmap work is actionable may Lumen propose a limited, deduplicated
    idea. It enters the backlog as `proposed`; it is not automatically built.
 
