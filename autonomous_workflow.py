@@ -1198,6 +1198,24 @@ class AutonomousWorkflow:
             report["deferred"].append(message)
             report["tasks_selected"][0]["status"] = "deferred"
             attempt["failure_classification"] = failure
+            action = str(result.get("human_action") or "").strip()
+            if action:
+                if action not in report["human_actions"]:
+                    report["human_actions"].append(action)
+                report["escalations"].append(
+                    format_escalation(
+                        project,
+                        item,
+                        str(
+                            result.get("attempted")
+                            or "Checked execution preconditions; no task execution started."
+                        ),
+                        message,
+                        failure,
+                        action,
+                        bool(result.get("other_work_can_continue", True)),
+                    )
+                )
         else:
             attempt["failure_classification"] = failure
             prior_attempts = len(item.get("previous_attempts", [])) + 1

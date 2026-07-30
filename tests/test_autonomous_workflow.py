@@ -537,6 +537,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "status": "deferred",
             "failure_classification": "decision_required",
             "reason": "A supervised Company Mode plan is already running.",
+            "attempted": "Checked the persisted Company Mode ledger before task execution.",
+            "human_action": "Run /company, resolve the open project, then retry /autorun live.",
+            "other_work_can_continue": True,
             "actual_cost_usd": 0.0,
             "model_invoked": False,
         })
@@ -546,8 +549,18 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         self.assertEqual(report["final_status"], "deferred")
         persisted_item = workflow.load_state()["projects"][0]["roadmap_items"][0]
+        self.assertEqual(persisted_item["status"], "deferred")
+        self.assertFalse(persisted_item["human_decision_required"])
         self.assertEqual(persisted_item["previous_models"], [])
         self.assertFalse(persisted_item["previous_attempts"][0]["model_invoked"])
+        self.assertEqual(report["actual_cost_usd"], 0.0)
+        self.assertIn("/company", report["human_actions"][0])
+        self.assertIn("/autorun live", report["telegram_summary"])
+        self.assertNotIn("Your action: None", report["telegram_summary"])
+        self.assertEqual(len(report["escalations"]), 1)
+        self.assertIn("OWNER ACTION NEEDED", report["escalations"][0])
+        self.assertIn("decision_required", report["escalations"][0])
+        self.assertIn("Checked the persisted Company Mode ledger", report["escalations"][0])
 
     def test_authorization_above_ceiling_escalates_without_execution(self):
         executor = Mock()

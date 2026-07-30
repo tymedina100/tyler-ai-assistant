@@ -507,7 +507,14 @@ async def handle_group_message(update: Update):
             return
         if parsed_company and parsed_company[0] == "/cancel":
             _cancel_running_plan()
-            await reply_chunks(update.message, await asyncio.to_thread(company_mode.cancel_project))
+            await reply_chunks(
+                update.message,
+                await asyncio.to_thread(
+                    company_mode.cancel_project,
+                    company_mode.COMPANY_STATE_FILE,
+                    parsed_company[1] or None,
+                ),
+            )
             return
         if parsed_company and parsed_company[0] == "/publish":
             await start_publish(update)
@@ -1519,6 +1526,9 @@ async def _autonomy_runtime_deferral():
             "status": "deferred",
             "failure_classification": "decision_required",
             "reason": "A Telegram confirmation is already waiting for the owner.",
+            "attempted": "Checked Telegram owner-confirmation state before starting any model or task.",
+            "human_action": "Review the pending Telegram action and send /confirm or /cancel. Then retry /autorun live.",
+            "other_work_can_continue": True,
             "actual_cost_usd": 0.0,
             "model_invoked": False,
         }
@@ -1528,6 +1538,9 @@ async def _autonomy_runtime_deferral():
             "status": "deferred",
             "failure_classification": "decision_required",
             "reason": "Company Mode is paused; use /resumecompany before a live autonomous run.",
+            "attempted": "Checked Company Mode before starting any model or task.",
+            "human_action": "Send /resumecompany, then retry /autorun live.",
+            "other_work_can_continue": True,
             "actual_cost_usd": 0.0,
             "model_invoked": False,
         }
@@ -1538,6 +1551,12 @@ async def _autonomy_runtime_deferral():
             "status": "deferred",
             "failure_classification": "decision_required",
             "reason": f"Company project {current['id']} is still {current['status']}.",
+            "attempted": "Checked the persisted Company Mode ledger before starting any model or task.",
+            "human_action": (
+                f"Run /company to inspect {current['id']}. If it is still wanted and safe to resume, "
+                f"use /approve; otherwise use /cancel {current['id']}. Then retry /autorun live."
+            ),
+            "other_work_can_continue": True,
             "actual_cost_usd": 0.0,
             "model_invoked": False,
         }
