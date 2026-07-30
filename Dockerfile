@@ -15,8 +15,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py bot.py company_mode.py google_helpers.py github_helpers.py gumroad_helpers.py linear_helpers.py deploy_helpers.py railway_helpers.py projects.py ./
+COPY main.py model_router.py autonomous_workflow.py bot.py company_mode.py google_helpers.py github_helpers.py gumroad_helpers.py linear_helpers.py deploy_helpers.py railway_helpers.py projects.py ./
 COPY projects.json ./
+COPY config/ ./config/
 COPY files/ ./files/
 
 # memory_db/ (long-term memory) and assistant.log are created here at

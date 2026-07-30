@@ -5,6 +5,12 @@ token.json
 credentials.json
 reminders.json
 company_state.json
+autonomy_state.json
+autonomy_state.json.recovery-required
+autonomous_runs/
+*.json.lock
+autonomous_daily.lock
+autonomy_run.lock
 memory_db/
 assistant.log
 sandbox/

@@ -19,9 +19,11 @@ from openai import OpenAI
 from tavily import TavilyClient
 
 import deploy_helpers
+import autonomous_workflow
 import github_helpers
 import google_helpers
 import linear_helpers
+import model_router
 import projects
 import railway_helpers
 
@@ -199,44 +201,48 @@ def in_company_execution():
     return _company_execution.get()
 
 
-# Two model tiers instead of one model for everything. The premium model does
-# the work that needs real reasoning (coding, research, writing, the catch-all
-# general assistant); the fast/cheap model handles work that's mostly routing or
-# a thin wrapper over an API result (the Manager's delegation decision, weather,
-# tasks, personal-assistant memory ops). Every call defaults to PREMIUM_MODEL, so
-# nothing silently downgrades - a call is only cheap where we deliberately say so.
-# Confirm the exact cheaper sibling id available on the account before deploying.
-PREMIUM_MODEL = "gpt-5.5"
-FAST_MODEL = "gpt-5.4-mini"
-GENERAL_MODEL = PREMIUM_MODEL  # the general assistant fields arbitrary questions
-EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+# Model availability, capability tiers, context limits, and pricing live in one
+# operator-maintained catalog. Keep the legacy FAST/PREMIUM aliases because the
+# reactive assistant still assigns a default tier per persona; autonomous work may
+# override that default with a recorded per-task routing decision.
+MODEL_CATALOG = model_router.load_model_catalog()
 
-# USD price per 1,000 tokens as (input_rate, output_rate) per model. Company Mode
-# meters real token usage against these so the daily budget reflects actual spend,
-# not a flat estimate. This is the ONE place to update when prices or model ids
-# change. Values below are OpenAI list pricing divided by 1,000 (list is per 1M
-# tokens). An unknown model falls back to DEFAULT_MODEL_PRICE and logs a warning, so
-# a model swap can never silently meter $0 and hide runaway cost - the fallback is
-# deliberately on the high side so an unpriced model over-counts rather than under.
+
+def _catalog_default(level, preferred_id):
+    override = MODEL_CATALOG.get(preferred_id)
+    if override and override.enabled:
+        return override.model_id
+    candidates = [
+        spec for spec in MODEL_CATALOG.enabled_models if spec.level == level
+    ]
+    if not candidates:
+        candidates = list(MODEL_CATALOG.enabled_models)
+    if not candidates:
+        raise RuntimeError("The model catalog has no enabled models.")
+    return min(candidates, key=lambda spec: (spec.strength, spec.model_id)).model_id
+
+
+PREMIUM_MODEL = os.environ.get("OPENAI_PREMIUM_MODEL") or _catalog_default(
+    model_router.CapabilityLevel.ADVANCED, "gpt-5.6-sol"
+)
+FAST_MODEL = os.environ.get("OPENAI_FAST_MODEL") or _catalog_default(
+    model_router.CapabilityLevel.STANDARD, "gpt-5.4-mini"
+)
+GENERAL_MODEL = PREMIUM_MODEL  # the general assistant fields arbitrary questions
+EMBEDDING_MODEL_NAME = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+# Compatibility views derived from config/model-catalog.json. Rates are USD per
+# 1,000 tokens because older tests/callers use that shape; the catalog itself stores
+# the clearer per-million snapshot. An unknown model uses a conservative fallback.
 DEFAULT_MODEL_PRICE = (0.01, 0.03)
-# Cached input tokens (prompt caching) are billed at a fraction of the input rate. In a
-# tool loop the model re-sends a large, mostly-stable prefix every iteration, so most of
-# those input tokens are cache hits - charging them at the full rate is what made the
-# Company Mode ledger over-count real spend ~2x. OpenAI lists cached input at 10% of the
-# regular input rate for the configured models (gpt-5.5 $0.50 vs $5.00, gpt-5.4 $0.25 vs
-# $2.50, gpt-5.4-mini $0.075 vs $0.75 per 1M; see
-# https://developers.openai.com/api/docs/pricing). One constant to tune if a model uses
-# a different cached ratio.
+# Kept as a compatibility constant for unknown-model fallback behavior.
 CACHED_INPUT_RATE_MULTIPLIER = 0.10
 MODEL_PRICING = {
-    PREMIUM_MODEL: (0.005, 0.030),         # gpt-5.5:      $5.00 / $30.00 per 1M
-    FAST_MODEL: (0.00075, 0.0045),         # gpt-5.4-mini: $0.75 / $4.50 per 1M
-    EMBEDDING_MODEL_NAME: (0.00002, 0.0),  # text-embedding-3-small: ~$0.02 per 1M
-    # Other current OpenAI models, priced ahead of time for easy model swaps:
-    "gpt-5.5-pro": (0.030, 0.180),         # $30.00 / $180.00 per 1M
-    "gpt-5.4": (0.0025, 0.015),            # $2.50 / $15.00 per 1M
-    "gpt-5.4-nano": (0.0002, 0.00125),     # $0.20 / $1.25 per 1M
-    "o4-mini": (0.00055, 0.0022),          # $0.55 / $2.20 per 1M
+    spec.model_id: (
+        spec.input_usd_per_million / 1000.0,
+        spec.output_usd_per_million / 1000.0,
+    )
+    for spec in MODEL_CATALOG
 }
 
 
@@ -250,8 +256,8 @@ def usage_to_usd(model, usage):
     if usage is None:
         return 0.0
 
-    in_rate, out_rate = MODEL_PRICING.get(model, DEFAULT_MODEL_PRICE)
-    if model not in MODEL_PRICING:
+    spec = MODEL_CATALOG.get(model)
+    if spec is None:
         logger.warning(f"No price for model {model!r}; using default rate for metering.")
 
     input_tokens = getattr(usage, "input_tokens", None)
@@ -263,16 +269,20 @@ def usage_to_usd(model, usage):
         total = getattr(usage, "total_tokens", 0) or 0
         output_tokens = max(0, total - input_tokens)
 
-    # Split input into cache hits (billed at a fraction) and fresh tokens (full rate).
     cached_tokens = min(_cached_input_tokens(usage), input_tokens)
-    fresh_input = max(0, input_tokens - cached_tokens)
+    if spec is not None:
+        return round(
+            spec.estimate_cost(input_tokens, cached_tokens, output_tokens), 6
+        )
 
-    cost = (
+    in_rate, out_rate = DEFAULT_MODEL_PRICE
+    fresh_input = max(0, input_tokens - cached_tokens)
+    return round(
         (fresh_input / 1000.0) * in_rate
         + (cached_tokens / 1000.0) * in_rate * CACHED_INPUT_RATE_MULTIPLIER
-        + (output_tokens / 1000.0) * out_rate
+        + (output_tokens / 1000.0) * out_rate,
+        6,
     )
-    return round(cost, 6)
 
 
 def _cached_input_tokens(usage):
@@ -290,12 +300,44 @@ def _cached_input_tokens(usage):
     return getattr(details, "cached_tokens", 0) or 0
 
 
+def usage_record(model, usage):
+    """Return a JSON-safe usage/cost record for one model call.
+
+    Company Mode used to retain only an aggregate dollar value. Keeping the raw token
+    categories makes a run auditable by task, agent, and model while preserving the
+    existing tolerant handling of SDK usage shapes.
+    """
+    if usage is None:
+        return None
+
+    input_tokens = getattr(usage, "input_tokens", None)
+    if input_tokens is None:
+        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    output_tokens = getattr(usage, "output_tokens", None)
+    if output_tokens is None:
+        total_tokens = getattr(usage, "total_tokens", 0) or 0
+        output_tokens = max(0, total_tokens - input_tokens)
+    cached_tokens = min(_cached_input_tokens(usage), input_tokens)
+    return {
+        "model": model,
+        "input_tokens": int(input_tokens),
+        "cached_input_tokens": int(cached_tokens),
+        "output_tokens": int(output_tokens),
+        "cost_usd": usage_to_usd(model, usage),
+        "cost_kind": "actual",
+    }
+
+
 def _accrue_cost(model, usage):
     """Add a model call's USD cost to the active execution sink, if any. A no-op
     outside Company Mode execution (sink is None), so ordinary turns are unaffected."""
     sink = current_execution_sink()
     if sink is not None:
-        sink["cost_usd"] = round(sink.get("cost_usd", 0.0) + usage_to_usd(model, usage), 6)
+        record = usage_record(model, usage)
+        if record is None:
+            return
+        sink["cost_usd"] = round(sink.get("cost_usd", 0.0) + record["cost_usd"], 6)
+        sink.setdefault("usage_records", []).append(record)
 
 
 def _record_artifact(note):
@@ -688,6 +730,11 @@ Current message:
 
 def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITERATIONS, model=PREMIUM_MODEL):
     assistant_response = "Sorry, I tried too many tool calls without finishing. Please try rephrasing."
+    authorized_tool_names = {
+        str(tool.get("name"))
+        for tool in tools
+        if isinstance(tool, dict) and tool.get("name")
+    }
 
     try:
         openai_client = get_openai_client()
@@ -713,7 +760,17 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
             input_items += response.output
 
             for call in function_calls:
-                result = execute_tool(call.name, json.loads(call.arguments))
+                if call.name not in authorized_tool_names:
+                    logger.warning(
+                        f"Denied unadvertised tool call {call.name!r}; authorized tools: "
+                        f"{sorted(authorized_tool_names)}"
+                    )
+                    result = (
+                        f"Tool call denied: {call.name} is not authorized for this task. "
+                        "Continue without it or explain what human approval is required."
+                    )
+                else:
+                    result = execute_tool(call.name, json.loads(call.arguments))
                 input_items.append({
                     "type": "function_call_output",
                     "call_id": call.call_id,
@@ -748,8 +805,31 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
     return assistant_response
 
 
-def ask_ai(prompt, record_history=True):
-    augmented_prompt = build_augmented_prompt(prompt)
+def _allowed_tools(tools, allowed_tool_names=None):
+    """Return the caller-authorized subset of Responses API tool definitions.
+
+    ``None`` preserves existing reactive behavior.  Autonomous execution passes an
+    explicit set derived from the roadmap authorization level, so a prompt cannot
+    grant itself a tool merely by asking for one.
+    """
+    if allowed_tool_names is None:
+        return tools
+    allowed = {str(name) for name in allowed_tool_names}
+    return [tool for tool in tools if tool.get("name") in allowed]
+
+
+def ask_ai(
+    prompt,
+    record_history=True,
+    model=None,
+    allowed_tool_names=None,
+    include_memories=True,
+):
+    augmented_prompt = (
+        build_augmented_prompt(prompt)
+        if include_memories
+        else f"Current date and time: {_now_local().strftime('%Y-%m-%d %H:%M %Z')}\n\n{prompt}"
+    )
 
     if record_history:
         history = get_history()
@@ -775,7 +855,12 @@ def ask_ai(prompt, record_history=True):
         # history entry itself, using the user's verbatim message.
         input_items = [{"role": "user", "content": augmented_prompt}]
 
-    assistant_response = run_with_tools(ASSISTANT_INSTRUCTIONS, input_items, TOOLS, model=GENERAL_MODEL)
+    assistant_response = run_with_tools(
+        ASSISTANT_INSTRUCTIONS,
+        input_items,
+        _allowed_tools(TOOLS, allowed_tool_names),
+        model=model or GENERAL_MODEL,
+    )
 
     if record_history:
         get_history().append({
@@ -1058,7 +1143,7 @@ User question:
 
     print()
     print("AI response:")
-    print(answer)
+    print(autonomous_workflow.redact_secrets(str(answer)))
 
 
 def create_task(content):
@@ -1341,7 +1426,7 @@ User question:
 
     print()
     print("AI response:")
-    print(answer)
+    print(autonomous_workflow.redact_secrets(str(answer)))
 
 
 def store_memory(text, source="chat"):
@@ -2877,16 +2962,31 @@ def build_persona_instructions(profile):
     return profile["role"] + "\n" + profile["persona"]
 
 
-def ask_specialist(specialist_key, prompt, record_history=True):
+def ask_specialist(
+    specialist_key,
+    prompt,
+    record_history=True,
+    model=None,
+    allowed_tool_names=None,
+    include_memories=True,
+):
     profile = SPECIALISTS[specialist_key]
-    specialist_tools = [tool for tool in TOOLS if tool["name"] in profile["tool_names"]]
+    specialist_tools = _allowed_tools(
+        [tool for tool in TOOLS if tool["name"] in profile["tool_names"]],
+        allowed_tool_names,
+    )
 
-    augmented_prompt = build_augmented_prompt(prompt)
+    augmented_prompt = (
+        build_augmented_prompt(prompt)
+        if include_memories
+        else f"Current date and time: {_now_local().strftime('%Y-%m-%d %H:%M %Z')}\n\n{prompt}"
+    )
     input_items = [{"role": "user", "content": augmented_prompt}]
 
     answer = run_with_tools(
         build_persona_instructions(profile), input_items, specialist_tools,
-        max_iterations=profile.get("max_iterations", MAX_TOOL_ITERATIONS), model=profile["model"]
+        max_iterations=profile.get("max_iterations", MAX_TOOL_ITERATIONS),
+        model=model or profile["model"],
     )
 
     if record_history:
@@ -2905,7 +3005,7 @@ def ask_specialist(specialist_key, prompt, record_history=True):
 
     print()
     print(f"{profile['name']}:")
-    print(answer)
+    print(autonomous_workflow.redact_secrets(str(answer)))
 
     return answer
 
@@ -2928,7 +3028,7 @@ def ask_manager(prompt):
 
     print()
     print("Miles (Manager):")
-    print(answer)
+    print(autonomous_workflow.redact_secrets(str(answer)))
 
     return answer
 
@@ -3069,6 +3169,19 @@ NEXT_MOVE_FALLBACK = (
     "strongest audience. - Miles"
 )
 
+CREATIVE_AGENT_NAME = "Lumen"
+CREATIVE_IDEA_FIELDS = (
+    "idea",
+    "problem_addressed",
+    "expected_value",
+    "target_user",
+    "estimated_effort",
+    "estimated_ai_cost_usd",
+    "risks",
+    "relationship_to_current_goals",
+    "recommended_next_validation_step",
+)
+
 
 def recommend_next_move(pnl_summary):
     """Given the company's product P&L, have Miles recommend ONE concrete next move
@@ -3097,6 +3210,69 @@ def recommend_next_move(pnl_summary):
     except Exception as e:
         logger.error(f"recommend_next_move failed: {e}")
     return NEXT_MOVE_FALLBACK
+
+
+def generate_controlled_ideas(project_context, limit=1, model=None):
+    """Generate a small validation-only idea batch for an idle autonomous run.
+
+    This function deliberately has no tools and performs no action. The autonomous
+    workflow deduplicates and stores accepted records in its idea backlog; it never
+    turns them into executable roadmap work automatically.
+    """
+    limit = max(1, min(int(limit or 1), 3))
+    instructions = f"""You are {CREATIVE_AGENT_NAME}, a disciplined product-ideation
+specialist. Existing roadmap work always outranks speculation. Given the current project
+context, propose at most {limit} small, testable idea(s). Do not build, publish, send, or
+change anything. Prefer ideas related to current goals and inexpensive validation.
+
+Reply with ONLY a JSON object shaped as {{"ideas": [{{
+  "idea": "...",
+  "problem_addressed": "...",
+  "expected_value": "...",
+  "target_user": "...",
+  "estimated_effort": "small|medium|large",
+  "estimated_ai_cost_usd": 0.0,
+  "risks": "...",
+  "relationship_to_current_goals": "...",
+  "recommended_next_validation_step": "..."
+}}]}}. Be imaginative but disciplined. - {CREATIVE_AGENT_NAME}"""
+
+    try:
+        openai_client = get_openai_client()
+        response = call_with_retries(
+            lambda: openai_client.responses.create(
+                model=model or FAST_MODEL,
+                instructions=instructions,
+                input=[{"role": "user", "content": project_context}],
+            ),
+            label="Controlled ideation call",
+        )
+        _accrue_cost(model or FAST_MODEL, getattr(response, "usage", None))
+        raw = (response.output_text or "").strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError("controlled ideation returned no JSON object")
+        payload = json.loads(raw[start:end + 1])
+
+        ideas = []
+        for candidate in payload.get("ideas", [])[:limit]:
+            if not isinstance(candidate, dict):
+                continue
+            idea = {field: candidate.get(field, "") for field in CREATIVE_IDEA_FIELDS}
+            idea["idea"] = str(idea["idea"] or "").strip()
+            if not idea["idea"]:
+                continue
+            try:
+                idea["estimated_ai_cost_usd"] = max(
+                    0.0, round(float(idea["estimated_ai_cost_usd"] or 0.0), 6)
+                )
+            except (TypeError, ValueError):
+                idea["estimated_ai_cost_usd"] = 0.0
+            ideas.append(idea)
+        return ideas
+    except Exception as e:
+        logger.error(f"Controlled ideation failed: {e}")
+        return []
 
 
 def handle_command(user_prompt):

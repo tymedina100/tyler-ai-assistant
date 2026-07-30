@@ -10,9 +10,13 @@ The assistant's V1 exists to help Tyler act, not to collect infinite agents. The
 2. **Job search support through Career Ops / approval-based workflows.** Help with resume/cover-letter/application/recruiter workflows, but keep external-facing actions approval-gated.
 3. **Calendar, tasks, and routine support only where it helps Tyler act.** Use Calendar, Todoist, reminders, and briefings to reduce friction around execution, not to become a general life dashboard.
 
-Everything else in this repo — extra specialist agents, Telegram modes, Company Mode, GitHub/Google/Gumroad helpers, product workflows, and other experiments — is **later** unless Tyler uses it weekly or it directly supports one of the three workflows above.
+These workflows remain the default product priorities. The Telegram specialists,
+Company Mode, and autonomous daily-run control plane are execution systems for those
+priorities; they are no longer merely "later" experiments.
 
-The assistant is **not** trying to become a do-everything autonomous company, app platform, or agent marketplace right now. Boring focus. Radical concept.
+The aim is a bounded, owner-directed AI team, not an uncontrolled do-everything agent
+platform. Roadmap priority, budget, authorization ceilings, review limits, and human
+approval gates determine what may run.
 
 ## Features
 
@@ -34,7 +38,7 @@ The assistant is **not** trying to become a do-everything autonomous company, ap
 - `/remember <fact>` command to explicitly save something to long-term memory
 - `/recall <query>` command to see what long-term memory has stored about a topic
 - `/brief <notes>` command to turn your context into a focused plan for the day
-- Nine specialist agents, each a named character with a real job title, its own
+- Specialist agents, each a named character with a real job title, its own
   personality, and curated tool access, including real external connectors (Todoist,
   OpenWeatherMap, Google, Gumroad) — see "Specialist agents" and "Meet the team" below
 - Cost-aware model tiering: a cheaper/faster model handles routing and simple lookups
@@ -54,6 +58,9 @@ The assistant is **not** trying to become a do-everything autonomous company, ap
   auto-routed to the best-fit teammate(s) (no Manager gatekeeping), and you can also
   message any agent privately 1:1, including DMing Miles to dispatch the team — see
   "Running the multi-bot group interface" below
+- An opt-in autonomous weekday run that selects one actionable roadmap item, routes it
+  to a budget-appropriate model, reuses Company Mode for execution/review, and writes a
+  structured audit report — disabled and dry-run-only by default
 
 ## Setup
 
@@ -86,6 +93,7 @@ You can use `.env.example` as a checklist for the available keys.
 
 ```
 OPENAI_API_KEY=your-openai-key-here
+DATA_DIR=
 TAVILY_API_KEY=your-tavily-key-here
 TELEGRAM_BOT_TOKEN=your-telegram-bot-token-here
 TELEGRAM_ALLOWED_USER_IDS=your-telegram-user-id-here
@@ -156,7 +164,7 @@ the safety "hardening" helpers, and a roster-consistency check that catches misw
 agents). Run it from the project root:
 
 ```powershell
-python -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 The tests stub out the external services (OpenAI, Chroma, Tavily, etc.), so they run
@@ -337,25 +345,26 @@ for Miles / Robin) in `main.py`. The character names live in `main.py` only; the
 Telegram group (`group_bot.py`) derives its labels and welcome messages from there, so
 a name never drifts between interfaces.
 
-## Cost: two model tiers
+## Cost: catalog-backed model routing
 
-Not every request needs the most powerful (most expensive) model, so agents run on one
-of two tiers instead of one model for everything:
+Reactive chat keeps two persona defaults: `PREMIUM_MODEL` for reasoning-heavy agents and
+`FAST_MODEL` for routing and routine connector work. Their defaults now come from
+[`config/model-catalog.json`](config/model-catalog.json); `OPENAI_PREMIUM_MODEL` and
+`OPENAI_FAST_MODEL` can override the reactive aliases.
 
-- **`PREMIUM_MODEL`** — used where real reasoning matters: **Patch** (engineering),
-  **Scout** (research), **Quill** (writing), **Sway** (marketing), **Vera** (editorial
-  review), and **Robin** (the catch-all general assistant).
-- **`FAST_MODEL`** — a cheaper, faster model for work that's mostly routing or a thin
-  wrapper over an API result: **Miles** (the Manager's delegation decision is a
-  classification task), **Sage** (memory + Todoist ops), **Ledger** (reads the ledger
-  and P&L tools), **Cadence** (calendar/reminders/weather), and **Piper** (Gmail).
+Autonomous roadmap work is routed per task instead. `model_router.py` considers task
+type, complexity, risk, required capabilities, context size, remaining budget, and prior
+failures, then selects the lowest-cost enabled model likely to succeed. The chosen model
+and reason are stored in the run report. Set `MODEL_CATALOG_FILE` to use a different
+catalog snapshot.
 
-Both are constants at the top of `main.py`, and every call defaults to `PREMIUM_MODEL`,
-so nothing silently downgrades — a call is only cheap where the code deliberately passes
-`FAST_MODEL`. To retune, change which tier an agent uses via the `"model"` key on its
-`SPECIALISTS` entry (or the `model=` argument in `ask_manager` / `ask_ai`). **Confirm
-the exact cheaper model id available on your OpenAI account** before deploying — it's a
-single constant (`FAST_MODEL`) to update.
+Catalog capability claims, context limits, model availability, and prices are
+**operator-maintained configuration snapshots**. Cost figures are routing estimates,
+not guaranteed current OpenAI prices or a substitute for provider billing. The enabled
+snapshot (GPT-5.4 nano, GPT-5.4 mini, and GPT-5.6 Sol) and source URLs were refreshed on
+2026-07-27; still verify the catalog against the models and prices available to your
+account before enabling live autonomy. Unknown models use a conservative fallback for
+Company Mode metering instead of silently recording zero cost.
 
 Two related token-cost guards also live in `main.py`:
 - **History window (`MAX_HISTORY_MESSAGES`).** Plain chat resends recent conversation
@@ -480,11 +489,188 @@ team message you unprompted:
 - **Company Mode daily report.** At `DAILY_REPORT_TIME`, Miles posts a supervised
   startup-style report with the active project, open work, reserved/spent budget, and
   the next recommended move.
+- **Autonomous roadmap run.** When `AUTONOMY_ENABLED=true`, a separate weekday cron job
+  selects at most one actionable roadmap item and applies the configured budget and
+  authorization gates. Live runs post the final summary/escalations; scheduled dry-runs
+  write the audit report without sending Telegram.
 
-These only run in the group interface (that's where a persistent process lives); the CLI
-and single bot store reminders but don't fire them. Configure via `.env`:
+These scheduled jobs run only in the group interface (that's where a persistent process
+lives); the standalone autonomy CLI can still trigger a manual dry-run. The CLI and
+single bot store reminders but don't fire them. Configure the existing briefing/report
+jobs via `.env`:
 `HOME_LOCATION`, `BRIEFING_TIME` (e.g. `08:00`), `TIMEZONE` (e.g. `America/New_York`),
 `EVENT_ALERT_MINUTES` (e.g. `15`), and `DAILY_REPORT_TIME` (e.g. `18:00`).
+
+## Autonomous daily runs (safe vertical slice)
+
+The autonomous layer extends the current system rather than replacing it:
+
+1. `autonomous_workflow.py` loads structured project/roadmap state, claims a
+   cross-process file lock, and selects the highest-priority unblocked item whose
+   dependencies are complete.
+2. `model_router.py` chooses a configured capable model and records why.
+3. `autonomy_team.py` converts a selected item into one bounded worker task plus a
+   separately routed Vera acceptance-criteria review, while intersecting the agent's
+   normal tool set with the roadmap authorization level.
+4. A live run uses the existing Company Mode sequential runner, artifact handoff,
+   bounded revisions, budget ledger, and approval gates.
+5. The coordinator reconciles usage, updates state, writes a JSON run report, and posts
+   a concise Telegram summary or owner escalation.
+6. Only when no roadmap work is actionable may Lumen propose a limited, deduplicated
+   idea. It enters the backlog as `proposed`; it is not automatically built.
+
+### Safe setup and manual dry-run
+
+Defaults are deliberately inert: scheduling is disabled and execution is dry-run. Copy
+the autonomy block from `.env.example`, keep `AUTONOMY_ENABLED=false` and
+`AUTONOMY_DRY_RUN=true`, then exercise the local control plane without an OpenAI or
+connector call:
+
+```powershell
+$env:AUTONOMY_DATA_DIR = Join-Path $env:TEMP "ai-assistant-autonomy-dry-run"
+.\.venv\Scripts\python.exe .\autonomous_workflow.py --dry-run --json
+```
+
+The standalone command reads the current process environment rather than `.env`; the
+command above intentionally relies on conservative defaults. It writes only local audit
+state and a report below the temporary directory. It performs no paid model call,
+Telegram/connector call, code change, deploy, publish, delete, or other external action.
+
+Run the critical offline tests from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_autonomous_workflow.py" -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_autonomy_team.py" -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_group_autonomy.py" -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_model_router.py" -v
+```
+
+With the multi-bot group running, ask Miles for the current configuration/next item or
+trigger a dry-run. Both commands also work in a Miles DM:
+
+```text
+/autorun status
+/autorun dry-run
+```
+
+After reviewing dry-run selection, routing, budget, and authorization output, live mode
+requires deliberate configuration: set `AUTONOMY_ENABLED=true`, set
+`AUTONOMY_DRY_RUN=false`, and choose an appropriate
+`AUTONOMY_MAX_AUTHORIZATION`, then restart `group_bot.py`. `/autorun live` in the
+**group operating room**
+invokes the bounded Company Mode path; live starts are refused in DMs. It can spend API
+budget only within the configured authorization ceiling. This vertical slice
+auto-executes only `observe` and `propose`; `modify_local` and `external_action` stop for
+owner review because the existing Python/GitHub helpers are not a true isolated-local
+boundary. Existing `/confirm`, PR, deployment, publishing, email, and delete gates still
+apply. Do not grant broader permissions merely to suppress an escalation.
+
+A live run defers without competing for work when a supervised Company Mode plan is
+already running, another Company project remains open, Company Mode is paused, or a
+Telegram confirmation is already waiting for the owner.
+
+### Scheduler and configuration
+
+The autonomous job is registered only inside the long-running `group_bot.py` process.
+Development defaults are **08:00, Monday-Friday, America/Phoenix, $5/day**, with a
+**$0.25 emergency reserve**, one roadmap item, and at most one proposed idea per run.
+Use these canonical environment variables (the complete copy-ready block is in
+`.env.example`):
+
+| Variable | Default / purpose |
+| --- | --- |
+| `AUTONOMY_ENABLED` | `false`; no autonomous cron job is registered |
+| `AUTONOMY_DRY_RUN` | `true`; scheduled runs plan/report locally and send no Telegram message |
+| `AUTONOMY_SCHEDULE_TIME` | `08:00` |
+| `AUTONOMY_SCHEDULE_DAYS` | `mon-fri` (APScheduler weekday expression) |
+| `AUTONOMY_TIMEZONE` | `America/Phoenix` (IANA name) |
+| `BUDGET_TIMEZONE` | `America/Phoenix`; Company ledger day boundary, normally aligned with autonomy |
+| `AUTONOMY_DAILY_BUDGET_USD` | `5.00`; standalone/control-plane fallback ceiling |
+| `AUTONOMY_EMERGENCY_RESERVE_USD` | `0.25`; standalone/control-plane fallback reserve |
+| `AUTONOMY_COST_ESTIMATE_MULTIPLIER` | `4.0`; expands one-response estimates for bounded tool loops |
+| `AUTONOMY_MIN_TASK_RESERVATION_USD` | `0.05`; minimum live worker/reviewer reservation |
+| `AUTONOMY_MAX_IDEAS_PER_RUN` | `1`; set `0` to disable idle ideation |
+| `AUTONOMY_IDEA_BACKLOG_LIMIT` | `50` proposed ideas retained |
+| `AUTONOMY_MAX_EXECUTION_ATTEMPTS` | `2` roadmap-level failed attempts before owner escalation |
+| `AUTONOMY_TASK_TIMEOUT_SECONDS` | `900`; monitoring ceiling; late threads are awaited, charged, and not retried |
+| `AUTONOMY_STALE_RUN_MINUTES` | `180` before conservative stale-run recovery |
+| `AUTONOMY_MAX_AUTHORIZATION` | `propose`; one of `observe`, `propose`, `modify_local`, `external_action` |
+| `AUTONOMY_LOCK_TIMEOUT_SECONDS` | `0`; an overlap is skipped immediately |
+| `AUTONOMY_DATA_DIR` | optional autonomy-only state override; normally leave blank and use `DATA_DIR` |
+| `AUTONOMY_ROADMAP_FILE` | `config/autonomous-roadmap.json`; first-use seed |
+| `MODEL_CATALOG_FILE` | `config/model-catalog.json`; routing/pricing snapshot |
+
+In the Telegram runtime, the persisted Company Mode ledger is the authoritative budget
+source for routing and reports, including spend and reservations from other work. Use
+`/setbudget` to change its daily limit. `COMPANY_EMERGENCY_RESERVE_USD` seeds the reserve
+for new/legacy state; an existing `company_state.json` retains its stored value. Keep the
+`AUTONOMY_*` fallback values aligned if you also use the standalone CLI.
+
+`MAX_REVISION_ROUNDS` and `MAX_EXECUTION_ATTEMPTS` bound Company Mode's review and task
+loops. `MAX_TASK_RESULT_CHARS` defaults to `5000`, giving Vera a bounded but materially
+complete view of non-file worker output. Live worker/reviewer estimates and controlled idle ideation are reserved atomically
+before paid calls and then released or reconciled. `ADHOC_RESERVATION_USD` defaults to
+`0.10` when metered group work has no task-specific estimate. Concurrent reservations on
+one shared filesystem cannot each claim the same remaining dollars. If a metered caller
+is cancelled after its Python worker thread starts, the runner waits for that thread to
+finish before reconciling so provider spend cannot continue outside the ledger.
+
+### Roadmap, authorization, and reports
+
+[`config/autonomous-roadmap.json`](config/autonomous-roadmap.json) is safe example seed
+data. Each roadmap item carries priority, status, dependencies, blockers, mandatory acceptance
+criteria, agent owner, task type, complexity/risk, required capabilities, authorization,
+estimates, previous attempts/models, and any human decision required. On first use it is
+copied into `autonomy_state.json`; after that, the persistent state is the source of truth
+and later seed-file edits are not automatically merged.
+
+Miles owns selection. If a roadmap item uses `agent_owner: "manager"`, the bounded worker
+task is delegated to Robin's general worker path so execution, Telegram identity, and cost
+attribution do not falsely claim that the manager persona performed specialist work.
+
+Autonomy reports/state and Company Mode state redact secret-looking keys and embedded
+credential patterns before persistence; autonomous Telegram output and model answers
+printed by the core are redacted too. This remains a backstop, so roadmaps should contain
+references to credentials/access requirements, never the secret values themselves.
+
+Use `DATA_DIR` as the common persistent root. Autonomous state is stored in
+`autonomy_state.json`; reports are stored in `autonomous_runs/<run-id>.json`; the idea
+backlog and scheduled-date idempotency records live inside the state file. The persistent
+run lock prevents overlap for processes sharing that filesystem. A report records plan,
+tasks, agents, model decisions, tokens, estimated/actual-or-reconciled cost, review,
+retries, blockers, escalations, changed files, tests, artifacts, and final status. See
+[`docs/sample-autonomous-daily-run-report.json`](docs/sample-autonomous-daily-run-report.json)
+for an illustrative dry-run report with no secrets.
+
+If autonomy state is corrupt, the unreadable file is quarantined and
+`autonomy_state.json.recovery-required` keeps every later run blocked. Inspect the
+quarantined file, restore a verified `autonomy_state.json`, remove the recovery marker,
+and run `/autorun dry-run` before enabling live execution. The coordinator never silently
+reseeds while that marker exists.
+
+Live reports include nested worker/reviewer agents, models, and cost splits by project,
+task, agent, and model. The top-level route reason is in the run report; each nested
+Company Mode task retains its own `model_reason` in `company_state.json`. Scheduled live
+runs keep intermediate agent chatter quiet and send only actionable escalations plus the
+final summary.
+
+Authorization levels are ceilings, not grants: `observe` inspects, `propose` drafts,
+`modify_local` conceptually covers an isolated local/branch workspace, and
+`external_action` covers sending, deploying, merging, publishing, purchasing, deleting,
+or production mutation. The current runtime has no killable isolated checkout executor,
+so both `modify_local` and `external_action` remain human-gated even if the configured
+ceiling is raised. Raising the ceiling never adds tools or bypasses confirmation.
+
+Current limitations: runs are sequential and select one roadmap item; the JSON/file-lock
+design assumes every replica shares one mounted filesystem; pending Telegram
+confirmations remain process-memory state; exact provider billing is unavailable when a
+response lacks usage and is then conservatively charged at the held estimate; the task
+time ceiling prevents another attempt but cannot preempt a Python thread, so the runner
+waits for it to finish and reconcile; modify-local automation awaits an isolated executor;
+owner resolution does not yet have a dedicated `/autorun resolve|retry|skip` command;
+model prices/availability are configuration snapshots; and live Telegram, OpenAI,
+Railway-volume, Docker, and external-connector behavior still require credentialed smoke
+tests.
 
 ## Company Mode (Telegram Startup OS)
 
@@ -526,23 +712,29 @@ Commands in the group:
 (`/approve`, `/cancel`, `/setbudget`, `/assign`, and pause/resume are group-only — the
 Miles DM is read-only for `/company`, `/status`, `/dailyreport`.)
 
-### Metered budget + hard cap (the financial brake)
+### Metered budget + reservation guardrail (the financial brake)
 
-Every model call is now priced against `MODEL_PRICING` in `main.py` (input/output rate
-per 1,000 tokens) and the **actual** spend is added to today's ledger — not a flat
-estimate. This covers both autonomous execution and ordinary delegated chat in the
-group. **Confirm the real prices for your account** in `MODEL_PRICING` before trusting
-the numbers; an unknown model falls back to a default rate and logs a warning so cost is
-never silently `$0`.
+Every metered group/Company model call is priced from the operator-maintained snapshot in
+`config/model-catalog.json`. When the API returns usage, input, cached-input, and output
+tokens are reconciled into today's ledger; otherwise the record is explicitly labeled
+estimated at the held reservation. This covers Company Mode execution, controlled
+ideation, publish/launch preparation, planning/routing fallbacks, and ordinary delegated
+chat in the group.
+Confirm the catalog against your account before trusting it as a forecast; an unknown
+model uses a conservative fallback and logs a warning rather than silently costing `$0`.
 
 A fresh deploy starts on a **$5/day budget** by default (`DEFAULT_DAILY_BUDGET_USD` in
-`company_mode.py`); change it live any time with `/setbudget <amount>`. If you're running
-a persisted `company_state.json` from before v2, run `/setbudget 5` once to adopt it.
+`company_mode.py`); change it live any time with `/setbudget <amount>`. Ordinary work
+also preserves a **$0.25 emergency reserve** by default, configurable through
+`COMPANY_EMERGENCY_RESERVE_USD`. If you're running a persisted `company_state.json` from
+before v2, run `/setbudget 5` once to adopt the budget.
 
-The engine enforces the cap **between tasks**: if the day's budget is exhausted it stops
-and defers the rest. Because the check is at task boundaries, a single task can overshoot
-the remaining budget by at most its own cost (itself bounded by the tool-call cap) — keep
-per-day budgets modest and raise them as a product proves out.
+The engine atomically reserves estimated cost before work, so concurrent workers sharing
+the same `DATA_DIR` cannot independently spend the same available balance. Completion
+releases the hold and records actual cost when usage exists, or a labeled estimate when
+it does not. Work that cannot reserve its estimate is deferred. A provider call can
+still cost more than its estimate, so this is an application guardrail rather than a
+guaranteed provider-side billing cap; keep limits modest and monitor real billing.
 
 ### Publishing a product (`/publish`, assisted)
 
@@ -552,9 +744,8 @@ the project's finished deliverable into a clean **buyer-download file** and a
 **paste-ready Gumroad listing** (name, price, description, tags, cover idea), then
 **stages a gated approval**. Reply `/confirm` to mark the project published and get the
 exact Gumroad go-live steps. The one thing that stays yours is the final upload click —
-which is the right control for an irreversible, money-adjacent action anyway. (True
-end-to-end auto-publishing would require browser automation or a platform like Stripe
-whose API can create products; revenue tracking is planned for v3.)
+which is the right control for an irreversible, money-adjacent action anyway. True
+end-to-end auto-publishing would require a separately approved browser/API workflow.
 
 ### Revenue tracking (the money loop)
 
@@ -571,7 +762,7 @@ budget today?" or "which product is actually profitable?" in the group or a DM.
 
 ### What stays supervised
 
-During autonomous execution, *produce* actions (writing a file, saving a file or opening
+During owner-approved Company Mode execution, *produce* actions (writing a file, saving a file or opening
 a PR on GitHub) run without a prompt — they're the deliverables. *Irreversible* actions
 (**sending email, deleting a file**, and by policy publishing/deploying/paid spend/
 new-agent creation) still stage behind `/confirm`: the task is marked **blocked** and the
@@ -579,10 +770,9 @@ engine stops so you can approve it (the `/confirm` prompt shows which project/ta
 for). Reply `/confirm` in the group, then `/approve` again to continue the plan.
 
 Only agents listed in `BOT_KEYS` speak as themselves; other specialists still contribute
-through Miles-labeled delegation.
-
-> Revenue/product-selling (tracking launches and money earned) is intentionally **not**
-> in v2 — it's planned for v3, once the pipeline reliably produces budgeted deliverables.
+through Miles-labeled delegation. Revenue tracking is implemented through `/link`,
+`/products`, and the read-only `/revenue` Gumroad sync; product creation/upload remains a
+human dashboard step.
 
 ## Google setup (Calendar & Gmail)
 
@@ -699,19 +889,17 @@ docs rather than trusting specifics here. Whichever you pick, you'll need to:
    environment variables/secrets on the platform (never commit `.env`). Add
    `TAVILY_API_KEY`, `OPENWEATHER_API_KEY`, and `TODOIST_API_TOKEN` only if you want
    web search, weather, or Todoist tasks in that deployment.
-2. **Mount a persistent volume at `/app/memory_db`** if you want long-term memory to
-   survive restarts and redeploys. A plain container's filesystem is wiped every time
-   it restarts — without a volume, the assistant's memory resets on every deploy,
-   which defeats the point of Week 3. This is the one piece that genuinely needs your
-   attention; everything else in the Dockerfile works without it, just without
-   persistence.
+2. **Mount a persistent volume at `/app/data` and set `DATA_DIR=/app/data`** if you
+   want memory and other state to survive restarts and redeploys. A plain container's
+   filesystem is wiped every time it restarts. If `DATA_DIR` is unset, Railway's
+   `RAILWAY_VOLUME_MOUNT_PATH` is used when available, then the project directory.
 
 ## Running the multi-bot group interface (group_bot.py)
 
 `group_bot.py` is a third entry point (alongside `main.py` and `bot.py`): each agent
 (Manager + specialists) is its own real Telegram bot, all members of one shared group
-chat with you. Same underlying AI logic as everywhere else, reused without
-duplication — this file is purely the "who's listening, who replies as whom" layer.
+chat with you. It reuses the agent logic in `main.py` and owns the long-running Telegram,
+Company Mode, scheduler/autonomy, and optional Office API runtime coordination.
 
 **Setup, per agent you want in the group:**
 
@@ -736,6 +924,12 @@ duplication — this file is purely the "who's listening, who replies as whom" l
    TELEGRAM_MARKETING_BOT_TOKEN=...
    TELEGRAM_EDITOR_BOT_TOKEN=...
    TELEGRAM_FINANCE_BOT_TOKEN=...
+   TELEGRAM_CALENDAR_BOT_TOKEN=...
+   TELEGRAM_GMAIL_BOT_TOKEN=...
+   TELEGRAM_LINEAR_BOT_TOKEN=...
+   TELEGRAM_GENERAL_BOT_TOKEN=...
+   TELEGRAM_SALES_BOT_TOKEN=...
+   TELEGRAM_ANALYTICS_BOT_TOKEN=...
    TELEGRAM_GROUP_CHAT_ID=...
    ```
    `TELEGRAM_GROUP_CHAT_ID` only needs setting once — send any message in the group,
@@ -749,10 +943,10 @@ duplication — this file is purely the "who's listening, who replies as whom" l
    into the matching new var (news → marketing, weather → editor, tasks → finance)
    and delete the old var. On a deployed instance, make the same env-var swap on
    the platform and redeploy.
-5. In `group_bot.py`, add the agent's key to `BOT_KEYS` (near the top of the file) —
-   this is how you control which agents are actually active without needing every
-   bot created before anything works. Start small (e.g. just Manager + one
-   specialist) and expand as you create more bots.
+5. The core roster is listed in `BOT_KEYS`. Optional Linear, Calendar, Gmail, Robin,
+   Sales, and Analytics bots are added automatically when their matching token is set;
+   they remain available through Miles even without a dedicated bot. Adding an entirely
+   new code-defined agent still requires a roster entry plus its token, then a redeploy.
 
 **Optional: give every bot its own profile picture.**
 
@@ -885,17 +1079,20 @@ that browser's local storage; the state API itself stays token-protected. Add
 **Deploying it:**
 
 `Dockerfile.group` containerizes `group_bot.py` (separate from `Dockerfile`, which
-still builds `bot.py` if you'd rather deploy the simpler single-bot interface
-instead):
+still builds `bot.py` if you'd rather deploy the simpler single-bot interface). The
+group process polls Telegram and runs APScheduler; when `OFFICE_API_TOKEN` is set, that
+same worker also binds `$PORT` and serves the authenticated Virtual Office API/pages:
 
 ```powershell
 docker build -f Dockerfile.group -t ai-assistant-group-bot .
 docker run --env-file .env ai-assistant-group-bot
 ```
 
-Not build-tested in this environment (no Docker available here) — verify it builds
-and runs for you first. Same deployment shape as `bot.py`: a **background worker**
-(not a web service, since it doesn't listen on a port).
+Not build-tested in this environment (no Docker available here) — verify it builds and
+runs for you first. Without `OFFICE_API_TOKEN`, it can run as a background worker. With
+the Office API enabled, deploy it as a long-running service that supports both Telegram
+polling and inbound HTTP, and assign a public domain if the desktop/browser office needs
+remote access.
 
 **Persistence — mount ONE volume and set `DATA_DIR`.** A plain container's filesystem
 is wiped on every redeploy, so long-term memory, pending reminders, Company Mode state,
@@ -905,16 +1102,18 @@ var and writes all of that under it:
 1. On Railway (or your platform), **attach a volume** with mount path `/app/data`.
 2. Set the env var **`DATA_DIR=/app/data`**.
 
-That's it — `memory_db/`, `reminders.json`, `company_state.json`, `office_state.json`, and `token.json` now
-live on the volume and survive redeploys. Without `DATA_DIR`, everything defaults to the
-project directory (fine locally, ephemeral in a container). Then set the
+That's it — `memory_db/`, `reminders.json`, `company_state.json`, `office_state.json`,
+`active_project.json`, `autonomy_state.json`, `autonomous_runs/`, and `token.json` now
+live on the volume and survive redeploys. `projects.json` in `DATA_DIR` may override the
+bundled project registry. Without `DATA_DIR`, the app falls back to
+`RAILWAY_VOLUME_MOUNT_PATH` when Railway provides it, then the project directory (fine
+locally, ephemeral in a plain container). Then set the
 required group tokens you're using (`TELEGRAM_MANAGER_BOT_TOKEN`,
 `TELEGRAM_GROUP_CHAT_ID`, etc.) plus `OPENAI_API_KEY`. Add
 `TAVILY_API_KEY`/`OPENWEATHER_API_KEY`/`TODOIST_API_TOKEN` only for web search,
 weather, or Todoist, and keep `HOME_LOCATION`/`BRIEFING_TIME`/`DAILY_REPORT_TIME`/
 `TIMEZONE`/`EVENT_ALERT_MINUTES` as optional scheduling configuration.
 
-**One thing to remember:** `BOT_KEYS` in `group_bot.py` controls which agents are
-active. Whenever you create a new bot and want to add it to a *deployed* instance,
-you need to both add its token as a secret on the platform *and* add its key to
-`BOT_KEYS`, then redeploy — the two changes go together.
+**One thing to remember:** the core `BOT_KEYS` roster is code-defined. Optional bot keys
+already listed in `OPTIONAL_BOT_KEYS` activate when their token secret is present. A
+brand-new agent requires both a code roster entry and a token before redeploying.

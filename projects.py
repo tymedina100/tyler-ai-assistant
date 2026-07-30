@@ -10,6 +10,7 @@ The active selection is persisted to active_project.json in DATA_DIR (same
 pattern as company_state.json) so it survives a restart of the long-running
 Telegram process.
 """
+import contextvars
 import json
 import os
 from pathlib import Path
@@ -18,12 +19,18 @@ import github_helpers
 
 
 BASE_DIR = Path(__file__).parent
+_SCOPED_PROJECT_KEY = contextvars.ContextVar("scoped_project_key", default=None)
 
 
 def _data_dir():
     """Directory for persistent state. Set DATA_DIR (e.g. a mounted volume on
-    Railway) so the active-project choice survives redeploys."""
-    return Path(os.environ.get("DATA_DIR") or BASE_DIR)
+    Railway) so the active-project choice survives redeploys. Honor Railway's
+    mounted-volume hint too, matching Company Mode and Google state."""
+    return Path(
+        os.environ.get("DATA_DIR")
+        or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+        or BASE_DIR
+    )
 
 
 def _registry_path():
@@ -128,12 +135,41 @@ def get_active_project():
     Re-applies the persisted selection to github_helpers so a fresh process
     (which lost the in-memory override on restart) targets the right repo.
     """
-    key = _read_active_key()
+    scoped_key = _SCOPED_PROJECT_KEY.get()
+    key = scoped_key or _read_active_key()
     if not key:
         return None, None
-    if github_helpers.active_code_repo() is None:
+    if not scoped_key and github_helpers.active_code_repo() is None:
         _apply_to_github(key)
     return key, get_project(key)
+
+
+def begin_scoped_project(key):
+    """Select a project only for this execution context.
+
+    Returns ``(profile, error, token_pair)``.  The caller must pass the token pair
+    to :func:`end_scoped_project` in ``finally``.  Unlike ``set_active_project``,
+    this never rewrites the user's persisted project selection.
+    """
+    profile = get_project(key)
+    if profile is None:
+        known = ", ".join(k for k, _ in list_projects()) or "(none configured)"
+        return None, f"Unknown project '{key}'. Known projects: {known}.", None
+    if not profile.get("repo"):
+        return None, f"Project '{key}' has no repo configured in projects.json.", None
+    project_token = _SCOPED_PROJECT_KEY.set(key)
+    code_token = github_helpers.set_scoped_code_repo(
+        profile["repo"], profile.get("default_branch", "main")
+    )
+    return profile, None, (project_token, code_token)
+
+
+def end_scoped_project(tokens):
+    if not tokens:
+        return
+    project_token, code_token = tokens
+    github_helpers.reset_scoped_code_repo(code_token)
+    _SCOPED_PROJECT_KEY.reset(project_token)
 
 
 def set_active_project(key):

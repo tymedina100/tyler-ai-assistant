@@ -30,6 +30,12 @@ Add a project by adding another key. To override the bundled registry on a cloud
 deploy, drop a `projects.json` into your `DATA_DIR` — it's preferred over the
 bundled one.
 
+For any long-running deployment, point `DATA_DIR` at one shared mounted volume (for
+example `/app/data`). Project selection, Company Mode, autonomous roadmap state, run
+reports, reminders, memory, and Office state then survive redeploys together. When
+`DATA_DIR` is unset, the code uses Railway's `RAILWAY_VOLUME_MOUNT_PATH` when available,
+then the repository directory.
+
 Worthlane uses the `vantage` project key and intentionally targets the
 `tymedina100/vantage` GitHub repo. Local folder names may differ and should not
 be treated as the canonical repo name.
@@ -145,9 +151,11 @@ These generate structured plans; they don't create anything by themselves.
 
 ## 6b. Company Mode + Linear (the tracker for the autonomous company)
 
-Company Mode is the autonomous engine: `/assign <goal>` plans a project + tasks and
-reserves budget, `/approve` runs it (research → build → write → editor review),
-metering spend as it goes. When `LINEAR_API_KEY` is set, **Company Mode mirrors that
+Company Mode is the supervised execution engine: `/assign <goal>` plans a project +
+tasks and reserves budget, `/approve` runs it (research → build → write → editor
+review), metering spend as it goes. The autonomous daily-run control plane described
+below can invoke this same bounded engine for an approved roadmap item. When
+`LINEAR_API_KEY` is set, **Company Mode mirrors that
 work into Linear automatically** so Linear is your live board for the company:
 
 - **At `/approve`** (not `/assign` — a proposal you can still `/cancel` never touches
@@ -207,7 +215,120 @@ supervised Company Mode project:
 - Same budget + `/approve` gate as any Company Mode project. `/cancel` before approving
   touches nothing.
 
-## 6c. Deploying a site live (Vercel)
+## 6c. Autonomous roadmap selection
+
+The repository now has two complementary project representations:
+
+- `projects.json` maps a short project key to its GitHub repo, default branch, Linear
+  project, and common commands.
+- `config/autonomous-roadmap.json` seeds goals and actionable roadmap items for the
+  daily coordinator. It is structured work state, not a large manager prompt.
+
+The included seed is deliberately illustrative. A roadmap item uses fields such as:
+
+```json
+{
+  "id": "AUTO-EXAMPLE-001",
+  "goal_id": "assistant-autonomy",
+  "title": "Validate the autonomous daily-run configuration",
+  "priority": 100,
+  "status": "ready",
+  "dependencies": [],
+  "blockers": [],
+  "acceptance_criteria": [
+    "The schedule, timezone, and dry-run setting are reported.",
+    "No external or destructive action is performed."
+  ],
+  "agent_owner": "manager",
+  "task_type": "status_update",
+  "complexity": "lightweight",
+  "risk": "low",
+  "required_capabilities": ["text"],
+  "authorization_level": "observe",
+  "estimated_input_tokens": 1200,
+  "estimated_output_tokens": 300,
+  "previous_attempts": [],
+  "previous_models": [],
+  "human_decision_required": false,
+  "human_action": ""
+}
+```
+
+The coordinator ignores paused/completed projects, blocked or human-decision items, and
+items whose dependencies are not complete. Among the remaining `ready`, `planned`,
+`pending`, `todo`, `deferred`, or `retry` items, higher item priority wins, followed by
+project priority and stable source order.
+
+On first use, the seed becomes `DATA_DIR/autonomy_state.json`. That persistent file then
+owns item status, attempts, previous models, idea backlog, budget tracking, active-run
+claim, scheduled-date idempotency, and recent runs; later edits to the seed are not
+automatically merged. Each run report is written to
+`DATA_DIR/autonomous_runs/<run-id>.json`.
+
+Put credential names or required-access notes in blockers, never credential values.
+State/report persistence applies secret-pattern redaction, but redaction is a backstop,
+not a reason to store private data in the roadmap.
+
+Safe local inspection from PowerShell:
+
+```powershell
+$env:AUTONOMY_DATA_DIR = Join-Path $env:TEMP "ai-assistant-autonomy-dry-run"
+.\.venv\Scripts\python.exe .\autonomous_workflow.py --dry-run --json
+```
+
+Safe Telegram inspection while `group_bot.py` is running:
+
+```text
+/autorun status
+/autorun dry-run
+```
+
+Status and dry-run work in the group or a Miles DM. `/autorun live` is group-only.
+
+Scheduling is disabled by default. `AUTONOMY_ENABLED=true` registers the weekday job;
+`AUTONOMY_DRY_RUN=true` keeps scheduled runs audit-only and sends no Telegram message.
+The defaults are `08:00`,
+`mon-fri`, `America/Phoenix`, a `$5.00` daily ceiling, and a `$0.25` emergency reserve.
+Set `AUTONOMY_DRY_RUN=false` only after reviewing dry-run reports, then restart the group
+worker; `/autorun live` uses the existing sequential Company Mode execution/review path.
+It defers if Company Mode is paused, a supervised/open Company project exists, or an
+owner confirmation is pending. In the Telegram
+runtime, the persisted Company Mode ledger (`/setbudget`) is authoritative for routing
+and reports; the `AUTONOMY_*` budget values are the standalone/control-plane fallback.
+
+`AUTONOMY_MAX_AUTHORIZATION` defaults to `propose`. Items may request `observe`,
+`propose`, `modify_local`, or `external_action`; a request above the ceiling stops in
+`needs_human`. This slice auto-executes only observe/propose. `modify_local` also stops
+for the owner because the current Python and GitHub helpers are network/remote-capable,
+not an isolated checkout boundary. The ceiling does not bypass the existing PR,
+`/confirm`, send, deploy, publish, delete, or production gates. `external_action`
+remains human-only. A no-roadmap-work run may propose a bounded, deduplicated idea into
+`idea_backlog`; it never starts building the idea and defers before routing if supervised
+work or a confirmation is open.
+
+Model selection comes from `config/model-catalog.json` or `MODEL_CATALOG_FILE`. Prices,
+capabilities, availability, and context limits are operator-maintained snapshots used
+for estimates; enabled prices and source URLs were refreshed from official OpenAI model
+pages on 2026-07-27. Live Company Mode worker/reviewer and idle-ideation reservations are
+atomic on the shared filesystem and reconciled from API usage where available; missing
+exact usage is labeled estimated. `AUTONOMY_COST_ESTIMATE_MULTIPLIER` and
+`AUTONOMY_MIN_TASK_RESERVATION_USD` conservatively expand a one-response route estimate
+for bounded tool loops. `BUDGET_TIMEZONE` controls the shared ledger date. A task beyond
+`AUTONOMY_TASK_TIMEOUT_SECONDS` is awaited and charged but receives no retry; the limit
+does not kill a Python thread. See the full environment variable table in
+[README.md](README.md) and the illustrative report at
+[`docs/sample-autonomous-daily-run-report.json`](docs/sample-autonomous-daily-run-report.json).
+
+Current scope is intentionally narrow: one sequential roadmap item per run, one shared
+filesystem rather than distributed locking, and no claim that live Telegram/OpenAI/
+Railway/Docker integrations are verified until credentialed smoke tests are run.
+
+Live reports attribute the nested worker/reviewer models and costs by project, task,
+agent, and model. Their task-level `model_reason` values remain in `company_state.json`;
+the coordinator route reason is copied into the run report. Intermediate autonomous
+agent chatter is suppressed, leaving final summaries and actionable escalations.
+
+## 6d. Deploying a site live (Vercel)
 
 Patch and Sway can put a landing page live with the `deploy_site` tool (Vercel).
 
@@ -236,7 +357,7 @@ Example — the full loop, live:
 /confirm                   # goes live on the real domain
 ```
 
-## 6d. Railway infrastructure (`railway_*`)
+## 6e. Railway infrastructure (`railway_*`)
 
 Patch can inspect (and, with `/confirm`, change) the backend on Railway — so a
 "verify the Railway release config" task is actually verifiable instead of blocked.
