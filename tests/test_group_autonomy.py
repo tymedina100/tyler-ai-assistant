@@ -123,6 +123,46 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(waiting["model_invoked"])
         load_state.assert_not_called()
 
+    async def test_persisted_open_project_deferral_has_owner_recovery_action(self):
+        state = {
+            "company": {"mode": "running"},
+            "projects": [{"id": "proj_stale", "status": "active"}],
+        }
+        with patch.object(self.group, "company_runner_task", None), patch.object(
+            self.group.main, "pending_actions", {"group": None}
+        ), patch.object(self.group.company_mode, "load_state", return_value=state):
+            result = await self.group._autonomy_runtime_deferral()
+
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["failure_classification"], "decision_required")
+        self.assertIn("proj_stale", result["reason"])
+        self.assertIn("/company", result["human_action"])
+        self.assertIn("/approve", result["human_action"])
+        self.assertIn("/cancel proj_stale", result["human_action"])
+        self.assertIn("/autorun live", result["human_action"])
+        self.assertTrue(result["attempted"])
+        self.assertEqual(result["actual_cost_usd"], 0.0)
+        self.assertFalse(result["model_invoked"])
+
+    async def test_group_cancel_passes_explicit_project_id(self):
+        update = types.SimpleNamespace(
+            message=types.SimpleNamespace(text="/cancel proj_stale", reply_text=AsyncMock())
+        )
+        usernames = {key: f"{key}_bot" for key in self.group.BOT_KEYS}
+        with patch.object(self.group, "bot_usernames", usernames), patch.object(
+            self.group, "_handle_pending_confirmation", new=AsyncMock(return_value=False)
+        ), patch.object(self.group, "_cancel_running_plan") as cancel_runner, patch.object(
+            self.group.company_mode, "cancel_project", return_value="Cancelled."
+        ) as cancel_project, patch.object(self.group, "reply_chunks", new=AsyncMock()) as reply:
+            await self.group.handle_group_message(update)
+
+        cancel_runner.assert_called_once_with()
+        cancel_project.assert_called_once_with(
+            self.group.company_mode.COMPANY_STATE_FILE,
+            "proj_stale",
+        )
+        reply.assert_awaited_once_with(update.message, "Cancelled.")
+
     async def test_budget_approved_worker_and_reviewer_complete_the_autonomous_item(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "company.json"
