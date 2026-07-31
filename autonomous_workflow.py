@@ -33,6 +33,28 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_RESULT_PREVIEW_CHARS = 360
 TERMINAL_TASK_STATUSES = {"complete", "completed", "done", "approved", "shipped"}
 ACTIONABLE_TASK_STATUSES = {"planned", "ready", "pending", "todo", "deferred", "retry"}
+RETRYABLE_HUMAN_STATUSES = {"blocked", "needs_human"}
+RETRY_BLOCKED_PROJECT_STATUSES = {
+    "paused",
+    "archived",
+    "cancelled",
+    "complete",
+    "completed",
+}
+HUMAN_RESOLUTION_HISTORY_LIMIT = 50
+RETRY_RESET_FIELDS = {
+    "blocked_reason",
+    "blocker",
+    "blocking_reason",
+    "error",
+    "failure",
+    "failure_classification",
+    "failure_reason",
+    "last_error",
+    "last_failure",
+    "needs_human_reason",
+    "terminal_reason",
+}
 
 
 class AuthorizationLevel(str, Enum):
@@ -234,6 +256,10 @@ class CorruptAutonomyStateError(RuntimeError):
         self.recovery_path = recovery_path
 
 
+class RoadmapItemRetryError(ValueError):
+    """Raised when a persisted roadmap item cannot be safely reset for retry."""
+
+
 _SECRET_KEY_RE = re.compile(
     r"(?i)^(?:(?:[a-z0-9]+[_-])*(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|bot[_-]?token|password|secret|client[_-]?secret|private[_-]?key|database[_-]?url)|authorization|cookie|credential)$"
 )
@@ -364,6 +390,7 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
             item.setdefault("agent_owner", "manager")
             item.setdefault("previous_attempts", [])
             item.setdefault("previous_models", [])
+            item.setdefault("human_resolution_history", [])
             item.setdefault("human_decision_required", False)
             item.setdefault("human_action", "")
             item.setdefault("authorization_level", AuthorizationLevel.PROPOSE.value)
@@ -373,9 +400,13 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
                 "acceptance_criteria",
                 "previous_attempts",
                 "previous_models",
+                "human_resolution_history",
             ):
                 if not isinstance(item[field], list):
                     raise ValueError(f"Roadmap item {field} must be a list")
+            item["human_resolution_history"] = item["human_resolution_history"][
+                -HUMAN_RESOLUTION_HISTORY_LIMIT:
+            ]
     return state
 
 
@@ -422,25 +453,30 @@ class AutonomyStateStore:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return self.recovery_path
 
+    def _load_unlocked(self) -> dict[str, Any]:
+        """Load normalized state while the caller holds ``self.lock``."""
+
+        pending_recovery = self._pending_recovery()
+        if pending_recovery is not None:
+            raise CorruptAutonomyStateError(
+                self.path, pending_recovery, self.recovery_path
+            )
+        if not self.path.exists():
+            seeded = self._read_seed()
+            _atomic_write_json(self.path, seeded)
+            return deepcopy(seeded)
+        try:
+            with self.path.open("r", encoding="utf-8") as stream:
+                return _normalize_state(json.load(stream))
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError) as exc:
+            quarantine = self._quarantine()
+            raise CorruptAutonomyStateError(
+                self.path, quarantine, self.recovery_path
+            ) from exc
+
     def load(self) -> dict[str, Any]:
         with self.lock:
-            pending_recovery = self._pending_recovery()
-            if pending_recovery is not None:
-                raise CorruptAutonomyStateError(
-                    self.path, pending_recovery, self.recovery_path
-                )
-            if not self.path.exists():
-                seeded = self._read_seed()
-                _atomic_write_json(self.path, seeded)
-                return deepcopy(seeded)
-            try:
-                with self.path.open("r", encoding="utf-8") as stream:
-                    return _normalize_state(json.load(stream))
-            except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError) as exc:
-                quarantine = self._quarantine()
-                raise CorruptAutonomyStateError(
-                    self.path, quarantine, self.recovery_path
-                ) from exc
+            return self._load_unlocked()
 
     def save(self, state: Mapping[str, Any]) -> None:
         normalized = _normalize_state(dict(state))
@@ -451,6 +487,97 @@ class AutonomyStateStore:
                     self.path, pending_recovery, self.recovery_path
                 )
             _atomic_write_json(self.path, normalized)
+
+    def _reset_item_for_retry(self, item_id: str, *, reset_at: datetime) -> str:
+        """Atomically reset one unambiguous human-blocked item to ``ready``.
+
+        The workflow-level caller also holds the autonomous run lock.  Checking the
+        persisted run claim here closes the crash/restart gap without weakening the
+        existing state-file locking boundary.
+        """
+
+        target_id = str(item_id or "").strip()
+        if not target_id:
+            raise RoadmapItemRetryError("A non-empty roadmap item ID is required for retry.")
+
+        with self.lock:
+            state = self._load_unlocked()
+            active_run = state["run_control"].get("active_run")
+            if active_run:
+                run_id = str(active_run.get("run_id") or "unknown")
+                raise RoadmapItemRetryError(
+                    f"Roadmap item {target_id!r} was not reset because autonomous run "
+                    f"{run_id!r} is active."
+                )
+
+            matches = []
+            for project in state.get("projects", []):
+                for candidate in project.get("roadmap_items", []):
+                    if str(candidate.get("id") or "").strip() == target_id:
+                        matches.append((project, candidate))
+
+            if not matches:
+                raise RoadmapItemRetryError(f"Roadmap item {target_id!r} was not found.")
+            if len(matches) != 1:
+                raise RoadmapItemRetryError(
+                    f"Roadmap item ID {target_id!r} is ambiguous: {len(matches)} items match; "
+                    "no state was changed."
+                )
+
+            project, roadmap_item = matches[0]
+            previous_status = str(roadmap_item.get("status") or "planned").strip().lower()
+            if previous_status not in RETRYABLE_HUMAN_STATUSES:
+                raise RoadmapItemRetryError(
+                    f"Roadmap item {target_id!r} is {previous_status!r}; only 'needs_human' "
+                    "or 'blocked' items can be reset to 'ready'."
+                )
+            project_status = str(project.get("status") or "active").strip().lower()
+            if project_status in RETRY_BLOCKED_PROJECT_STATUSES:
+                raise RoadmapItemRetryError(
+                    f"Roadmap item {target_id!r} was not reset because parent project "
+                    f"{str(project.get('id') or project.get('name') or 'unknown')!r} is "
+                    f"{project_status!r}."
+                )
+            if _has_unresolved_blockers(roadmap_item):
+                raise RoadmapItemRetryError(
+                    f"Roadmap item {target_id!r} still has unresolved blockers; resolve them "
+                    "before retrying. No state was changed."
+                )
+            acceptance_criteria = [
+                str(value).strip()
+                for value in roadmap_item.get("acceptance_criteria", [])
+                if str(value).strip()
+            ]
+            if not acceptance_criteria:
+                raise RoadmapItemRetryError(
+                    f"Roadmap item {target_id!r} has no acceptance criteria; add explicit "
+                    "criteria before retrying. No state was changed."
+                )
+
+            reset_timestamp = _aware_utc(reset_at).isoformat()
+            roadmap_item["human_resolution_history"].append({
+                "action": "retry",
+                "reset_at": reset_timestamp,
+                "from_status": previous_status,
+                "to_status": "ready",
+            })
+            roadmap_item["human_resolution_history"] = roadmap_item[
+                "human_resolution_history"
+            ][-HUMAN_RESOLUTION_HISTORY_LIMIT:]
+            roadmap_item["status"] = "ready"
+            roadmap_item["human_decision_required"] = False
+            roadmap_item["human_action"] = ""
+            roadmap_item.pop("human_decisions_required", None)
+            for field in RETRY_RESET_FIELDS:
+                roadmap_item.pop(field, None)
+            roadmap_item["updated_at"] = reset_timestamp
+            _atomic_write_json(self.path, state)
+
+            return (
+                f"Roadmap item {target_id!r} reset from {previous_status!r} to 'ready'; "
+                "previous attempts were preserved. No model was invoked. "
+                "Run /autorun dry-run to inspect selection before /autorun live."
+            )
 
 
 def _iter_project_items(state: Mapping[str, Any]):
@@ -736,6 +863,31 @@ class AutonomousWorkflow:
 
     def load_state(self) -> dict[str, Any]:
         return self.store.load()
+
+    def retry_item(self, item_id: str) -> tuple[bool, str]:
+        """Safely make one human-blocked item eligible for a future run.
+
+        Expected owner-correctable rejections return ``(False, message)`` so a
+        Telegram handler can display the message directly. Persistent-state I/O or
+        corruption errors still raise; callers must not mistake those for a normal
+        validation rejection.
+        """
+
+        run_lock = FileLock(
+            str(self.run_lock_path), timeout=self.config.lock_timeout_seconds
+        )
+        try:
+            with run_lock:
+                message = self.store._reset_item_for_retry(item_id, reset_at=self._now())
+        except FileLockTimeout:
+            message = (
+                f"Roadmap item {str(item_id or '').strip()!r} was not reset because another "
+                "autonomous run holds the persistent run lock."
+            )
+            return False, _redact_text(message)
+        except RoadmapItemRetryError as exc:
+            return False, _redact_text(str(exc))
+        return True, _redact_text(message)
 
     def select_actionable_item(self, state: Optional[Mapping[str, Any]] = None) -> Optional[dict[str, Any]]:
         return select_actionable_item(state or self.store.load())

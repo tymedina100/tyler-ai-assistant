@@ -142,6 +142,257 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(report["final_status"], "overlap_prevented")
         executor.assert_not_called()
 
+    def test_retry_reset_clears_terminal_fields_and_preserves_attempt_history(self):
+        previous_attempts = [
+            {
+                "run_id": "run-before-access",
+                "status": "needs_human",
+                "failure_classification": "missing_access",
+            }
+        ]
+        workflow = self.workflow([
+            item(
+                status="needs_human",
+                blockers=[{"status": "resolved", "reason": "Repository access was granted."}],
+                human_decision_required=True,
+                human_decisions_required=["Grant repository access."],
+                human_action="Grant repository access, then retry.",
+                failure_classification="missing_access",
+                failure_reason="Repository access is missing.",
+                last_error="403 Forbidden",
+                previous_attempts=previous_attempts,
+                previous_models=["worker-model"],
+            ),
+            item(
+                "other-blocked",
+                status="blocked",
+                blockers=["A separate owner decision is pending."],
+                human_decision_required=True,
+                human_action="Resolve the separate decision.",
+            ),
+        ])
+
+        success, message = workflow.retry_item("task-1")
+
+        self.assertTrue(success)
+        self.assertIn("reset from 'needs_human' to 'ready'", message)
+        self.assertIn("previous attempts were preserved", message)
+        self.assertIn("No model was invoked", message)
+        self.assertIn("/autorun dry-run", message)
+        self.assertIn("/autorun live", message)
+        persisted = workflow.load_state()["projects"][0]["roadmap_items"][0]
+        self.assertEqual(persisted["status"], "ready")
+        self.assertFalse(persisted["human_decision_required"])
+        self.assertEqual(persisted["human_action"], "")
+        self.assertEqual(
+            persisted["blockers"],
+            [{"status": "resolved", "reason": "Repository access was granted."}],
+        )
+        self.assertNotIn("human_decisions_required", persisted)
+        self.assertNotIn("failure_classification", persisted)
+        self.assertNotIn("failure_reason", persisted)
+        self.assertNotIn("last_error", persisted)
+        self.assertEqual(persisted["previous_attempts"], previous_attempts)
+        self.assertEqual(persisted["previous_models"], ["worker-model"])
+        self.assertEqual(
+            persisted["human_resolution_history"],
+            [{
+                "action": "retry",
+                "reset_at": persisted["updated_at"],
+                "from_status": "needs_human",
+                "to_status": "ready",
+            }],
+        )
+        other = workflow.load_state()["projects"][0]["roadmap_items"][1]
+        self.assertEqual(other["status"], "blocked")
+        self.assertTrue(other["human_decision_required"])
+        self.assertEqual(other["blockers"], ["A separate owner decision is pending."])
+        self.assertIsNotNone(autonomy.select_actionable_item(workflow.load_state()))
+
+    def test_retry_reset_accepts_blocked_status(self):
+        workflow = self.workflow([
+            item(
+                status="blocked",
+                blockers=[{"status": "closed", "reason": "Owner decision supplied"}],
+                human_decision_required=True,
+                human_action="Choose a direction.",
+            )
+        ])
+
+        success, message = workflow.retry_item("task-1")
+
+        self.assertTrue(success)
+        self.assertIn("reset from 'blocked' to 'ready'", message)
+        persisted = workflow.load_state()["projects"][0]["roadmap_items"][0]
+        self.assertEqual(persisted["status"], "ready")
+        self.assertEqual(
+            persisted["blockers"],
+            [{"status": "closed", "reason": "Owner decision supplied"}],
+        )
+        self.assertEqual(persisted["human_resolution_history"][0]["action"], "retry")
+        self.assertEqual(
+            persisted["human_resolution_history"][0]["from_status"], "blocked"
+        )
+
+    def test_retry_reset_rejects_unresolved_blockers_and_missing_acceptance_criteria(self):
+        blocked_workflow = self.workflow([
+            item(
+                status="needs_human",
+                blockers=["Repository access is still missing."],
+                human_decision_required=True,
+                human_action="Grant repository access.",
+            )
+        ])
+        blocked_workflow.load_state()
+        before = self.state_path.read_text(encoding="utf-8")
+
+        success, message = blocked_workflow.retry_item("task-1")
+
+        self.assertFalse(success)
+        self.assertIn("still has unresolved blockers", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        criteria_seed = self.root / "criteria-seed.json"
+        criteria_state = self.root / "criteria-state.json"
+        criteria_seed.write_text(
+            json.dumps(roadmap_state([
+                item(
+                    status="needs_human",
+                    acceptance_criteria=[],
+                    human_decision_required=True,
+                )
+            ])),
+            encoding="utf-8",
+        )
+        criteria_workflow = autonomy.AutonomousWorkflow(
+            self.config, state_path=criteria_state, seed_path=criteria_seed
+        )
+        criteria_workflow.load_state()
+        before = criteria_state.read_text(encoding="utf-8")
+
+        success, message = criteria_workflow.retry_item("task-1")
+
+        self.assertFalse(success)
+        self.assertIn("has no acceptance criteria", message)
+        self.assertEqual(criteria_state.read_text(encoding="utf-8"), before)
+
+    def test_retry_reset_rejects_inactive_parent_project(self):
+        for project_status in ("paused", "archived", "cancelled", "completed"):
+            with self.subTest(project_status=project_status):
+                seed_path = self.root / f"{project_status}-seed.json"
+                state_path = self.root / f"{project_status}-state.json"
+                state = roadmap_state([
+                    item(status="needs_human", human_decision_required=True)
+                ])
+                state["projects"][0]["status"] = project_status
+                seed_path.write_text(json.dumps(state), encoding="utf-8")
+                workflow = autonomy.AutonomousWorkflow(
+                    self.config, state_path=state_path, seed_path=seed_path
+                )
+                workflow.load_state()
+                before = state_path.read_text(encoding="utf-8")
+
+                success, message = workflow.retry_item("task-1")
+
+                self.assertFalse(success)
+                self.assertIn(f"is '{project_status}'", message)
+                self.assertEqual(state_path.read_text(encoding="utf-8"), before)
+
+    def test_retry_resolution_history_is_normalized_and_capped(self):
+        history = [
+            {
+                "action": "retry",
+                "reset_at": f"2026-07-{index + 1:02d}T00:00:00+00:00",
+                "from_status": "needs_human",
+                "to_status": "ready",
+                "sequence": index,
+            }
+            for index in range(55)
+        ]
+        workflow = self.workflow([
+            item(
+                status="needs_human",
+                human_decision_required=True,
+                human_resolution_history=history,
+            )
+        ])
+
+        success, _message = workflow.retry_item("task-1")
+
+        self.assertTrue(success)
+        persisted = workflow.load_state()["projects"][0]["roadmap_items"][0]
+        self.assertEqual(len(persisted["human_resolution_history"]), 50)
+        self.assertEqual(persisted["human_resolution_history"][0]["sequence"], 6)
+        self.assertEqual(persisted["human_resolution_history"][-1]["action"], "retry")
+        self.assertEqual(persisted["human_resolution_history"][-1]["to_status"], "ready")
+
+    def test_retry_reset_rejects_unknown_nonterminal_and_duplicate_ids(self):
+        workflow = self.workflow([item("ready-item")])
+        workflow.load_state()
+
+        success, message = workflow.retry_item("missing-item")
+        self.assertFalse(success)
+        self.assertIn("was not found", message)
+        success, message = workflow.retry_item("ready-item")
+        self.assertFalse(success)
+        self.assertIn("only 'needs_human' or 'blocked'", message)
+
+        duplicate_seed = self.root / "duplicate-seed.json"
+        duplicate_state = self.root / "duplicate-state.json"
+        duplicate_seed.write_text(
+            json.dumps(roadmap_state([
+                item("duplicate", status="needs_human"),
+                item("duplicate", status="blocked"),
+            ])),
+            encoding="utf-8",
+        )
+        duplicate_workflow = autonomy.AutonomousWorkflow(
+            self.config, state_path=duplicate_state, seed_path=duplicate_seed
+        )
+        success, message = duplicate_workflow.retry_item("duplicate")
+        self.assertFalse(success)
+        self.assertIn("ambiguous: 2 items match", message)
+        statuses = [
+            value["status"]
+            for value in duplicate_workflow.load_state()["projects"][0]["roadmap_items"]
+        ]
+        self.assertEqual(statuses, ["needs_human", "blocked"])
+
+    def test_retry_reset_rejects_active_run_claim_and_held_run_lock(self):
+        workflow = self.workflow([item(status="needs_human", human_decision_required=True)])
+        state = workflow.load_state()
+        state["run_control"]["active_run"] = {
+            "run_id": "run-active",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "item_id": "task-1",
+        }
+        workflow.store.save(state)
+
+        success, message = workflow.retry_item("task-1")
+        self.assertFalse(success)
+        self.assertIn("run-active", message)
+        self.assertIn("is active", message)
+        self.assertEqual(
+            workflow.load_state()["projects"][0]["roadmap_items"][0]["status"],
+            "needs_human",
+        )
+
+        state = workflow.load_state()
+        state["run_control"]["active_run"] = None
+        workflow.store.save(state)
+        held = FileLock(str(workflow.run_lock_path))
+        held.acquire()
+        try:
+            success, message = workflow.retry_item("task-1")
+        finally:
+            held.release()
+        self.assertFalse(success)
+        self.assertIn("persistent run lock", message)
+        self.assertEqual(
+            workflow.load_state()["projects"][0]["roadmap_items"][0]["status"],
+            "needs_human",
+        )
+
     def test_selects_highest_priority_actionable_item_and_skips_blockers(self):
         items = [
             item("blocked-high", priority=100, blockers=["Needs credentials"]),

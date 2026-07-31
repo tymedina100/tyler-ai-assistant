@@ -101,6 +101,74 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         run.assert_awaited_once_with("telegram", dry_run=True)
         self.assertIn("dry_run", reply.await_args.args[1])
 
+    async def test_autorun_retry_resets_one_item_without_starting_work(self):
+        update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
+        workflow = types.SimpleNamespace(
+            retry_item=Mock(return_value=(
+                True,
+                "Roadmap item AUTO-RECOVERY-001 is ready. No model was invoked.",
+            ))
+        )
+        with patch.object(self.group, "autonomy_runner_task", None), patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(self.group, "_run_autonomy_cycle", new=AsyncMock()) as run:
+            await self.group.handle_autorun_command(
+                update,
+                "/autorun retry AUTO-RECOVERY-001",
+                allow_live=True,
+            )
+
+        workflow.retry_item.assert_called_once_with("AUTO-RECOVERY-001")
+        run.assert_not_awaited()
+        self.assertIn("No model was invoked", update.message.reply_text.await_args.args[0])
+
+    async def test_autorun_retry_is_refused_in_dm_and_during_an_active_run(self):
+        update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
+        workflow = types.SimpleNamespace(retry_item=Mock(return_value=(True, "ready")))
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ):
+            await self.group.handle_autorun_command(
+                update,
+                "/autorun retry AUTO-RECOVERY-001",
+                allow_live=False,
+            )
+        workflow.retry_item.assert_not_called()
+        self.assertIn("group operating room", update.message.reply_text.await_args.args[0])
+
+        update.message.reply_text.reset_mock()
+        active = types.SimpleNamespace(done=lambda: False)
+        with patch.object(self.group, "autonomy_runner_task", active), patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ):
+            await self.group.handle_autorun_command(
+                update,
+                "/autorun retry AUTO-RECOVERY-001",
+                allow_live=True,
+            )
+        workflow.retry_item.assert_not_called()
+        self.assertIn("no roadmap state was changed", update.message.reply_text.await_args.args[0])
+
+    async def test_autorun_retry_reports_persistent_state_failure_without_starting_work(self):
+        update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
+        workflow = types.SimpleNamespace(
+            retry_item=Mock(side_effect=OSError("simulated state write failure"))
+        )
+        with patch.object(self.group, "autonomy_runner_task", None), patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(self.group, "_run_autonomy_cycle", new=AsyncMock()) as run:
+            await self.group.handle_autorun_command(
+                update,
+                "/autorun retry AUTO-RECOVERY-001",
+                allow_live=True,
+            )
+
+        run.assert_not_awaited()
+        self.assertIn(
+            "persistent state could not be updated safely",
+            update.message.reply_text.await_args.args[0],
+        )
+
     async def test_runtime_deferral_protects_supervised_work_and_pending_confirmation(self):
         active_runner = types.SimpleNamespace(done=lambda: False)
         with patch.object(self.group, "company_runner_task", active_runner), patch.object(
@@ -538,6 +606,47 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "blocked")
         terminal = [call for call in update.call_args_list if len(call.args) > 1 and call.args[1] == "needs_human"]
         self.assertEqual(len(terminal), 1)
+
+    async def test_successful_worker_result_is_persisted_without_pre_review_truncation(self):
+        result = "complete evidence\n" + ("x" * 7000)
+        task = {
+            "id": "worker-long", "owner": "manager", "title": "Long proposal",
+            "model": "worker-model", "model_reason": "test", "estimate_usd": 0.10,
+            "execution_attempts": 0, "attempt_history": [],
+            "authorization_level": "observe", "enforce_authorization": True,
+        }
+        project = {"id": "project-1", "title": "Project"}
+        sink = {
+            "cost_usd": 0.0,
+            "artifacts": [],
+            "usage_records": [],
+            "context": "test",
+        }
+        self.group.main.ask_ai = Mock(return_value=result)
+        self.group.main.pending_actions = {}
+        with patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ) as update, patch.object(
+            self.group.company_mode, "load_state", return_value={"company": {}}
+        ), patch.object(
+            self.group.company_mode, "render_money", return_value="Budget ok"
+        ), patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ):
+            outcome = await self.group._execute_routed_task(
+                project,
+                task,
+                None,
+                "prompt",
+                sink,
+            )
+
+        done_call = next(call for call in update.call_args_list if call.args[1] == "done")
+        self.assertEqual(outcome, "done")
+        self.assertEqual(done_call.args[2], result)
+        self.assertGreater(len(done_call.args[2]), company_mode.MAX_TASK_RESULT_CHARS)
 
     async def test_time_limit_waits_for_thread_and_stops_without_retry(self):
         task = {

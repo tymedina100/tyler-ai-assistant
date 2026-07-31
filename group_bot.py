@@ -1347,7 +1347,7 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
 
     await asyncio.to_thread(
         company_mode.update_task_status,
-        task["id"], "done", answer[:company_mode.MAX_TASK_RESULT_CHARS], sink["artifacts"],
+        task["id"], "done", answer, sink["artifacts"],
         _sink_spend_for_reconciliation(sink),
         company_mode.COMPANY_STATE_FILE,
         usage_records=sink["usage_records"],
@@ -1866,7 +1866,13 @@ def _autonomy_status_text():
 async def handle_autorun_command(update, text, *, allow_live=True):
     """Handle safe status/dry-run commands and explicitly gated live execution."""
     global autonomy_runner_task
-    argument = re.sub(r"^/autorun(?:@[A-Za-z0-9_]+)?", "", str(text or "").strip(), flags=re.I).strip().lower()
+    raw_argument = re.sub(
+        r"^/autorun(?:@[A-Za-z0-9_]+)?",
+        "",
+        str(text or "").strip(),
+        flags=re.I,
+    ).strip()
+    argument = raw_argument.lower()
     if argument in {"", "dry", "dry-run", "plan"}:
         if autonomy_runner_task and not autonomy_runner_task.done():
             await update.message.reply_text("An autonomous run is already active; this trigger was not started.")
@@ -1876,6 +1882,36 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         return
     if argument == "status":
         await reply_chunks(update.message, await asyncio.to_thread(_autonomy_status_text))
+        return
+    if argument == "retry" or argument.startswith("retry "):
+        parts = raw_argument.split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].strip():
+            await update.message.reply_text("Usage: /autorun retry <roadmap-item-id>")
+            return
+        if not allow_live:
+            await update.message.reply_text(
+                "Reset roadmap items from the group operating room, not a DM."
+            )
+            return
+        if autonomy_runner_task and not autonomy_runner_task.done():
+            await update.message.reply_text(
+                "An autonomous run is already active; no roadmap state was changed."
+            )
+            return
+        workflow = _get_autonomy_workflow()
+        try:
+            _success, message = await asyncio.to_thread(
+                workflow.retry_item,
+                parts[1].strip(),
+            )
+        except Exception as exc:
+            main.logger.error(f"Autonomy retry failed without changing roadmap state: {exc}")
+            await update.message.reply_text(
+                "The roadmap item was not reset because its persistent state could not "
+                "be updated safely. Check the Railway logs or recovery marker before retrying."
+            )
+            return
+        await update.message.reply_text(message)
         return
     if argument == "live":
         if not allow_live:
@@ -1893,7 +1929,10 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         autonomy_runner_task = asyncio.create_task(_run_and_post_autonomy("telegram", dry_run=False))
         await update.message.reply_text("Started one bounded autonomous run. Miles will post the final report or an exact owner action.")
         return
-    await update.message.reply_text("Usage: /autorun dry-run | /autorun status | /autorun live")
+    await update.message.reply_text(
+        "Usage: /autorun dry-run | /autorun status | "
+        "/autorun retry <roadmap-item-id> | /autorun live"
+    )
 
 
 # --------------------------------------------------------------------------- #
