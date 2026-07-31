@@ -29,6 +29,8 @@ from filelock import FileLock, Timeout as FileLockTimeout
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ROADMAP_FILE = BASE_DIR / "config" / "autonomous-roadmap.json"
 STATE_VERSION = 1
+TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_RESULT_PREVIEW_CHARS = 360
 TERMINAL_TASK_STATUSES = {"complete", "completed", "done", "approved", "shipped"}
 ACTIONABLE_TASK_STATUSES = {"planned", "ready", "pending", "todo", "deferred", "retry"}
 
@@ -626,7 +628,43 @@ def format_telegram_summary(report: Mapping[str, Any]) -> str:
         f"Budget: ${used:.4f} used of ${limit:.2f}; ${remaining:.4f} remaining{estimate_label}",
         f"Your action: {'; '.join(map(str, actions)) if actions else 'None'}",
     ]
-    return _redact_text("\n".join(lines))[:4096]
+    result_text = _redact_text(str(report.get("result_text") or "")).strip()
+    if completed and result_text:
+        compact_result = re.sub(r"\s+", " ", result_text)
+        base_text = _redact_text("\n".join(lines))
+        available = max(0, TELEGRAM_MESSAGE_LIMIT - len(base_text) - len("\nResult: "))
+        preview_limit = min(TELEGRAM_RESULT_PREVIEW_CHARS, available)
+        if preview_limit > 0:
+            marker = " [preview truncated]"
+            if len(compact_result) > preview_limit:
+                if preview_limit <= len(marker):
+                    compact_result = marker[:preview_limit]
+                else:
+                    keep = preview_limit - len(marker)
+                    compact_result = compact_result[:keep].rstrip() + marker
+            lines.insert(3, f"Result: {compact_result}")
+    return _redact_text("\n".join(lines))[:TELEGRAM_MESSAGE_LIMIT]
+
+
+def format_telegram_deliverable(report: Mapping[str, Any]) -> str:
+    """Format the substantive completed result for chunked Telegram delivery."""
+
+    tasks = report.get("tasks_selected", []) or []
+    completed = [task for task in tasks if str(task.get("status", "")).lower() in TERMINAL_TASK_STATUSES]
+    result_text = _redact_text(str(report.get("result_text") or "")).strip()
+    if not completed or not result_text:
+        return ""
+    task = completed[0]
+    lines = [
+        "Autonomous deliverable",
+        f"Task: {task.get('title') or task.get('id') or 'Unknown'}",
+        f"Agent: {report.get('result_agent') or task.get('agent_owner') or 'unrecorded'}",
+        "",
+        result_text,
+    ]
+    if report.get("result_truncated"):
+        lines.extend(["", "Note: the captured agent result reached the configured storage limit."])
+    return _redact_text("\n".join(lines))
 
 
 format_daily_summary = format_telegram_summary
@@ -745,6 +783,10 @@ class AutonomousWorkflow:
                 "remaining_usd": max(0.0, self.config.daily_budget_usd - self.config.emergency_reserve_usd),
             },
             "review_outcomes": [],
+            "result_text": "",
+            "result_task_id": None,
+            "result_agent": None,
+            "result_truncated": False,
             "retry_count": 0,
             "blockers": [],
             "deferred": [],
@@ -1180,6 +1222,21 @@ class AutonomousWorkflow:
         report["files_changed"] = list(result.get("files_changed", []) or [])
         report["tests_executed"] = list(result.get("tests_executed", []) or [])
         report["artifacts"] = list(result.get("artifacts", []) or [])
+        raw_result_text = str(
+            result.get("result_text") or result.get("result") or result.get("summary") or ""
+        )
+        result_limit = _safe_int(os.environ.get("MAX_TASK_RESULT_CHARS"), 5000, 1, 20000)
+        report["result_text"] = _redact_text(raw_result_text).strip()[:result_limit]
+        report["result_truncated"] = bool(result.get("result_truncated")) or (
+            len(_redact_text(raw_result_text).strip()) > result_limit
+        )
+        if report["result_text"]:
+            report["result_task_id"] = result.get("result_task_id") or item_id
+            report["result_agent"] = result.get("result_agent") or agent
+            report["tasks_selected"][0]["result_summary"] = report["result_text"][:1000]
+            report["tasks_selected"][0]["result_task_id"] = report["result_task_id"]
+            report["tasks_selected"][0]["result_agent"] = report["result_agent"]
+            report["tasks_selected"][0]["result_truncated"] = report["result_truncated"]
         attempt.update(
             finished_at=self._now().isoformat(),
             status=status,
@@ -1187,7 +1244,7 @@ class AutonomousWorkflow:
             actual_or_reconciled_cost_usd=reconciled_cost,
             cost_is_estimated=report["cost_is_estimated"],
             token_usage=usage,
-            result_summary=str(result.get("result") or result.get("summary") or "")[:1000],
+            result_summary=report["result_text"][:1000],
         )
         if status in {"completed", "complete", "done", "approved", "shipped", "success"}:
             item["status"] = "completed"

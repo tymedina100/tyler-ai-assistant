@@ -64,6 +64,10 @@
     "remaining_usd": 4.75
   },
   "review_outcomes": [],
+  "result_text": "",
+  "result_task_id": null,
+  "result_agent": null,
+  "result_truncated": false,
   "retry_count": 0,
   "blockers": [],
   "deferred": [],

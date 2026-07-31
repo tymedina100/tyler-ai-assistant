@@ -355,12 +355,36 @@ def aggregate_company_result(
         "decision_required": "Provide the missing information or owner decision, then mark the item ready.",
         "no_progress": "Review the repeated feedback and decide whether to rescope, accept, or stop the task.",
     }
-    summary = str(project.get("last_editor_feedback") or "").strip()
-    if not summary:
-        summary = next((str(task.get("result") or "").strip() for task in reversed(tasks) if task.get("result")), "")
+    # The reviewer verdict is evidence about the deliverable, not the deliverable
+    # itself.  Prefer the latest completed worker result so proposal/observe tasks
+    # remain useful after intermediate Company Mode messages are suppressed.
+    result_task = next(
+        (
+            task
+            for task in reversed(tasks)
+            if task.get("owner") != "editor"
+            and task.get("status") in {"done", "completed", "complete", "approved"}
+            and str(task.get("result") or "").strip()
+        ),
+        None,
+    )
+    if result_task is None:
+        result_task = next(
+            (task for task in reversed(tasks) if str(task.get("result") or "").strip()),
+            None,
+        )
+    result_text = str((result_task or {}).get("result") or "").strip()
+    result_limit = int(_configured_number("MAX_TASK_RESULT_CHARS", 5000, 1.0))
+    result_truncated = bool((result_task or {}).get("result_truncated")) or (
+        bool(result_text) and len(result_text) >= result_limit
+    )
     return {
         "status": status,
-        "result": summary[:1000],
+        "result": result_text[:1000],
+        "result_text": result_text,
+        "result_task_id": (result_task or {}).get("id"),
+        "result_agent": (result_task or {}).get("owner"),
+        "result_truncated": result_truncated,
         "reason": reason[:1500],
         "failure_classification": failure,
         "human_action": human_actions.get(failure, "Inspect the run report, correct the failure, then retry in dry-run mode."),
