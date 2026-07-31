@@ -143,7 +143,9 @@ The Telegram command `/autorun dry-run` is always safe. A local CLI command prov
 - The JSON/file-lock store assumes all replicas share one filesystem volume; it is not a distributed database.
 - Existing helper functions can still be imported directly, outside the centralized tool authorization path.
 - Pending Telegram confirmations are still process-memory state.
-- `needs_human` items do not yet have a dedicated `/autorun resolve|retry|skip` command; the owner must repair state deliberately before retrying.
+- `/autorun retry <item-id>` deliberately resets one `needs_human` or `blocked` item after
+  the owner resolves its stated problem. It preserves attempt history and never starts a
+  model call. Skip, accept-as-is, criteria editing, and automatic rescoping remain deferred.
 - Recent-run state stores outcome metadata and per-item attempts, not full prior-run narrative content or milestones.
 - The task time ceiling is a monitored stop/no-retry boundary, not a kill signal for Python threads; the runner waits for completion to preserve accounting.
 - Automatic local modification is disabled until work can run in a killable, isolated checkout without remote side effects.

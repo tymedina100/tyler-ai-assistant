@@ -405,7 +405,7 @@ class CompanyModeTests(unittest.TestCase):
             path=self.state_path,
         )
 
-    def test_prior_work_summary_carries_full_editor_feedback_not_truncated_result(self):
+    def test_prior_work_summary_keeps_each_historical_editor_result(self):
         self._assign()
         state = company_mode.load_state(self.state_path)
         project_id = state["company"]["active_project_id"]
@@ -418,14 +418,15 @@ class CompanyModeTests(unittest.TestCase):
         )
         self.assertGreater(len(long_feedback), 1000)  # longer than the stored task result would allow
 
-        # Simulate what _run_one_task does: the task result is clipped to 1000 chars,
-        # but set_project_revision_flag keeps the full text separately.
-        company_mode.update_task_status(editor_task["id"], "done", long_feedback[:1000], path=self.state_path)
+        company_mode.update_task_status(
+            editor_task["id"], "done", "STORED HISTORICAL EDITOR RESULT", path=self.state_path
+        )
         company_mode.set_project_revision_flag(project_id, long_feedback, self.state_path)
 
         state = company_mode.load_state(self.state_path)
         summary = company_mode.prior_work_summary(state, project_id, other_task["id"])
-        self.assertIn("Fix item 39", summary)  # only present in the untruncated feedback
+        self.assertIn("STORED HISTORICAL EDITOR RESULT", summary)
+        self.assertNotIn("Fix item 39", summary)
 
     def test_record_adhoc_spend_counts_against_budget(self):
         self._assign()
@@ -454,23 +455,108 @@ class CompanyModeTests(unittest.TestCase):
         # ...but a still-planned task contributes nothing yet.
         self.assertNotIn(second["title"], summary)
 
-    def test_editor_receives_the_bounded_full_worker_result(self):
+    def test_editor_context_preserves_full_worker_result_over_display_limit(self):
         self._assign()
         state = company_mode.load_state(self.state_path)
         project = company_mode.active_project(state)
         tasks = company_mode.project_tasks(state, project["id"])
         worker = next(task for task in tasks if task["owner"] != "editor")
         editor = next(task for task in tasks if task["owner"] == "editor")
-        long_result = "start-" + ("x" * 3500) + "-review-tail"
+        long_result = "start-" + ("x" * 6000) + "-review-tail"
+        self.assertGreater(len(long_result), 5000)
 
         company_mode.update_task_status(
             worker["id"], "done", result=long_result, path=self.state_path
         )
         state = company_mode.load_state(self.state_path)
+        persisted = next(task for task in state["tasks"] if task["id"] == worker["id"])
         summary = company_mode.prior_work_summary(state, project["id"], editor["id"])
 
+        self.assertEqual(persisted["result"], long_result)
+        self.assertFalse(persisted["result_truncated"])
+        self.assertIn("LATEST REVIEW CANDIDATE", summary)
         self.assertIn("review-tail", summary)
         self.assertNotIn("...[truncated]", summary)
+
+    def test_oversized_task_result_is_capped_in_state_and_reviewer_context(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project = company_mode.active_project(state)
+        tasks = company_mode.project_tasks(state, project["id"])
+        worker = next(task for task in tasks if task["owner"] != "editor")
+        editor = next(task for task in tasks if task["owner"] == "editor")
+        oversized = (
+            "result-start-"
+            + ("x" * company_mode.MAX_TASK_STORED_RESULT_CHARS)
+            + "-result-tail"
+        )
+
+        company_mode.update_task_status(
+            worker["id"], "done", result=oversized, path=self.state_path
+        )
+        state = company_mode.load_state(self.state_path)
+        persisted = next(task for task in state["tasks"] if task["id"] == worker["id"])
+        summary = company_mode.prior_work_summary(state, project["id"], editor["id"])
+
+        self.assertEqual(len(persisted["result"]), company_mode.MAX_TASK_STORED_RESULT_CHARS)
+        self.assertTrue(persisted["result_truncated"])
+        self.assertNotIn("result-tail", persisted["result"])
+        self.assertIn("LATEST REVIEW CANDIDATE", summary)
+        self.assertIn("...[truncated]", summary)
+        self.assertNotIn("result-tail", summary)
+
+    def test_state_normalization_caps_task_result_and_revision_feedback(self):
+        state = company_mode.new_state()
+        state["tasks"] = [{
+            "id": "task_oversized",
+            "result": "r" * (company_mode.MAX_TASK_STORED_RESULT_CHARS + 100),
+            "revision_feedback": "f" * (company_mode.MAX_REVIEW_FEEDBACK_CHARS + 100),
+        }]
+
+        normalized = company_mode.normalize_state(state)
+        task = normalized["tasks"][0]
+
+        self.assertEqual(len(task["result"]), company_mode.MAX_TASK_STORED_RESULT_CHARS)
+        self.assertTrue(task["result_truncated"])
+        self.assertEqual(
+            len(task["revision_feedback"]), company_mode.MAX_REVIEW_FEEDBACK_CHARS
+        )
+        self.assertTrue(task["revision_feedback_truncated"])
+
+    def test_review_feedback_and_history_are_capped(self):
+        self._assign()
+        project_id = company_mode.load_state(self.state_path)["company"]["active_project_id"]
+        total_reviews = company_mode.MAX_EDITOR_FEEDBACK_HISTORY + 3
+        for attempt in range(total_reviews):
+            feedback = (
+                f"APPROVED {attempt}: "
+                + ("f" * company_mode.MAX_REVIEW_FEEDBACK_CHARS)
+                + "-feedback-tail"
+            )
+            company_mode.set_project_revision_flag(project_id, feedback, self.state_path)
+
+        state = company_mode.load_state(self.state_path)
+        project = next(item for item in state["projects"] if item["id"] == project_id)
+        history = project["editor_feedback_history"]
+
+        self.assertEqual(len(project["last_editor_feedback"]), company_mode.MAX_REVIEW_FEEDBACK_CHARS)
+        self.assertTrue(project["last_editor_feedback_truncated"])
+        self.assertNotIn("feedback-tail", project["last_editor_feedback"])
+        self.assertEqual(len(history), company_mode.MAX_EDITOR_FEEDBACK_HISTORY)
+        self.assertTrue(project["editor_feedback_history_truncated"])
+        self.assertEqual(history[0]["attempt"], total_reviews - len(history) + 1)
+        self.assertTrue(all(entry["feedback_truncated"] for entry in history))
+        self.assertTrue(all(
+            len(entry["feedback"]) <= company_mode.MAX_REVIEW_FEEDBACK_CHARS
+            for entry in history
+        ))
+
+    def test_configured_limit_honors_hard_maximum(self):
+        with mock.patch.dict(os.environ, {"TEST_CHAR_LIMIT": "999999"}):
+            value = company_mode._configured_positive_int(
+                "TEST_CHAR_LIMIT", 100, maximum=50000
+            )
+        self.assertEqual(value, 50000)
 
     def test_prior_work_summary_empty_when_nothing_done(self):
         self._assign()
@@ -779,6 +865,75 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual([task["model"] for task in revised], ["small-model", "review-model"])
         self.assertTrue(all(task["enforce_authorization"] for task in revised))
         self.assertTrue(all(task["acceptance_criteria"] == criteria for task in revised))
+        self.assertTrue(all(task["revision_round"] == 1 for task in revised))
+        self.assertTrue(all(
+            task["revision_feedback"]
+            == "REVISIONS REQUIRED: make the validation result explicit."
+            for task in revised
+        ))
+
+    def test_reject_revision_prompts_snapshot_feedback_and_mark_latest_candidate(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        project = company_mode.active_project(state)
+        project_id = project["id"]
+        original_tasks = company_mode.project_tasks(state, project_id)
+        original_worker = next(task for task in original_tasks if task["owner"] != "editor")
+        original_editor = next(task for task in original_tasks if task["owner"] == "editor")
+        company_mode.update_task_status(
+            original_worker["id"], "done", "ORIGINAL FAILED CANDIDATE", path=self.state_path
+        )
+        company_mode.update_task_status(
+            original_editor["id"], "done", "STORED FIRST REVIEW", path=self.state_path
+        )
+        feedback = "REVISIONS REQUIRED\n1. State the exact configured timezone."
+        company_mode.set_project_revision_flag(project_id, feedback, self.state_path)
+
+        created, _note = company_mode.start_revision_round(
+            project_id, ["manager", "code", "editor"], self.state_path
+        )
+        self.assertTrue(created)
+        state = company_mode.load_state(self.state_path)
+        project = next(item for item in state["projects"] if item["id"] == project_id)
+        revision_tasks = [
+            task for task in company_mode.project_tasks(state, project_id)
+            if task["revision_round"] == 1
+        ]
+        revision_worker = next(task for task in revision_tasks if task["owner"] != "editor")
+        revision_editor = next(task for task in revision_tasks if task["owner"] == "editor")
+        self.assertTrue(all(task["revision_feedback"] == feedback for task in revision_tasks))
+
+        worker_prior = company_mode.prior_work_summary(
+            state, project_id, revision_worker["id"]
+        )
+        worker_prompt = company_mode.build_task_prompt(project, revision_worker, worker_prior)
+        self.assertEqual(worker_prompt.count("Latest required changes:"), 1)
+        self.assertEqual(worker_prompt.count(feedback), 1)
+        self.assertIn("Revision round: 1", worker_prompt)
+        self.assertIn("Address every applicable required change explicitly", worker_prompt)
+
+        company_mode.update_task_status(
+            revision_worker["id"], "done", "ROUND ONE REVISED CANDIDATE", path=self.state_path
+        )
+        state = company_mode.load_state(self.state_path)
+        reviewer_prior = company_mode.prior_work_summary(
+            state, project_id, revision_editor["id"]
+        )
+        reviewer_prompt = company_mode.build_task_prompt(
+            project, revision_editor, reviewer_prior
+        )
+
+        self.assertIn("STORED FIRST REVIEW", reviewer_prior)
+        self.assertNotIn(feedback, reviewer_prior)
+        self.assertIn(
+            "LATEST REVIEW CANDIDATE: research", reviewer_prior
+        )
+        self.assertIn("ROUND ONE REVISED CANDIDATE", reviewer_prior)
+        self.assertEqual(reviewer_prompt.count("Latest required changes:"), 1)
+        self.assertEqual(reviewer_prompt.count(feedback), 1)
+        self.assertIn(
+            "Review the result labeled LATEST REVIEW CANDIDATE", reviewer_prompt
+        )
 
     def test_autonomous_task_prompt_makes_acceptance_and_authorization_explicit(self):
         prompt = company_mode.build_task_prompt(

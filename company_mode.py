@@ -221,6 +221,50 @@ def _normalize_usage_records(records):
     return normalized
 
 
+def _bounded_text(value, limit, *, strip=False):
+    """Return text constrained to a configured state/prompt boundary.
+
+    The boolean records whether this call removed content.  Callers preserve an
+    existing flag when normalizing already-truncated persisted state.
+    """
+    text = str(value or "")
+    if strip:
+        text = text.strip()
+    truncated = len(text) > limit
+    return text[:limit], truncated
+
+
+def _normalize_project(project):
+    if not isinstance(project, dict):
+        return None
+    item = deepcopy(project)
+    feedback, feedback_truncated = _bounded_text(
+        item.get("last_editor_feedback"), MAX_REVIEW_FEEDBACK_CHARS, strip=True
+    )
+    item["last_editor_feedback"] = feedback
+    item["last_editor_feedback_truncated"] = bool(
+        item.get("last_editor_feedback_truncated")
+    ) or feedback_truncated
+
+    history = []
+    for raw in _list(item.get("editor_feedback_history")):
+        if not isinstance(raw, dict):
+            continue
+        entry = deepcopy(raw)
+        entry_feedback, entry_truncated = _bounded_text(
+            entry.get("feedback"), MAX_REVIEW_FEEDBACK_CHARS, strip=True
+        )
+        entry["feedback"] = entry_feedback
+        entry["feedback_truncated"] = bool(entry.get("feedback_truncated")) or entry_truncated
+        history.append(entry)
+    history_was_truncated = len(history) > MAX_EDITOR_FEEDBACK_HISTORY
+    item["editor_feedback_history"] = history[-MAX_EDITOR_FEEDBACK_HISTORY:]
+    item["editor_feedback_history_truncated"] = bool(
+        item.get("editor_feedback_history_truncated")
+    ) or history_was_truncated
+    return item
+
+
 def _normalize_task(task):
     if not isinstance(task, dict):
         return None
@@ -234,12 +278,24 @@ def _normalize_task(task):
     item["estimate_usd"] = _amount(item.get("estimate_usd", 0.0))
     item["reserved_usd"] = _amount(item.get("reserved_usd", 0.0))
     item["spent_usd"] = _amount(item.get("spent_usd", 0.0))
-    item.setdefault("result", "")
+    result, result_truncated = _bounded_text(
+        item.get("result"), MAX_TASK_STORED_RESULT_CHARS
+    )
+    item["result"] = result
+    item["result_truncated"] = bool(item.get("result_truncated")) or result_truncated
     item["artifacts"] = _list(item.get("artifacts"))
     item["notes"] = _list(item.get("notes"))
     criteria = item.get("acceptance_criteria", [])
     item["acceptance_criteria"] = [str(value) for value in _list(criteria) if str(value).strip()]
     item.setdefault("authorization_level", "propose")
+    item["revision_round"] = int(item.get("revision_round", 0) or 0)
+    revision_feedback, revision_feedback_truncated = _bounded_text(
+        item.get("revision_feedback"), MAX_REVIEW_FEEDBACK_CHARS, strip=True
+    )
+    item["revision_feedback"] = revision_feedback
+    item["revision_feedback_truncated"] = bool(
+        item.get("revision_feedback_truncated")
+    ) or revision_feedback_truncated
     item["execution_attempts"] = int(item.get("execution_attempts", 0) or 0)
     item["review_attempts"] = int(item.get("review_attempts", 0) or 0)
     item.setdefault("failure_classification", "")
@@ -313,8 +369,13 @@ def normalize_state(state):
         return base
 
     normalized = deepcopy(base)
-    for key in ("projects", "events", "products"):
+    for key in ("events", "products"):
         normalized[key] = _list(state.get(key, normalized[key]))
+    normalized["projects"] = [
+        project
+        for project in (_normalize_project(raw) for raw in _list(state.get("projects")))
+        if project is not None
+    ]
     normalized["tasks"] = [
         task for task in (_normalize_task(raw) for raw in _list(state.get("tasks"))) if task is not None
     ]
@@ -831,10 +892,14 @@ def _new_task(project_id, owner, delivery, title, estimate=DEFAULT_TASK_ESTIMATE
         "created_at": _now().isoformat(),
         "updated_at": _now().isoformat(),
         "result": "",
+        "result_truncated": False,
         "artifacts": [],
         "notes": [],
         "acceptance_criteria": [],
         "authorization_level": "propose",
+        "revision_round": 0,
+        "revision_feedback": "",
+        "revision_feedback_truncated": False,
         "execution_attempts": 0,
         "review_attempts": 0,
         "failure_classification": "",
@@ -1010,7 +1075,11 @@ def update_task_status(
         task["status"] = status
         task["updated_at"] = _now().isoformat()
         if result:
-            task["result"] = result
+            bounded_result, result_truncated = _bounded_text(
+                result, MAX_TASK_STORED_RESULT_CHARS
+            )
+            task["result"] = bounded_result
+            task["result_truncated"] = result_truncated
         if model is not None:
             previous_model = task.get("model")
             if previous_model and previous_model != model:
@@ -1223,18 +1292,39 @@ def _stray_project_lines(state, exclude_id=None):
     return lines
 
 
-def _configured_positive_int(name, default, minimum=1):
+def _configured_positive_int(name, default, minimum=1, maximum=None):
     try:
-        return max(minimum, int(os.environ.get(name, default)))
+        value = int(os.environ.get(name, default))
     except (TypeError, ValueError):
-        return default
+        value = default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
 
 
 # Hard stops are configuration, not merely runner conventions: the state layer enforces
 # them even when a caller forgets to check first.
 MAX_REVISION_ROUNDS = _configured_positive_int("MAX_REVISION_ROUNDS", 2, minimum=0)
 MAX_EXECUTION_ATTEMPTS = _configured_positive_int("MAX_EXECUTION_ATTEMPTS", 3)
-MAX_TASK_RESULT_CHARS = _configured_positive_int("MAX_TASK_RESULT_CHARS", 5000)
+MAX_TASK_RESULT_CHARS = _configured_positive_int(
+    "MAX_TASK_RESULT_CHARS", 5000, maximum=20000
+)
+# Persist enough output for evidence-based review, but never let one provider reply
+# grow the shared JSON state or a later review prompt without bound.  These limits
+# are intentionally separate from the smaller Telegram/report display limit above.
+MAX_TASK_STORED_RESULT_CHARS = _configured_positive_int(
+    "MAX_TASK_STORED_RESULT_CHARS",
+    20000,
+    minimum=MAX_TASK_RESULT_CHARS,
+    maximum=50000,
+)
+MAX_REVIEW_FEEDBACK_CHARS = _configured_positive_int(
+    "MAX_REVIEW_FEEDBACK_CHARS", 12000, maximum=20000
+)
+MAX_EDITOR_FEEDBACK_HISTORY = _configured_positive_int(
+    "MAX_EDITOR_FEEDBACK_HISTORY", 10, maximum=50
+)
 FAILURE_CLASSIFICATIONS = {
     "missing_access",
     "missing_information",
@@ -1306,17 +1396,20 @@ def classify_editor_verdict(editor_answer):
 def set_project_revision_flag(project_id, editor_answer, path=COMPANY_STATE_FILE):
     """Record the Managing Editor's verdict on a project's deliverables. Stores the
     three-way verdict (see classify_editor_verdict), keeps needs_revision for the
-    'revise' case (the revision-round loop reads it), and keeps her full feedback
-    (unlike the 1000-char task result) so a revision round or an escalation can relay
-    her exact requirements."""
+    'revise' case (the revision-round loop reads it), and keeps bounded feedback so
+    a revision round or escalation can relay the requirements without allowing one
+    provider response to grow persistent state indefinitely."""
     verdict = classify_editor_verdict(editor_answer)
+    feedback_text, feedback_truncated = _bounded_text(
+        editor_answer, MAX_REVIEW_FEEDBACK_CHARS, strip=True
+    )
     with _state_transaction(path) as state:
         project = next((item for item in state["projects"] if item["id"] == project_id), None)
         if project is None:
             return None
         history = project.setdefault("editor_feedback_history", [])
         repeated = verdict == "revise" and any(
-            _substantially_same_feedback(item.get("feedback", ""), editor_answer)
+            _substantially_same_feedback(item.get("feedback", ""), feedback_text)
             for item in history
             if item.get("verdict") == "revise"
         )
@@ -1333,14 +1426,21 @@ def set_project_revision_flag(project_id, editor_answer, path=COMPANY_STATE_FILE
         project["review_attempts"] = int(project.get("review_attempts", 0)) + 1
         project["editor_verdict"] = verdict
         project["needs_revision"] = verdict == "revise"
-        project["last_editor_feedback"] = str(editor_answer or "").strip()
+        project["last_editor_feedback"] = feedback_text
+        project["last_editor_feedback_truncated"] = feedback_truncated
         history.append({
             "attempt": project["review_attempts"],
             "verdict": verdict,
-            "feedback": str(editor_answer or "").strip(),
-            "fingerprint": _fingerprint(_normalize_feedback(editor_answer)),
+            "feedback": feedback_text,
+            "feedback_truncated": feedback_truncated,
+            "fingerprint": _fingerprint(_normalize_feedback(feedback_text)),
             "timestamp": _now().isoformat(),
         })
+        if len(history) > MAX_EDITOR_FEEDBACK_HISTORY:
+            del history[:-MAX_EDITOR_FEEDBACK_HISTORY]
+            project["editor_feedback_history_truncated"] = True
+        else:
+            project.setdefault("editor_feedback_history_truncated", False)
     return verdict
 
 
@@ -1424,7 +1524,9 @@ def block_project(
             task["reserved_usd"] = 0.0
             task["failure_classification"] = classification
             if reason:
-                task["result"] = str(reason)[:MAX_TASK_RESULT_CHARS]
+                task["result"], task["result_truncated"] = _bounded_text(
+                    reason, MAX_TASK_STORED_RESULT_CHARS
+                )
         project["status"] = "blocked"
         project["failure_classification"] = classification
         add_event(
@@ -1533,6 +1635,17 @@ def start_revision_round(project_id, configured_agent_keys, path=COMPANY_STATE_F
                 )
                 if template.get(key) is not None
             }
+            # Keep the exact review that caused this round attached to every task in
+            # the round.  A later review must not silently rewrite the instructions
+            # that a worker received, and workers should not have to infer the latest
+            # required changes from a growing history of prior task summaries.
+            copied_metadata["revision_round"] = round_number
+            copied_metadata["revision_feedback"] = str(
+                project.get("last_editor_feedback") or ""
+            ).strip()
+            copied_metadata["revision_feedback_truncated"] = bool(
+                project.get("last_editor_feedback_truncated")
+            )
             estimate = estimates[preferred_owner]
             task = _new_task(project_id, owner, delivery, title, estimate, **copied_metadata)
             reservation = _reserve_budget_in_state(
@@ -1789,12 +1902,14 @@ def prior_work_summary(state, project_id, current_task_id, limit_chars=1500):
     task's owner, title, result (truncated), and any deliverables. Excludes the task
     being run now. Returns "" when nothing is done yet.
 
-    A current editor task receives a larger bounded view of worker output so it can
-    review the actual proposal/status result against every criterion. Prior editor
-    feedback still comes from the project's full feedback field for revision rounds."""
-    project = next((p for p in state.get("projects", []) if p["id"] == project_id), None)
+    A current editor task receives a larger bounded view of historical work plus the
+    stored latest worker result, explicitly marked as the review candidate.  Review
+    feedback for a revision round is injected separately from the task's immutable
+    ``revision_feedback`` snapshot, rather than being substituted into historical
+    editor task blocks."""
+    tasks = project_tasks(state, project_id)
     current_task = next(
-        (task for task in project_tasks(state, project_id) if task["id"] == current_task_id),
+        (task for task in tasks if task["id"] == current_task_id),
         None,
     )
     reviewer_limit = (
@@ -1802,17 +1917,43 @@ def prior_work_summary(state, project_id, current_task_id, limit_chars=1500):
         if current_task and current_task.get("owner") == "editor"
         else limit_chars
     )
+    latest_candidate_id = None
+    if current_task and current_task.get("owner") == "editor":
+        current_round = int(current_task.get("revision_round", 0) or 0)
+        candidates = [
+            task
+            for task in tasks
+            if task["id"] != current_task_id
+            and task["status"] in {"done", "shipped"}
+            and task.get("owner") != "editor"
+            and int(task.get("revision_round", 0) or 0) == current_round
+        ]
+        if not candidates:
+            candidates = [
+                task
+                for task in tasks
+                if task["id"] != current_task_id
+                and task["status"] in {"done", "shipped"}
+                and task.get("owner") != "editor"
+            ]
+        if candidates:
+            latest_candidate_id = candidates[-1]["id"]
+
     lines = []
-    for task in project_tasks(state, project_id):
+    for task in tasks:
         if task["id"] == current_task_id or task["status"] not in {"done", "shipped"}:
             continue
-        if task["owner"] == "editor" and project and project.get("last_editor_feedback"):
-            result, block_limit = project["last_editor_feedback"], max(reviewer_limit, 3000)
+        result = (task.get("result") or "").strip()
+        is_latest_candidate = task["id"] == latest_candidate_id
+        block_limit = MAX_TASK_STORED_RESULT_CHARS if is_latest_candidate else reviewer_limit
+        result_was_truncated = bool(task.get("result_truncated")) or len(result) > block_limit
+        if result_was_truncated:
+            marker = " ...[truncated]"
+            result = result[:max(0, block_limit - len(marker))] + marker
+        if is_latest_candidate:
+            block = f"- LATEST REVIEW CANDIDATE: {task['owner']} ({task['title']})"
         else:
-            result, block_limit = (task.get("result") or "").strip(), reviewer_limit
-        if len(result) > block_limit:
-            result = result[:block_limit] + " ...[truncated]"
-        block = f"- {task['owner']} ({task['title']})"
+            block = f"- {task['owner']} ({task['title']})"
         if result:
             block += f":\n  Result: {result}"
         if task.get("artifacts"):
@@ -1842,12 +1983,41 @@ def build_task_prompt(project, task, prior_work="", deliverable_name=None, deliv
     if acceptance_criteria:
         prompt += "\nAcceptance criteria (evaluate these explicitly):\n"
         prompt += "\n".join(f"- {criterion}" for criterion in acceptance_criteria) + "\n"
+    revision_feedback, prompt_feedback_truncated = _bounded_text(
+        task.get("revision_feedback"), MAX_REVIEW_FEEDBACK_CHARS, strip=True
+    )
+    if revision_feedback and (
+        prompt_feedback_truncated or task.get("revision_feedback_truncated")
+    ):
+        marker = " ...[truncated]"
+        revision_feedback = (
+            revision_feedback[:max(0, MAX_REVIEW_FEEDBACK_CHARS - len(marker))] + marker
+        )
+    if revision_feedback:
+        prompt += "\nLatest required changes:\n"
+        prompt += f"Revision round: {int(task.get('revision_round', 0) or 0)}\n"
+        prompt += f"---\n{revision_feedback}\n---\n"
+        if task.get("owner") == "editor":
+            prompt += (
+                "Verify whether the latest revision candidate addresses every applicable "
+                "required change; do not treat an older failed result as the candidate.\n"
+            )
+        else:
+            prompt += (
+                "Address every applicable required change explicitly, and state the "
+                "result or evidence for each one.\n"
+            )
     if prior_work:
         prompt += (
             "\nYour teammates have ALREADY completed earlier steps on this project. Build "
             "on their work - do NOT redo it or produce a duplicate:\n"
             f"{prior_work}\n"
         )
+        if task.get("owner") == "editor":
+            prompt += (
+                "Review the result labeled LATEST REVIEW CANDIDATE as the current "
+                "submission. Treat other task results as historical context only.\n"
+            )
     if deliverable_content:
         snippet = deliverable_content[:DELIVERABLE_INJECT_CHARS]
         truncated = "\n... [truncated]" if len(deliverable_content) > DELIVERABLE_INJECT_CHARS else ""

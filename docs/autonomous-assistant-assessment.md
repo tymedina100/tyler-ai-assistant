@@ -21,9 +21,9 @@ The sections below remain the preimplementation baseline. The current branch now
 - Telegram delivery through the existing group runtime; and
 - durable run, routing, attempt, usage, cost, review, and outcome records.
 
-The verification pass also closed five failure paths that were not safe enough in the initial implementation: corrupt autonomy state now leaves a durable recovery-required marker instead of silently reseeding on the next run; a crashed/cancelled Company runner blocks its project and closes reservations; cancellation waits for an already-started paid worker thread before budget reconciliation; reviewer prompts receive a larger bounded copy of non-file worker results; and an item with no explicit acceptance criteria cannot route or execute.
+The verification pass also closed failure paths that were not safe enough in the initial implementation: corrupt autonomy state now leaves a durable recovery-required marker instead of silently reseeding on the next run; a crashed/cancelled Company runner blocks its project and closes reservations; cancellation waits for an already-started paid worker thread before budget reconciliation; larger bounded internal worker results and explicit latest-candidate prompts prevent review feedback from chasing the smaller Telegram/report copy; an item with no explicit acceptance criteria cannot route or execute; and `/autorun retry <item-id>` provides a locked, audited owner recovery path without starting paid work.
 
-Remaining production verification is operational rather than architectural: credentialed OpenAI/Telegram execution, Railway mounted-volume behavior, and Docker images still require a controlled smoke test. Runs remain single-item and sequential, and owner resolution of `needs_human` items does not yet have a dedicated Telegram command.
+Remaining production verification is operational rather than architectural: credentialed OpenAI/Telegram execution, Railway mounted-volume behavior, and Docker images still require a controlled smoke test. Runs remain single-item and sequential; owner retry is supported, while skip, accept-as-is, criteria editing, and automatic rescoping remain deferred.
 
 ## 1. What the system currently does
 

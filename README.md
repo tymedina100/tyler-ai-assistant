@@ -555,6 +555,18 @@ trigger a dry-run. Both commands also work in a Miles DM:
 /autorun dry-run
 ```
 
+When a run reaches `needs_human` or `blocked`, resolve the stated access problem or
+owner decision first. Then reset exactly that roadmap item from the **group operating
+room** without starting work or spending model budget:
+
+```text
+/autorun retry AUTO-RECOVERY-001
+```
+
+The retry command preserves previous attempts and costs, clears the terminal owner-action
+fields, and makes the item eligible for a future run. It never starts execution itself;
+run `/autorun dry-run` next to verify selection before using `/autorun live`.
+
 After reviewing dry-run selection, routing, budget, and authorization output, live mode
 requires deliberate configuration: set `AUTONOMY_ENABLED=true`, set
 `AUTONOMY_DRY_RUN=false`, and choose an appropriate
@@ -609,8 +621,12 @@ for new/legacy state; an existing `company_state.json` retains its stored value.
 `AUTONOMY_*` fallback values aligned if you also use the standalone CLI.
 
 `MAX_REVISION_ROUNDS` and `MAX_EXECUTION_ATTEMPTS` bound Company Mode's review and task
-loops. `MAX_TASK_RESULT_CHARS` defaults to `5000`, giving Vera a bounded but materially
-complete view of non-file worker output. Live worker/reviewer estimates and controlled idle ideation are reserved atomically
+loops. Company Mode retains a larger bounded non-file worker result for review and marks
+the latest revision candidate explicitly. `MAX_TASK_STORED_RESULT_CHARS` defaults to
+`20000`; reviewer feedback defaults to `12000` characters with ten history entries.
+`MAX_TASK_RESULT_CHARS` defaults to `5000` and bounds the smaller copy placed in the run
+report and Telegram delivery. Each setting also has a defensive hard maximum. Live worker/reviewer
+estimates and controlled idle ideation are reserved atomically
 before paid calls and then released or reconciled. `ADHOC_RESERVATION_USD` defaults to
 `0.10` when metered group work has no task-specific estimate. Concurrent reservations on
 one shared filesystem cannot each claim the same remaining dollars. If a metered caller
@@ -669,7 +685,8 @@ confirmations remain process-memory state; exact provider billing is unavailable
 response lacks usage and is then conservatively charged at the held estimate; the task
 time ceiling prevents another attempt but cannot preempt a Python thread, so the runner
 waits for it to finish and reconcile; modify-local automation awaits an isolated executor;
-owner resolution does not yet have a dedicated `/autorun resolve|retry|skip` command;
+owner resolution currently supports explicit `/autorun retry <item-id>`, but not skip,
+accept-as-is, acceptance-criteria editing, or automatic rescoping;
 model prices/availability are configuration snapshots; and live Telegram, OpenAI,
 Railway-volume, Docker, and external-connector behavior still require credentialed smoke
 tests.
