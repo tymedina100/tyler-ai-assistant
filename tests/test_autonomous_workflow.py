@@ -107,9 +107,30 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(config.schedule_days, "mon-fri")
         self.assertEqual(config.timezone, "America/Phoenix")
         self.assertEqual(config.daily_budget_usd, 5.0)
-        self.assertEqual(config.max_tasks_per_run, 1)
-        self.assertEqual(config.max_ideas_per_run, 1)
+        self.assertEqual(config.max_tasks_per_run, 10)
+        self.assertEqual(config.max_ideas_per_run, 3)
+        self.assertEqual(config.max_session_minutes, 120)
+        self.assertEqual(config.min_task_reservation_usd, 0.05)
         self.assertEqual(config.max_authorization, autonomy.AuthorizationLevel.PROPOSE)
+
+    def test_session_limits_are_loaded_from_env_and_bounded(self):
+        with patch.dict(os.environ, {
+            "AUTONOMY_MAX_TASKS_PER_RUN": "12",
+            "AUTONOMY_MAX_IDEAS_PER_RUN": "4",
+            "AUTONOMY_MAX_SESSION_MINUTES": "90",
+        }, clear=True):
+            config = autonomy.AutonomyConfig.from_env()
+        self.assertEqual(config.max_tasks_per_run, 12)
+        self.assertEqual(config.max_ideas_per_run, 4)
+        self.assertEqual(config.max_session_minutes, 90)
+
+        with patch.dict(os.environ, {
+            "AUTONOMY_MAX_TASKS_PER_RUN": "51",
+            "AUTONOMY_MAX_SESSION_MINUTES": "0",
+        }, clear=True):
+            config = autonomy.AutonomyConfig.from_env()
+        self.assertEqual(config.max_tasks_per_run, 10)
+        self.assertEqual(config.max_session_minutes, 120)
 
     def test_scheduler_registers_weekday_daily_callback(self):
         scheduler = FakeScheduler()
@@ -937,6 +958,285 @@ class AutonomousWorkflowTests(unittest.TestCase):
             persisted["human_action"],
             "Grant read access to the repository, then retry.",
         )
+
+    def test_session_executes_priority_order_and_aggregates_totals(self):
+        self.config = replace(self.config, max_tasks_per_run=10)
+        calls = []
+
+        def execute(_project, selected, _decision, _run_id):
+            calls.append(selected["id"])
+            return {
+                "status": "completed",
+                "actual_cost_usd": 0.10,
+                "model": "worker-model",
+                "token_usage": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100},
+                "result_text": f"Completed {selected['id']}",
+            }
+
+        decision = SimpleNamespace(
+            model_id="worker-model", estimated_cost_usd=0.05,
+            reason="Lowest capable model.", deferred=False, deferral_reason="",
+        )
+        workflow = self.workflow(
+            [item("low", priority=10), item("high", priority=30), item("middle", priority=20)],
+            executor=execute,
+            router=SimpleNamespace(route=Mock(return_value=decision)),
+        )
+
+        report = workflow.run_session(dry_run=False)
+
+        self.assertEqual(calls, ["high", "middle", "low"])
+        self.assertEqual(report["final_status"], "completed")
+        self.assertEqual(report["stop_reason"], "no_actionable_work")
+        self.assertEqual(len(report["cycle_reports"]), 4)
+        self.assertAlmostEqual(report["actual_cost_usd"], 0.30)
+        self.assertEqual(report["token_usage"]["total_tokens"], 300)
+        self.assertEqual(report["costs"]["by_task"], {
+            "high": 0.10, "middle": 0.10, "low": 0.10,
+        })
+        self.assertIn("Task high, Task middle, Task low", report["telegram_summary"])
+        persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(len(persisted["cycle_reports"]), 4)
+
+    def test_session_holds_lock_and_scheduled_date_is_claimed_once(self):
+        observed_lock = []
+        workflow = self.workflow([item()])
+
+        def execute(_project, _selected, _decision, _run_id):
+            contender = FileLock(str(workflow.run_lock_path), timeout=0)
+            try:
+                contender.acquire()
+            except Exception:
+                observed_lock.append(True)
+            else:
+                contender.release()
+                observed_lock.append(False)
+            return {"status": "completed", "actual_cost_usd": 0.01}
+
+        workflow.executor = execute
+        first = workflow.run_session(
+            trigger_source="scheduled", dry_run=False, scheduled_date="2026-07-31"
+        )
+        second = workflow.run_session(
+            trigger_source="scheduled", dry_run=False, scheduled_date="2026-07-31"
+        )
+
+        self.assertEqual(observed_lock, [True])
+        self.assertEqual(first["final_status"], "completed")
+        self.assertEqual(second["final_status"], "idempotent_skip")
+        self.assertEqual(second["stop_reason"], "scheduled_date_already_claimed")
+
+    def test_overlapping_session_does_not_touch_persistent_state(self):
+        workflow = self.workflow([item()], executor=Mock())
+        workflow.base_dir.mkdir(parents=True, exist_ok=True)
+        held = FileLock(str(workflow.run_lock_path))
+        held.acquire()
+        try:
+            with patch.object(workflow.store, "load", side_effect=AssertionError("must not read")), \
+                    patch.object(workflow.store, "save", side_effect=AssertionError("must not write")):
+                report = workflow.run_session(dry_run=False)
+        finally:
+            held.release()
+
+        self.assertEqual(report["final_status"], "overlap_prevented")
+        self.assertEqual(report["stop_reason"], "overlap_prevented")
+        workflow.executor.assert_not_called()
+
+    def test_session_continues_after_needs_human_to_unrelated_work(self):
+        calls = []
+
+        def execute(_project, selected, _decision, _run_id):
+            calls.append(selected["id"])
+            if selected["id"] == "blocked-high":
+                return {
+                    "status": "needs_human",
+                    "reason": "Repository access is missing.",
+                    "failure_classification": "missing_access",
+                    "human_action": "Grant repository access.",
+                    "actual_cost_usd": 0.01,
+                }
+            return {"status": "completed", "actual_cost_usd": 0.02}
+
+        workflow = self.workflow([
+            item("blocked-high", priority=20), item("unrelated", priority=10)
+        ], executor=execute)
+
+        report = workflow.run_session(dry_run=False)
+
+        self.assertEqual(calls, ["blocked-high", "unrelated"])
+        self.assertEqual(report["final_status"], "completed")
+        self.assertEqual([task["status"] for task in report["tasks_selected"]], [
+            "needs_human", "completed",
+        ])
+        self.assertIn("Grant repository access.", report["human_actions"])
+
+    def test_session_attempts_budget_deferred_item_once_then_continues(self):
+        routed_types = []
+
+        def route(request):
+            routed_types.append(request.task_type)
+            if request.task_type == "architecture":
+                return SimpleNamespace(
+                    model_id=None, estimated_cost_usd=9.0,
+                    reason="Task estimate does not fit.", deferred=True,
+                    deferral_reason="insufficient_budget",
+                )
+            return SimpleNamespace(
+                model_id="worker-model", estimated_cost_usd=0.05,
+                reason="Fits remaining budget.", deferred=False, deferral_reason="",
+            )
+
+        executor = Mock(return_value={"status": "completed", "actual_cost_usd": 0.02})
+        workflow = self.workflow([
+            item("too-large", priority=20, task_type="architecture"),
+            item("small", priority=10, task_type="status_update"),
+        ], executor=executor, router=SimpleNamespace(route=route))
+
+        report = workflow.run_session(dry_run=False)
+
+        self.assertEqual(routed_types, ["architecture", "status_update"])
+        self.assertEqual([task["id"] for task in report["tasks_selected"]], ["too-large", "small"])
+        self.assertEqual(report["tasks_selected"][0]["status"], "deferred")
+        self.assertEqual(report["tasks_selected"][1]["status"], "completed")
+        executor.assert_called_once()
+
+    def test_session_stops_at_budget_floor_and_preserves_emergency_reserve(self):
+        executor = Mock(return_value={"status": "completed", "actual_cost_usd": 4.72})
+        decision = SimpleNamespace(
+            model_id="worker-model", estimated_cost_usd=0.05,
+            reason="Fits ordinary budget.", deferred=False, deferral_reason="",
+        )
+        workflow = self.workflow(
+            [item("first", priority=20), item("second", priority=10)],
+            executor=executor,
+            router=SimpleNamespace(route=Mock(return_value=decision)),
+        )
+
+        report = workflow.run_session(dry_run=False)
+
+        self.assertEqual(report["stop_reason"], "budget_floor")
+        self.assertEqual([task["id"] for task in report["tasks_selected"]], ["first"])
+        self.assertAlmostEqual(report["budget"]["remaining_usd"], 0.03)
+        self.assertEqual(workflow.load_state()["projects"][0]["roadmap_items"][1]["status"], "ready")
+
+    def test_session_dry_run_plans_once_without_execution_or_ideas(self):
+        executor = Mock()
+        ideas = Mock()
+        workflow = self.workflow(
+            [item("high", priority=20), item("low", priority=10)],
+            executor=executor,
+            idea_generator=ideas,
+        )
+
+        report = workflow.run_session(dry_run=True)
+
+        self.assertEqual(report["final_status"], "dry_run")
+        self.assertEqual(report["stop_reason"], "dry_run_complete")
+        self.assertEqual(len(report["cycle_reports"]), 1)
+        self.assertEqual([task["id"] for task in report["tasks_selected"]], ["high"])
+        executor.assert_not_called()
+        ideas.assert_not_called()
+
+    def test_session_runs_creative_once_and_never_executes_proposals(self):
+        executor = Mock()
+        ideas = Mock(return_value={
+            "ideas": [
+                {
+                    "idea": "Deployment health digest",
+                    "problem_addressed": "Silent failures",
+                    "expected_value": "Faster recovery",
+                    "estimated_effort": "small",
+                    "estimated_ai_cost_usd": 0.03,
+                    "recommended_next_validation_step": "Review three incidents",
+                },
+                {"idea": "Roadmap aging report"},
+            ],
+            "model": "creative-model",
+            "model_reason": "A balanced ideation model is sufficient.",
+            "estimated_cost_usd": 0.04,
+            "actual_cost_usd": 0.03,
+            "token_usage": {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100},
+            "agent": "creative",
+        })
+        workflow = self.workflow(
+            [item(status="completed")], executor=executor, idea_generator=ideas
+        )
+
+        report = workflow.run_session(dry_run=False)
+
+        ideas.assert_called_once()
+        executor.assert_not_called()
+        self.assertEqual(report["final_status"], "ideas_proposed")
+        self.assertEqual(report["stop_reason"], "ideas_proposed")
+        self.assertEqual(len(report["idea_proposals"]), 2)
+        self.assertIn("Deployment health digest", autonomy.format_telegram_deliverable(report))
+        backlog = workflow.load_state()["idea_backlog"]
+        self.assertEqual([idea["status"] for idea in backlog], ["proposed", "proposed"])
+
+    def test_creative_report_never_claims_more_than_backlog_capacity(self):
+        self.config = replace(self.config, idea_backlog_limit=2, max_ideas_per_run=3)
+        workflow = self.workflow(
+            [item(status="completed")],
+            idea_generator=Mock(return_value=[
+                {"idea": "Only available slot"},
+                {"idea": "Must not be reported"},
+                {"idea": "Also must not be reported"},
+            ]),
+        )
+        state = workflow.load_state()
+        state["idea_backlog"] = [{
+            "id": "existing", "idea": "Existing idea", "status": "proposed",
+            "fingerprint": "existing-fingerprint",
+        }]
+        workflow.store.save(state)
+
+        report = workflow.run_session(dry_run=False)
+
+        self.assertEqual(len(report["idea_proposals"]), 1)
+        self.assertEqual(report["idea_proposals"][0]["idea"], "Only available slot")
+        self.assertEqual(len(workflow.load_state()["idea_backlog"]), 2)
+
+    def test_session_stops_before_work_on_a_new_budget_date(self):
+        clock = {"now": datetime(2026, 7, 31, 14, 0, tzinfo=timezone.utc)}
+        calls = []
+
+        def execute(_project, selected, _decision, _run_id):
+            calls.append(selected["id"])
+            clock["now"] = clock["now"] + timedelta(days=1)
+            return {"status": "completed", "actual_cost_usd": 0.01}
+
+        self.write_seed([item("first", priority=20), item("second", priority=10)])
+        workflow = autonomy.AutonomousWorkflow(
+            self.config,
+            state_path=self.state_path,
+            seed_path=self.seed,
+            executor=execute,
+            now_provider=lambda: clock["now"],
+        )
+
+        report = workflow.run_session(dry_run=False)
+
+        self.assertEqual(calls, ["first"])
+        self.assertEqual(report["stop_reason"], "budget_date_changed")
+        self.assertIn("Stop: budget date changed", report["telegram_summary"])
+        self.assertEqual(workflow.load_state()["projects"][0]["roadmap_items"][1]["status"], "ready")
+
+    def test_session_honors_task_and_elapsed_time_caps(self):
+        self.config = replace(self.config, max_tasks_per_run=2)
+        executor = Mock(return_value={"status": "completed", "actual_cost_usd": 0.01})
+        workflow = self.workflow([
+            item("one", priority=30), item("two", priority=20), item("three", priority=10)
+        ], executor=executor)
+
+        report = workflow.run_session(dry_run=False)
+        self.assertEqual(report["stop_reason"], "max_tasks_reached")
+        self.assertEqual(executor.call_count, 2)
+
+        timed = self.workflow([item("later")], executor=Mock())
+        with patch.object(autonomy.time, "monotonic", side_effect=[0.0, 7200.0]):
+            timed_report = timed.run_session(dry_run=False)
+        self.assertEqual(timed_report["stop_reason"], "max_session_time_reached")
+        timed.executor.assert_not_called()
 
 
 if __name__ == "__main__":

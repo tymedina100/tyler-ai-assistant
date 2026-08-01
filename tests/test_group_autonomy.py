@@ -28,6 +28,9 @@ def import_group_bot_with_stub_main():
         for key in specialist_keys
     }
     fake_main = types.SimpleNamespace(
+        ExecutionBudgetExceededError=type(
+            "ExecutionBudgetExceededError", (RuntimeError,), {}
+        ),
         SPECIALISTS=specialists,
         TOOLS=[{"type": "function", "name": "read_file"}, {"type": "function", "name": "send_email"}],
         CONFIRMATION_MODE="enabled",
@@ -73,7 +76,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
         disabled = autonomous_workflow.AutonomyConfig(enabled=False, dry_run=True)
         with patch.object(self.group, "AUTONOMY_CONFIG", disabled), patch.object(
-            self.group, "_run_autonomy_cycle", new=AsyncMock()
+            self.group, "_run_autonomy_session", new=AsyncMock()
         ) as run:
             await self.group.handle_autorun_command(update, "/autorun live")
         run.assert_not_awaited()
@@ -82,7 +85,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         update.message.reply_text.reset_mock()
         locked = autonomous_workflow.AutonomyConfig(enabled=True, dry_run=True)
         with patch.object(self.group, "AUTONOMY_CONFIG", locked), patch.object(
-            self.group, "_run_autonomy_cycle", new=AsyncMock()
+            self.group, "_run_autonomy_session", new=AsyncMock()
         ) as run:
             await self.group.handle_autorun_command(update, "/autorun live")
         run.assert_not_awaited()
@@ -91,15 +94,44 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
     async def test_manual_dry_run_returns_report_without_live_executor(self):
         update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
         report = {
+            "dry_run": True,
+            "cycle_reports": [],
             "telegram_summary": "Autonomous run: dry_run",
             "report_path": "C:/tmp/run.json",
         }
         with patch.object(
-            self.group, "_run_autonomy_cycle", new=AsyncMock(return_value=report)
+            self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
         ) as run, patch.object(self.group, "reply_chunks", new=AsyncMock()) as reply:
             await self.group.handle_autorun_command(update, "/autorun dry-run")
         run.assert_awaited_once_with("telegram", dry_run=True)
         self.assertIn("dry_run", reply.await_args.args[1])
+
+    async def test_manual_live_command_starts_one_bounded_session(self):
+        update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
+        config = autonomous_workflow.AutonomyConfig(enabled=True, dry_run=False)
+        report = {
+            "dry_run": False,
+            "cycle_reports": [],
+            "escalations": [],
+            "telegram_summary": "Autonomous session: completed",
+        }
+        with patch.object(self.group, "AUTONOMY_CONFIG", config), patch.object(
+            self.group, "autonomy_runner_task", None
+        ), patch.object(
+            self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
+        ) as run, patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
+            await self.group.handle_autorun_command(update, "/autorun live")
+            session_task = self.group.autonomy_runner_task
+            self.assertIsNotNone(session_task)
+            await session_task
+
+        run.assert_awaited_once_with("telegram", dry_run=False)
+        self.assertEqual(
+            [call.args for call in post.await_args_list],
+            [("Autonomous session: completed", "manager")],
+        )
+        self.assertIn("bounded autonomous session", update.message.reply_text.await_args.args[0])
+        self.assertIsNone(self.group.autonomy_runner_task)
 
     async def test_autorun_retry_resets_one_item_without_starting_work(self):
         update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
@@ -111,7 +143,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(self.group, "autonomy_runner_task", None), patch.object(
             self.group, "_get_autonomy_workflow", return_value=workflow
-        ), patch.object(self.group, "_run_autonomy_cycle", new=AsyncMock()) as run:
+        ), patch.object(self.group, "_run_autonomy_session", new=AsyncMock()) as run:
             await self.group.handle_autorun_command(
                 update,
                 "/autorun retry AUTO-RECOVERY-001",
@@ -156,7 +188,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(self.group, "autonomy_runner_task", None), patch.object(
             self.group, "_get_autonomy_workflow", return_value=workflow
-        ), patch.object(self.group, "_run_autonomy_cycle", new=AsyncMock()) as run:
+        ), patch.object(self.group, "_run_autonomy_session", new=AsyncMock()) as run:
             await self.group.handle_autorun_command(
                 update,
                 "/autorun retry AUTO-RECOVERY-001",
@@ -321,15 +353,48 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["projects"][0]["status"], "completed")
         self.assertTrue(all(task["status"] == "done" for task in final["tasks"]))
 
-    async def test_scheduled_live_run_posts_escalation_and_summary_as_manager(self):
+    async def test_run_autonomy_session_calls_bounded_workflow_api(self):
+        report = {"cycle_reports": [], "telegram_summary": "Session complete"}
+        workflow = types.SimpleNamespace(run_session=Mock(return_value=report))
+        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            returned = await self.group._run_autonomy_session("scheduled", dry_run=False)
+
+        self.assertIs(returned, report)
+        workflow.run_session.assert_called_once_with(
+            trigger_source="scheduled",
+            dry_run=False,
+        )
+
+    async def test_scheduled_live_session_deduplicates_escalations_and_posts_one_summary(self):
         report = {
             "dry_run": False,
-            "escalations": ["Project A needs repository access."],
-            "telegram_summary": "Autonomous run: needs_human",
+            "cycle_reports": [
+                {
+                    "escalations": [
+                        "Project A needs repository access.",
+                        "Project A needs repository access.",
+                    ],
+                },
+                {
+                    "escalations": [
+                        "Project A needs repository access.",
+                        "Project B needs an owner decision.",
+                    ],
+                },
+            ],
+            "escalations": [
+                "Project A needs repository access.",
+                "Project B needs an owner decision.",
+            ],
+            "telegram_summary": "Autonomous session: needs_human",
         }
         with patch.object(
-            self.group, "_run_autonomy_cycle", new=AsyncMock(return_value=report)
-        ) as run, patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
+            self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
+        ) as run, patch.object(
+            self.group.autonomous_workflow,
+            "format_telegram_deliverable",
+            return_value="",
+        ), patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
             returned = await self.group._run_and_post_autonomy("scheduled", dry_run=False)
 
         self.assertIs(returned, report)
@@ -338,53 +403,93 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             [call.args for call in post.await_args_list],
             [
                 ("Project A needs repository access.", "manager"),
-                ("Autonomous run: needs_human", "manager"),
+                ("Project B needs an owner decision.", "manager"),
+                ("Autonomous session: needs_human", "manager"),
             ],
         )
         self.assertIsNone(self.group.autonomy_runner_task)
 
-    async def test_completed_live_run_posts_deliverable_before_summary(self):
+    async def test_live_session_posts_each_child_deliverable_in_order_then_one_summary(self):
+        children = [
+            {"id": "cycle-1", "telegram_summary": "DO NOT POST CHILD 1"},
+            {"id": "cycle-2", "telegram_summary": "DO NOT POST CHILD 2"},
+            {
+                "id": "cycle-3",
+                "idea_proposals": [{"idea": "Add a deployment health digest"}],
+                "telegram_summary": "DO NOT POST CHILD 3",
+            },
+        ]
         report = {
             "dry_run": False,
             "escalations": [],
-            "tasks_selected": [{
-                "id": "AUTO-1",
-                "title": "Produce checklist",
-                "status": "completed",
-                "agent_owner": "manager",
-            }],
-            "result_text": "1. Verify the Railway run.\n2. Verify the Telegram summary.",
-            "result_agent": "general",
-            "result_truncated": False,
-            "telegram_summary": "Autonomous run: completed",
+            "cycle_reports": children,
+            "telegram_summary": "Autonomous session: completed",
         }
         with patch.object(
-            self.group, "_run_autonomy_cycle", new=AsyncMock(return_value=report)
-        ), patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
+            self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
+        ), patch.object(
+            self.group.autonomous_workflow,
+            "format_telegram_deliverable",
+            side_effect=[
+                "Autonomous deliverable: first",
+                "Autonomous deliverable: second",
+                "Lumen idea plan: deployment health digest",
+            ],
+        ) as formatter, patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
             await self.group._run_and_post_autonomy("scheduled", dry_run=False)
 
-        self.assertEqual(len(post.await_args_list), 2)
-        deliverable_call, summary_call = post.await_args_list
-        self.assertIn("Autonomous deliverable", deliverable_call.args[0])
-        self.assertIn("Verify the Railway run", deliverable_call.args[0])
-        self.assertEqual(deliverable_call.args[1], "manager")
-        self.assertEqual(summary_call.args, ("Autonomous run: completed", "manager"))
+        self.assertEqual([call.args[0] for call in formatter.call_args_list], children)
+        self.assertEqual(
+            [call.args for call in post.await_args_list],
+            [
+                ("Autonomous deliverable: first", "manager"),
+                ("Autonomous deliverable: second", "manager"),
+                ("Lumen idea plan: deployment health digest", "manager"),
+                ("Autonomous session: completed", "manager"),
+            ],
+        )
+        self.assertEqual(
+            sum(call.args[0] == "Autonomous session: completed" for call in post.await_args_list),
+            1,
+        )
+        self.assertFalse(any("DO NOT POST CHILD" in call.args[0] for call in post.await_args_list))
 
-    async def test_scheduled_dry_run_posts_no_telegram_message(self):
+    async def test_scheduled_dry_run_session_posts_no_telegram_message(self):
         report = {
             "dry_run": True,
             "escalations": [],
-            "tasks_selected": [],
-            "result_text": "",
-            "telegram_summary": "Autonomous run: dry_run",
+            "cycle_reports": [{"telegram_summary": "Child dry run"}],
+            "telegram_summary": "Autonomous session: dry_run",
             "report_path": "C:/tmp/run.json",
         }
         with patch.object(
-            self.group, "_run_autonomy_cycle", new=AsyncMock(return_value=report)
+            self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
         ), patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
             await self.group._run_and_post_autonomy("scheduled", dry_run=True)
 
         post.assert_not_awaited()
+
+    async def test_autonomy_runner_task_stays_active_for_entire_session(self):
+        observed = []
+
+        async def session(_trigger_source, *, dry_run=None):
+            current = asyncio.current_task()
+            observed.append(self.group.autonomy_runner_task is current)
+            await asyncio.sleep(0)
+            observed.append(self.group.autonomy_runner_task is current)
+            return {
+                "dry_run": bool(dry_run),
+                "cycle_reports": [],
+                "telegram_summary": "Autonomous session: completed",
+            }
+
+        with patch.object(self.group, "_run_autonomy_session", side_effect=session), patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ):
+            await self.group._run_and_post_autonomy("scheduled", dry_run=False)
+
+        self.assertEqual(observed, [True, True])
+        self.assertIsNone(self.group.autonomy_runner_task)
 
     async def test_external_action_escalates_without_model_or_company_call(self):
         with patch.object(self.group, "_company_budget_snapshot") as budget, patch.object(
@@ -449,6 +554,30 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["include_memories"])
         self.assertFalse(any(call.args == (True,) for call in fake_main.set_company_execution.call_args_list))
 
+    async def test_company_task_sink_uses_its_persisted_reservation_as_hard_envelope(self):
+        project = {"id": "project-1", "title": "Project", "goal": "Inspect"}
+        task = {
+            "id": "task-1", "project_id": "project-1", "owner": "manager",
+            "title": "Inspect", "reserved_usd": 0.125,
+        }
+        state = {"projects": [project], "tasks": [task], "company": {}}
+        with patch.object(
+            self.group.company_mode, "load_state", return_value=state
+        ), patch.object(
+            self.group.company_mode, "prior_work_summary", return_value=""
+        ), patch.object(
+            self.group, "_load_project_deliverable", return_value=("", "")
+        ), patch.object(
+            self.group.company_mode, "build_task_prompt", return_value="prompt"
+        ), patch.object(
+            self.group, "_execute_routed_task", new=AsyncMock(return_value="done")
+        ) as execute:
+            outcome = await self.group._run_one_task(project, task)
+
+        self.assertEqual(outcome, "done")
+        sink = execute.await_args.args[4]
+        self.assertEqual(sink["budget_cap_usd"], 0.125)
+
     async def test_metered_no_usage_charges_reserved_estimate_as_estimated(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "company.json"
@@ -469,6 +598,33 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["cost_entries"][-1]["cost_basis"], "estimated")
         self.assertEqual(receipt["project_id"], "project-a")
         self.assertEqual(receipt["task_id"], "task-a")
+
+    async def test_budget_guard_before_first_call_reconciles_known_zero_spend(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "company.json"
+            company_mode.set_daily_budget(1.0, path)
+
+            def guard_blocks():
+                sink = self.group.main.set_execution_sink.call_args.args[0]
+                sink["budget_guard_blocked"] = True
+                raise self.group.main.ExecutionBudgetExceededError("request cannot fit")
+
+            self.group.main.set_execution_sink.reset_mock()
+            with patch.object(self.group.company_mode, "COMPANY_STATE_FILE", path):
+                with self.assertRaises(self.group.main.ExecutionBudgetExceededError):
+                    await self.group._run_metered(
+                        guard_blocks,
+                        estimate_usd=0.10,
+                        context="strict preflight",
+                        strict_budget=True,
+                    )
+            state = company_mode.load_state(path)
+
+        strict_sink = self.group.main.set_execution_sink.call_args_list[0].args[0]
+        self.assertEqual(strict_sink["budget_cap_usd"], 0.10)
+        self.assertEqual(state["company"]["reserved_today_usd"], 0.0)
+        self.assertEqual(state["company"]["spent_today_usd"], 0.0)
+        self.assertEqual(state["cost_entries"][-1]["cost_basis"], "actual")
 
     async def test_cancelled_metered_call_finishes_before_budget_reconciliation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -534,7 +690,65 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["agent"], "creative")
         self.assertEqual(result["model"], "creative-model")
         self.assertTrue(metered.await_args.kwargs["return_receipt"])
+        self.assertTrue(metered.await_args.kwargs["strict_budget"])
         self.assertEqual(metered.await_args.kwargs["project_id"], "idea_backlog")
+
+    async def test_idle_ideation_turns_strict_budget_guard_into_deferral(self):
+        decision = types.SimpleNamespace(
+            model_id="gpt-5.4-mini",
+            reason="Standard ideation route.",
+            estimated_cost_usd=0.01,
+            deferred=False,
+            deferral_reason="",
+        )
+        error = self.group.main.ExecutionBudgetExceededError(
+            "The creative request cannot fit its reservation."
+        )
+        with patch.object(
+            self.group, "_autonomy_runtime_deferral", new=AsyncMock(return_value=None)
+        ), patch.object(
+            self.group, "_company_budget_snapshot", return_value={"remaining_usd": 1.0}
+        ), patch.object(
+            self.group.AUTONOMY_ROUTER, "route", return_value=decision
+        ), patch.object(
+            self.group, "_run_metered", new=AsyncMock(side_effect=error)
+        ):
+            result = await self.group._generate_autonomy_ideas({"projects": []}, 1)
+
+        self.assertTrue(result["deferred"])
+        self.assertEqual(result["actual_cost_usd"], 0.0)
+        self.assertIn("cannot fit", result["deferral_reason"])
+
+    async def test_full_idea_backlog_skips_routing_and_paid_generation(self):
+        config = autonomous_workflow.AutonomyConfig(idea_backlog_limit=2)
+        state = {
+            "projects": [],
+            "idea_backlog": [
+                {"id": "idea-1", "idea": "First"},
+                {"id": "idea-2", "idea": "Second"},
+            ],
+        }
+        with patch.object(self.group, "AUTONOMY_CONFIG", config), patch.object(
+            self.group, "_autonomy_runtime_deferral", new=AsyncMock()
+        ) as runtime, patch.object(
+            self.group, "_company_budget_snapshot"
+        ) as budget, patch.object(
+            self.group.AUTONOMY_ROUTER, "route"
+        ) as route, patch.object(
+            self.group, "_run_metered", new=AsyncMock()
+        ) as metered:
+            result = await self.group._generate_autonomy_ideas(state, 1)
+
+        self.assertEqual(result["ideas"], [])
+        self.assertTrue(result["deferred"])
+        self.assertTrue(result["idle"])
+        self.assertEqual(result["deferral_kind"], "backlog_full")
+        self.assertEqual(result["actual_cost_usd"], 0.0)
+        self.assertIn("configured limit of 2", result["deferral_reason"])
+        runtime.assert_not_awaited()
+        budget.assert_not_called()
+        route.assert_not_called()
+        metered.assert_not_awaited()
 
     async def test_idle_ideation_defers_before_routing_when_owner_state_is_open(self):
         blocker = {

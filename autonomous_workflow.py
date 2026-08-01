@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 import re
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -163,8 +164,10 @@ class AutonomyConfig:
     timezone: str = "America/Phoenix"
     daily_budget_usd: float = 5.0
     emergency_reserve_usd: float = 0.25
-    max_tasks_per_run: int = 1
-    max_ideas_per_run: int = 1
+    max_tasks_per_run: int = 10
+    max_ideas_per_run: int = 3
+    max_session_minutes: int = 120
+    min_task_reservation_usd: float = 0.05
     idea_backlog_limit: int = 50
     max_execution_attempts: int = 2
     stale_run_minutes: int = 180
@@ -225,8 +228,23 @@ class AutonomyConfig:
             emergency_reserve_usd=_safe_float(
                 _env_first("AUTONOMY_EMERGENCY_RESERVE_USD", "AUTONOMOUS_EMERGENCY_RESERVE_USD"), 0.25
             ),
+            max_tasks_per_run=_safe_int(
+                _env_first("AUTONOMY_MAX_TASKS_PER_RUN", "AUTONOMOUS_MAX_TASKS_PER_RUN"),
+                10,
+                minimum=1,
+                maximum=50,
+            ),
             max_ideas_per_run=_safe_int(
-                _env_first("AUTONOMY_MAX_IDEAS_PER_RUN", "AUTONOMOUS_MAX_IDEAS_PER_RUN"), 1, minimum=0, maximum=10
+                _env_first("AUTONOMY_MAX_IDEAS_PER_RUN", "AUTONOMOUS_MAX_IDEAS_PER_RUN"), 3, minimum=0, maximum=10
+            ),
+            max_session_minutes=_safe_int(
+                _env_first("AUTONOMY_MAX_SESSION_MINUTES", "AUTONOMOUS_MAX_SESSION_MINUTES"),
+                120,
+                minimum=1,
+                maximum=1440,
+            ),
+            min_task_reservation_usd=_safe_float(
+                _env_first("AUTONOMY_MIN_TASK_RESERVATION_USD"), 0.05, minimum=0.001
             ),
             idea_backlog_limit=_safe_int(
                 _env_first("AUTONOMY_IDEA_BACKLOG_LIMIT", "AUTONOMOUS_IDEA_BACKLOG_LIMIT"), 50, minimum=1, maximum=1000
@@ -635,7 +653,11 @@ def _priority_value(value: Any) -> float:
         return 0.0
 
 
-def _select_project_and_item(state: Mapping[str, Any]) -> Optional[tuple[dict[str, Any], dict[str, Any]]]:
+def _select_project_and_item(
+    state: Mapping[str, Any],
+    excluded_item_ids: Optional[set[str]] = None,
+) -> Optional[tuple[dict[str, Any], dict[str, Any]]]:
+    excluded = {str(value) for value in (excluded_item_ids or set())}
     all_items = {
         str(item.get("id")): item
         for _, _, _, item in _iter_project_items(state)
@@ -643,6 +665,8 @@ def _select_project_and_item(state: Mapping[str, Any]) -> Optional[tuple[dict[st
     }
     candidates = []
     for project_index, item_index, project, item in _iter_project_items(state):
+        if str(item.get("id")) in excluded:
+            continue
         status = str(item.get("status", "planned")).strip().lower()
         if status not in ACTIONABLE_TASK_STATUSES:
             continue
@@ -737,6 +761,12 @@ def format_telegram_summary(report: Mapping[str, Any]) -> str:
     planned = ", ".join(str(task.get("title") or task.get("id")) for task in tasks) or "No roadmap task"
     completed_text = ", ".join(str(task.get("title") or task.get("id")) for task in completed) or "None"
     changed = list(report.get("files_changed", []) or []) + list(report.get("artifacts", []) or [])
+    idea_proposals = [
+        idea for idea in (report.get("idea_proposals", []) or []) if isinstance(idea, Mapping)
+    ]
+    idea_titles = [str(idea.get("idea") or idea.get("id") or "Untitled idea") for idea in idea_proposals]
+    if not idea_titles:
+        idea_titles = [str(value) for value in (report.get("ideas_added", []) or [])]
     deferred = report.get("deferred", []) or []
     blockers = report.get("blockers", []) or []
     actions = report.get("human_actions", []) or []
@@ -745,16 +775,21 @@ def format_telegram_summary(report: Mapping[str, Any]) -> str:
     limit = _money(budget.get("daily_budget_usd", 0.0))
     remaining = _money(budget.get("remaining_usd", max(0.0, limit - used)))
     estimate_label = " (estimated where exact usage was unavailable)" if report.get("cost_is_estimated") else ""
+    report_label = "session" if report.get("session") else "run"
     lines = [
-        f"Autonomous run: {report.get('final_status') or report.get('status') or 'unknown'}",
+        f"Autonomous {report_label}: {report.get('final_status') or report.get('status') or 'unknown'}",
         f"Planned: {planned}",
         f"Completed: {completed_text}",
         f"Changed: {', '.join(map(str, changed)) if changed else 'None'}",
+        f"Ideas: {', '.join(idea_titles) if idea_titles else 'None'}",
         f"Deferred: {', '.join(map(str, deferred)) if deferred else 'None'}",
         f"Blocked: {', '.join(map(str, blockers)) if blockers else 'None'}",
         f"Budget: ${used:.4f} used of ${limit:.2f}; ${remaining:.4f} remaining{estimate_label}",
         f"Your action: {'; '.join(map(str, actions)) if actions else 'None'}",
     ]
+    stop_reason = str(report.get("stop_reason") or "").strip()
+    if stop_reason:
+        lines.insert(-2, f"Stop: {stop_reason.replace('_', ' ')}")
     result_text = _redact_text(str(report.get("result_text") or "")).strip()
     if completed and result_text:
         compact_result = re.sub(r"\s+", " ", result_text)
@@ -773,6 +808,31 @@ def format_telegram_summary(report: Mapping[str, Any]) -> str:
     return _redact_text("\n".join(lines))[:TELEGRAM_MESSAGE_LIMIT]
 
 
+def format_telegram_idea_plan(report: Mapping[str, Any]) -> str:
+    """Render controlled Lumen proposals without another model call."""
+
+    proposals = [
+        idea for idea in (report.get("idea_proposals", []) or []) if isinstance(idea, Mapping)
+    ]
+    if not proposals:
+        return ""
+    lines = ["Lumen idea plan"]
+    for index, idea in enumerate(proposals, 1):
+        lines.extend([
+            "",
+            f"{index}. {idea.get('idea') or 'Untitled idea'}",
+            f"Problem: {idea.get('problem_addressed') or 'Not specified'}",
+            f"Expected value: {idea.get('expected_value') or 'Not specified'}",
+            f"Effort: {idea.get('estimated_effort') or 'unknown'}; estimated AI cost: ${_money(idea.get('estimated_ai_cost_usd')):.4f}",
+            f"Next validation: {idea.get('recommended_next_validation_step') or 'Owner review'}",
+        ])
+    rendered = _redact_text("\n".join(lines))
+    if len(rendered) <= TELEGRAM_MESSAGE_LIMIT:
+        return rendered
+    marker = "\n[idea plan truncated; see the persisted run report]"
+    return rendered[: TELEGRAM_MESSAGE_LIMIT - len(marker)].rstrip() + marker
+
+
 def format_telegram_deliverable(report: Mapping[str, Any]) -> str:
     """Format the substantive completed result for chunked Telegram delivery."""
 
@@ -780,7 +840,7 @@ def format_telegram_deliverable(report: Mapping[str, Any]) -> str:
     completed = [task for task in tasks if str(task.get("status", "")).lower() in TERMINAL_TASK_STATUSES]
     result_text = _redact_text(str(report.get("result_text") or "")).strip()
     if not completed or not result_text:
-        return ""
+        return format_telegram_idea_plan(report)
     task = completed[0]
     lines = [
         "Autonomous deliverable",
@@ -834,7 +894,7 @@ def _find_item(state: Mapping[str, Any], item_id: str) -> Optional[dict[str, Any
 
 
 class AutonomousWorkflow:
-    """One-task-per-run autonomous roadmap coordinator."""
+    """Single-cycle primitive plus bounded sequential daily-session coordinator."""
 
     def __init__(
         self,
@@ -948,8 +1008,10 @@ class AutonomousWorkflow:
             "tests_executed": [],
             "artifacts": [],
             "ideas_added": [],
+            "idea_proposals": [],
             "stale_recoveries": [],
             "errors": [],
+            "stop_reason": "",
             "report_path": str(report_path),
         }
 
@@ -1133,6 +1195,8 @@ class AutonomousWorkflow:
         if not isinstance(candidates, (list, tuple)):
             return
         backlog = state.setdefault("idea_backlog", [])
+        available_slots = max(0, self.config.idea_backlog_limit - len(backlog))
+        addition_limit = min(self.config.max_ideas_per_run, available_slots)
         fingerprints = {
             str(idea.get("fingerprint") or _idea_fingerprint(idea))
             for idea in backlog
@@ -1140,7 +1204,7 @@ class AutonomousWorkflow:
         }
         added = 0
         for candidate in candidates:
-            if added >= self.config.max_ideas_per_run or not isinstance(candidate, Mapping):
+            if added >= addition_limit or not isinstance(candidate, Mapping):
                 break
             idea_text = str(candidate.get("idea") or candidate.get("title") or "").strip()
             if not idea_text:
@@ -1168,9 +1232,11 @@ class AutonomousWorkflow:
             if fingerprint in fingerprints:
                 continue
             idea["fingerprint"] = fingerprint
-            backlog.append(redact_secrets(idea))
+            safe_idea = redact_secrets(idea)
+            backlog.append(safe_idea)
             fingerprints.add(fingerprint)
             report["ideas_added"].append(idea["id"])
+            report.setdefault("idea_proposals", []).append(deepcopy(safe_idea))
             added += 1
         if len(backlog) > self.config.idea_backlog_limit:
             # Keep the oldest accepted ideas stable; a full backlog requires owner
@@ -1183,12 +1249,13 @@ class AutonomousWorkflow:
         report: dict[str, Any],
         metadata: Mapping[str, Any],
         spent_before: float,
-    ) -> bool:
+    ) -> Optional[str]:
         """Attach a metered creative callback to the same run-level audit trail.
 
         Integrations may return ``{"ideas": [...], ...metering fields...}`` while
-        simple/offline generators may continue returning a plain list.  The boolean
-        result tells the caller whether routing deferred the creative call.
+        simple/offline generators may continue returning a plain list.  A string
+        result classifies a deferral so non-budget control-plane conditions are not
+        mislabeled as exhausted spend.
         """
 
         model_id = str(metadata.get("model") or metadata.get("model_id") or "").strip()
@@ -1204,7 +1271,11 @@ class AutonomousWorkflow:
         if deferred:
             reason = str(metadata.get("deferral_reason") or "Creative work was deferred by the model router.")
             report["deferred"].append(reason)
-            return True
+            report["creative_deferral_reason"] = reason
+            normalized = reason.lower()
+            if any(marker in normalized for marker in ("budget", "reserve", "remaining", "cost")):
+                return "budget"
+            return "non_budget"
 
         actual_supplied = metadata.get("actual_cost_usd") is not None
         actual = _money(metadata.get("actual_cost_usd") if actual_supplied else estimate)
@@ -1258,7 +1329,7 @@ class AutonomousWorkflow:
             except Exception as exc:
                 report["errors"].append(f"Shared budget refresh failed after idea generation: {exc}")
                 report["budget"]["spent_after_usd"] = state["budget_tracking"]["actual_or_reconciled_cost_usd"]
-        return False
+        return None
 
     def _authorization_allowed(self, item: Mapping[str, Any]) -> bool:
         requested = _authorization(item.get("authorization_level"), AuthorizationLevel.PROPOSE)
@@ -1406,6 +1477,7 @@ class AutonomousWorkflow:
             message = str(result.get("reason") or "Execution deferred.")
             report["deferred"].append(message)
             report["tasks_selected"][0]["status"] = "deferred"
+            report["tasks_selected"][0]["failure_classification"] = failure
             attempt["failure_classification"] = failure
             action = str(result.get("human_action") or "").strip()
             if action:
@@ -1438,6 +1510,7 @@ class AutonomousWorkflow:
             } or prior_attempts >= self.config.max_execution_attempts or status in {"blocked", "needs_human"}
             item["status"] = "needs_human" if terminal_failure else "ready"
             report["tasks_selected"][0]["status"] = item["status"]
+            report["tasks_selected"][0]["failure_classification"] = failure
             reason = str(result.get("error") or result.get("reason") or "Execution did not complete.")
             report["blockers"].append(reason)
             if terminal_failure:
@@ -1482,7 +1555,11 @@ class AutonomousWorkflow:
         state["run_control"]["recent_runs"] = state["run_control"]["recent_runs"][-100:]
         self.store.save(state)
 
-    def _run_locked(self, report: dict[str, Any]) -> dict[str, Any]:
+    def _run_locked(
+        self,
+        report: dict[str, Any],
+        excluded_item_ids: Optional[set[str]] = None,
+    ) -> dict[str, Any]:
         try:
             state = self.store.load()
         except CorruptAutonomyStateError as exc:
@@ -1544,9 +1621,11 @@ class AutonomousWorkflow:
         self.store.save(state)
 
         try:
-            selected = _select_project_and_item(state)
+            selected = _select_project_and_item(state, excluded_item_ids)
             if selected is None:
-                report["daily_plan"].append("No actionable roadmap work; consider at most one controlled idea proposal.")
+                report["daily_plan"].append(
+                    "No actionable roadmap work; consider one controlled Lumen idea batch."
+                )
                 if report["dry_run"]:
                     report["deferred"].append("Creative callback skipped because this is a dry run.")
                     self._finish_report(report, "dry_run", "idle_dry_run")
@@ -1559,9 +1638,14 @@ class AutonomousWorkflow:
                         metadata = generated if isinstance(generated, Mapping) and "ideas" in generated else None
                         candidates = metadata.get("ideas", []) if metadata is not None else generated
                         self._add_ideas(state, candidates, report)
-                        deferred = self._record_idea_generation(state, report, metadata, spent_before) if metadata else False
-                        if deferred:
+                        deferral_kind = (
+                            self._record_idea_generation(state, report, metadata, spent_before)
+                            if metadata else None
+                        )
+                        if deferral_kind == "budget":
                             self._finish_report(report, "deferred", "budget_deferred")
+                        elif deferral_kind:
+                            self._finish_report(report, "completed", "idle")
                         else:
                             self._finish_report(report, "completed", "ideas_proposed" if report["ideas_added"] else "idle")
                     except Exception as exc:
@@ -1597,6 +1681,7 @@ class AutonomousWorkflow:
                     "mark it ready, and retry in dry-run mode."
                 )
                 task_record["status"] = "needs_human"
+                task_record["failure_classification"] = "decision_required"
                 report["blockers"].append("missing_acceptance_criteria")
                 report["human_actions"].append(action)
                 report["escalations"].append(
@@ -1635,6 +1720,7 @@ class AutonomousWorkflow:
                 report["escalations"].append(escalation)
                 report["human_actions"].append(action)
                 task_record["status"] = "needs_human"
+                task_record["failure_classification"] = "decision_required"
                 if not report["dry_run"]:
                     item["status"] = "needs_human"
                     item["human_decision_required"] = True
@@ -1647,6 +1733,7 @@ class AutonomousWorkflow:
                 if deferral_code == "insufficient_budget":
                     report["blockers"].append("budget_exhausted")
                     task_record["status"] = "deferred"
+                    task_record["failure_classification"] = "budget_exhausted"
                     if not report["dry_run"]:
                         item["status"] = "deferred"
                     self._finish_report(report, "deferred", "budget_deferred")
@@ -1670,6 +1757,7 @@ class AutonomousWorkflow:
                         )
                     )
                     task_record["status"] = "needs_human"
+                    task_record["failure_classification"] = failure
                     if not report["dry_run"]:
                         item["status"] = "needs_human"
                         item["human_decision_required"] = True
@@ -1699,6 +1787,290 @@ class AutonomousWorkflow:
         self._close_run_claim(state, report)
         self._persist_report(report)
         return redact_secrets(report)
+
+    @staticmethod
+    def _append_unique(target: list[Any], values: Any) -> None:
+        for value in values or []:
+            if value not in target:
+                target.append(deepcopy(value))
+
+    def _merge_session_cycle(
+        self,
+        session: dict[str, Any],
+        cycle: Mapping[str, Any],
+    ) -> None:
+        """Fold one persisted single-cycle report into a bounded session report."""
+
+        session["cycle_reports"].append(deepcopy(dict(cycle)))
+        session["daily_plan"].extend(deepcopy(list(cycle.get("daily_plan", []) or [])))
+        session["tasks_selected"].extend(deepcopy(list(cycle.get("tasks_selected", []) or [])))
+        for field in (
+            "agents_involved",
+            "models_selected",
+            "model_selection_reasons",
+            "review_outcomes",
+            "blockers",
+            "deferred",
+            "escalations",
+            "human_actions",
+            "files_changed",
+            "tests_executed",
+            "artifacts",
+            "ideas_added",
+            "idea_proposals",
+            "stale_recoveries",
+            "errors",
+        ):
+            self._append_unique(session[field], cycle.get(field, []))
+
+        for token_field in ("input_tokens", "cached_input_tokens", "output_tokens", "total_tokens"):
+            session["token_usage"][token_field] = _safe_int(
+                session["token_usage"].get(token_field), 0
+            ) + _safe_int((cycle.get("token_usage", {}) or {}).get(token_field), 0)
+        session["estimated_cost_usd"] = _money(
+            session.get("estimated_cost_usd", 0.0) + _money(cycle.get("estimated_cost_usd", 0.0))
+        )
+        session["actual_cost_usd"] = _money(
+            session.get("actual_cost_usd", 0.0) + _money(cycle.get("actual_cost_usd", 0.0))
+        )
+        session["cost_is_estimated"] = bool(session.get("cost_is_estimated")) or bool(
+            cycle.get("cost_is_estimated")
+        )
+        for dimension in ("by_project", "by_task", "by_agent", "by_model"):
+            for key, amount in ((cycle.get("costs", {}) or {}).get(dimension, {}) or {}).items():
+                session["costs"][dimension][str(key)] = _money(
+                    session["costs"][dimension].get(str(key), 0.0) + _money(amount)
+                )
+        session["retry_count"] = _safe_int(session.get("retry_count"), 0) + _safe_int(
+            cycle.get("retry_count"), 0
+        )
+
+        cycle_budget = cycle.get("budget", {}) or {}
+        if len(session["cycle_reports"]) == 1:
+            session["budget"] = deepcopy(cycle_budget)
+        else:
+            initial_spend = session["budget"].get("spent_before_usd", 0.0)
+            session["budget"].update(deepcopy(cycle_budget))
+            session["budget"]["spent_before_usd"] = initial_spend
+
+        if cycle.get("result_text"):
+            session["result_text"] = str(cycle.get("result_text") or "")
+            session["result_task_id"] = cycle.get("result_task_id")
+            session["result_agent"] = cycle.get("result_agent")
+            session["result_truncated"] = bool(cycle.get("result_truncated"))
+
+    @staticmethod
+    def _cycle_is_global_stop(cycle: Mapping[str, Any]) -> bool:
+        final = str(cycle.get("final_status") or "").lower()
+        tasks = cycle.get("tasks_selected", []) or []
+        if cycle.get("errors"):
+            return True
+        if final in {"disabled", "overlap_prevented", "idempotent_skip"}:
+            return True
+        if not tasks and final not in {"idle", "ideas_proposed", "idle_dry_run", "dry_run"}:
+            return True
+        if tasks:
+            task = tasks[0]
+            return (
+                str(task.get("status") or "").lower() == "deferred"
+                and str(task.get("failure_classification") or "").lower()
+                == "decision_required"
+            )
+        return False
+
+    def _finish_session(
+        self,
+        report: dict[str, Any],
+        stop_reason: str,
+    ) -> dict[str, Any]:
+        report["stop_reason"] = stop_reason
+        completed = any(
+            str(task.get("status") or "").lower() in TERMINAL_TASK_STATUSES
+            for task in report.get("tasks_selected", [])
+        )
+        if report.get("dry_run"):
+            status, final = "dry_run", "dry_run"
+        elif stop_reason == "disabled":
+            status, final = "skipped", "disabled"
+        elif stop_reason == "overlap_prevented":
+            status, final = "skipped", "overlap_prevented"
+        elif stop_reason == "scheduled_date_already_claimed":
+            status, final = "skipped", "idempotent_skip"
+        elif completed:
+            status, final = "completed", "completed"
+        elif report.get("ideas_added"):
+            status, final = "completed", "ideas_proposed"
+        elif stop_reason in {"budget_floor", "budget_deferred"}:
+            status, final = "deferred", "budget_deferred"
+        elif report.get("human_actions") or report.get("errors"):
+            status, final = "blocked", "needs_human"
+        else:
+            status, final = "completed", "idle"
+        self._finish_report(report, status, final)
+
+        scheduled_date = report.get("scheduled_date")
+        if stop_reason in {
+            "disabled",
+            "overlap_prevented",
+            "scheduled_date_already_claimed",
+        }:
+            self._persist_report(report)
+            return redact_secrets(report)
+        try:
+            state = self.store.load()
+            if scheduled_date:
+                claim = state["run_control"].get("scheduled_dates", {}).get(scheduled_date)
+                if claim and claim.get("run_id") == report.get("run_id"):
+                    claim["status"] = report["final_status"]
+                    claim["finished_at"] = report["finish_time"]
+                    claim["cycle_count"] = len(report.get("cycle_reports", []))
+            for recent in state["run_control"].get("recent_runs", []):
+                if recent.get("run_id") == report.get("run_id"):
+                    recent["finished_at"] = report["finish_time"]
+                    recent["final_status"] = report["final_status"]
+                    recent["session"] = True
+                    recent["cycle_count"] = len(report.get("cycle_reports", []))
+                    break
+            self.store.save(state)
+        except CorruptAutonomyStateError:
+            # The child report already contains the fail-closed recovery action.
+            pass
+        self._persist_report(report)
+        return redact_secrets(report)
+
+    def _run_session_locked(self, report: dict[str, Any]) -> dict[str, Any]:
+        attempted_item_ids: set[str] = set()
+        task_attempts = 0
+        creative_attempted = False
+        started_monotonic = time.monotonic()
+        stop_reason = "no_actionable_work"
+
+        while True:
+            if task_attempts >= self.config.max_tasks_per_run:
+                stop_reason = "max_tasks_reached"
+                break
+            if time.monotonic() - started_monotonic >= self.config.max_session_minutes * 60:
+                stop_reason = "max_session_time_reached"
+                break
+            if report["cycle_reports"]:
+                budget_date = str(report["budget"].get("budget_date") or "")
+                if budget_date and self._local_date(self._now()) != budget_date:
+                    stop_reason = "budget_date_changed"
+                    break
+            if report["cycle_reports"] and _money(report["budget"].get("remaining_usd")) < self.config.min_task_reservation_usd:
+                stop_reason = "budget_floor"
+                break
+
+            try:
+                current_state = self.store.load()
+                next_selected = _select_project_and_item(current_state, attempted_item_ids)
+            except CorruptAutonomyStateError:
+                next_selected = None
+            if next_selected is None and creative_attempted:
+                stop_reason = "no_actionable_work"
+                break
+
+            cycle = self._new_report(
+                report["trigger_source"] if not report["cycle_reports"] else "session_continuation",
+                bool(report["dry_run"]),
+                report.get("scheduled_date") if not report["cycle_reports"] else None,
+            )
+            if not report["cycle_reports"]:
+                cycle["run_id"] = report["run_id"]
+                cycle["start_time"] = report["start_time"]
+                cycle["started_at"] = report["started_at"]
+                cycle["report_path"] = report["report_path"]
+            cycle = self._run_locked(cycle, attempted_item_ids)
+            cycle["cycle_index"] = len(report["cycle_reports"]) + 1
+            self._merge_session_cycle(report, cycle)
+
+            selected_tasks = cycle.get("tasks_selected", []) or []
+            cycle_final = str(cycle.get("final_status") or "").lower()
+            if cycle_final in {"disabled", "overlap_prevented", "idempotent_skip"} or (
+                not selected_tasks
+                and cycle_final not in {
+                    "idle",
+                    "ideas_proposed",
+                    "idle_dry_run",
+                    "dry_run",
+                    "budget_deferred",
+                }
+            ):
+                stop_reason = (
+                    "scheduled_date_already_claimed"
+                    if cycle_final == "idempotent_skip"
+                    else "overlap_prevented"
+                    if cycle_final == "overlap_prevented"
+                    else "global_deferral"
+                )
+                break
+            if selected_tasks:
+                item_id = str(selected_tasks[0].get("id") or "").strip()
+                if not item_id or item_id in attempted_item_ids:
+                    stop_reason = "no_progress"
+                    break
+                attempted_item_ids.add(item_id)
+                task_attempts += 1
+            else:
+                creative_attempted = True
+                if cycle.get("ideas_added"):
+                    stop_reason = "ideas_proposed"
+                elif cycle.get("creative_deferral_reason"):
+                    stop_reason = "idea_generation_deferred"
+                elif str(cycle.get("final_status") or "") == "budget_deferred":
+                    stop_reason = "budget_deferred"
+                else:
+                    stop_reason = "no_actionable_work"
+                break
+
+            if report["dry_run"]:
+                stop_reason = "dry_run_complete"
+                break
+            if self._cycle_is_global_stop(cycle):
+                final = str(cycle.get("final_status") or "")
+                stop_reason = (
+                    "scheduled_date_already_claimed"
+                    if final == "idempotent_skip"
+                    else "overlap_prevented"
+                    if final == "overlap_prevented"
+                    else "global_deferral"
+                )
+                break
+
+        return self._finish_session(report, stop_reason)
+
+    def run_session(
+        self,
+        trigger_source: str = "manual",
+        *,
+        dry_run: Optional[bool] = None,
+        scheduled_date: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Run a bounded multi-item session under one persistent overlap lock."""
+
+        effective_dry_run = self.config.dry_run if dry_run is None else bool(dry_run)
+        normalized_trigger = str(trigger_source or "manual").strip().lower()
+        now = self._now()
+        if scheduled_date is None and normalized_trigger in {"scheduled", "scheduler", "daily"}:
+            scheduled_date = self._local_date(now)
+        report = self._new_report(normalized_trigger, effective_dry_run, scheduled_date)
+        report.update(
+            session=True,
+            cycle_reports=[],
+            max_tasks_per_run=self.config.max_tasks_per_run,
+            max_session_minutes=self.config.max_session_minutes,
+        )
+        if normalized_trigger in {"scheduled", "scheduler", "daily"} and not self.config.enabled:
+            report["deferred"].append("Scheduled autonomy is disabled by configuration.")
+            return self._finish_session(report, "disabled")
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        run_lock = FileLock(str(self.run_lock_path), timeout=self.config.lock_timeout_seconds)
+        try:
+            with run_lock:
+                return self._run_session_locked(report)
+        except FileLockTimeout:
+            report["blockers"].append("Another autonomous run holds the persistent run lock.")
+            return self._finish_session(report, "overlap_prevented")
 
     def run(
         self,
@@ -1730,7 +2102,7 @@ class AutonomousWorkflow:
     def register_scheduler(self, scheduler: Any):
         return register_scheduler(
             scheduler,
-            lambda: self.run(trigger_source="scheduled"),
+            lambda: self.run_session(trigger_source="scheduled"),
             config=self.config,
         )
 
@@ -1772,9 +2144,9 @@ def run_daily(
     executor: Optional[Callable[..., Any]] = None,
     idea_generator: Optional[Callable[..., Any]] = None,
 ) -> dict[str, Any]:
-    """Convenience entry point for integrations that do not need a long-lived object."""
+    """Run one bounded daily session without requiring a long-lived workflow object."""
 
-    return AutonomousWorkflow(config, executor=executor, idea_generator=idea_generator).run(
+    return AutonomousWorkflow(config, executor=executor, idea_generator=idea_generator).run_session(
         trigger_source=trigger_source,
         dry_run=dry_run,
     )

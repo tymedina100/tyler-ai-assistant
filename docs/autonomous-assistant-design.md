@@ -4,9 +4,9 @@ Date: 2026-07-27
 
 ## Decision
 
-Add a small autonomous control plane around the existing Company Mode rather than replacing the agent system. The first implementation slice selects at most one roadmap item per run and executes it sequentially through the current manager, specialists, artifact handoff, editor, Telegram transport, and approval gates. Autonomous approval intentionally suppresses Linear mirroring; offline behavior is tested and credentialed production smoke tests remain required.
+Add a small autonomous control plane around the existing Company Mode rather than replacing the agent system. A bounded daily session selects and executes useful, affordable roadmap items sequentially through the current manager, specialists, artifact handoff, editor, Telegram transport, and approval gates. It may select at most ten distinct items in 120 minutes and attempts each item at most once per session. Autonomous approval intentionally suppresses Linear mirroring; credentialed production smoke tests remain required.
 
-The sequence is intentionally single-task. Concurrent autonomous workers are deferred until the shared ledger, state transitions, and restart recovery have proven reliable in production.
+Execution is intentionally sequential. Concurrent autonomous workers are deferred until the shared ledger, state transitions, and restart recovery have proven reliable in production.
 
 ## Reused components
 
@@ -64,14 +64,16 @@ Only `observe` and `propose` auto-execute in this slice. The existing `run_pytho
 3. It recovers stale run/task state conservatively and records a new run ID plus trigger.
 4. It loads roadmap state, Company Mode state, blockers, recent-run/attempt metadata, and remaining spendable budget.
 5. The deterministic router may record a no-cost candidate decision; before any paid work, an open/paused/running Company project or pending owner confirmation defers execution and idle ideation.
-6. It selects the highest-priority actionable item whose dependencies are complete and whose blockers/human-decision fields are empty.
+6. It selects the highest-priority actionable item whose dependencies are complete, whose blockers/human-decision fields are empty, and which has not already been attempted in this session.
 7. It checks the item's authorization level and asks the model router for the least expensive capable route.
 8. In dry-run mode it records the plan and stops before paid model calls, state transitions, or external/destructive actions.
 9. In live mode it applies a context-scoped project target (without rewriting the owner's persisted selection), materializes one bounded worker task plus one reviewer task, attaches structured acceptance criteria and routing metadata, and reserves the full estimate atomically.
 10. Company Mode executes the tasks sequentially. Each task records model decision, tokens, actual/reconciled cost, attempts, artifacts, and failure classification.
-11. Vera evaluates mandatory explicit acceptance criteria. Repeated substantially identical feedback, repeated technical failure, unavailable tools, missing access, budget exhaustion, or the configured attempt limit produces a terminal `needs_human` state.
-12. The coordinator reconciles reservations, updates the roadmap item from the Company Mode result, persists the worker result separately from reviewer feedback, releases the lock, sends the completed deliverable through the existing chunked Telegram transport, and then sends a concise summary.
-13. If no roadmap work is actionable, a controlled creative callback may add at most the configured number of deduplicated ideas to the backlog. Ideas are never executed automatically.
+11. Vera evaluates mandatory explicit acceptance criteria. Repeated substantially identical feedback, repeated technical failure, unavailable tools, missing access, budget exhaustion, or the configured attempt limit produces a terminal `needs_human` state for that item.
+12. The coordinator reconciles reservations, updates the roadmap item from the Company Mode result, and persists the worker result separately from reviewer feedback. A task-local blocker is escalated but does not prevent the session from selecting unrelated actionable work.
+13. Before another item starts, the coordinator refreshes the ledger and checks the ten-item, 120-minute, one-attempt-per-item, and ordinary-budget ceilings. It stops when no useful complete worker/reviewer unit remains affordable; it does not create work merely to consume budget.
+14. After roadmap work is exhausted, Lumen may run one controlled batch containing at most the configured number of deduplicated ideas. Ideas remain `proposed` backlog records and are never executed automatically.
+15. The coordinator releases the lock, sends completed deliverables through the existing chunked Telegram transport, and sends one aggregate summary covering every selected task, route, attempt, cost, result, blocker, escalation, and proposed idea.
 
 ## Budget design
 
@@ -87,7 +89,7 @@ The ledger tracks:
 - project, task, agent, and model attribution;
 - pricing snapshot and model-routing reason.
 
-Normal work must reserve before it starts. A reservation that would exceed spendable budget is rejected. Reconciliation releases the estimate and records actual cost; failed work still records any cost already incurred. Deterministic Telegram summaries/escalations do not consume model budget.
+Normal work must reserve before it starts. A reservation that would exceed spendable budget is rejected. With the default $5 budget and $0.25 reserve, at most $4.75 is available to ordinary work. That amount is a ceiling, not a spending target: the session may finish below it when no useful complete unit fits. Each autonomous Responses request is limited to the output tokens affordable inside its task's remaining reservation after conservative fresh-input pricing and a safety margin; unknown model pricing and too-small envelopes fail closed before generation. Automatic transport retries are disabled inside these strict envelopes. Reconciliation releases the estimate and records actual cost; failed work still records any cost already incurred. Deterministic Telegram summaries/escalations do not consume model budget. Because provider pricing can change and a lost network response may still have been processed, an OpenAI project spending limit remains the only invoice-level hard ceiling.
 
 If an asyncio caller is cancelled after a paid Python worker thread starts, the runtime waits for that non-killable thread to finish before reconciling its reservation. This preserves accounting and prevents a cancelled call from continuing outside the ledger.
 
@@ -99,7 +101,8 @@ If an asyncio caller is cancelled after a paid Python worker thread starts, the 
 - Normalized reviewer-feedback fingerprints detect repeated review cycles; bounded execution/revision caps stop repeated worker failures.
 - Failures are classified as `missing_access`, `missing_information`, `unavailable_tool`, `permission_denied`, `budget_exhausted`, `transient`, `technical`, `no_progress`, or `decision_required`.
 - Access, permission, unavailable-tool, ambiguity/decision, budget, no-progress, and attempt-limit failures stop spending and escalate.
-- A blocked item does not prevent selection of an unrelated actionable item on the next run.
+- A blocked item does not prevent selection of unrelated actionable work later in the same session.
+- One roadmap item receives at most one execution selection per session, even when its result is retryable or deferred.
 - A task that exceeds its monitoring time ceiling is allowed to finish in its existing Python thread so usage/tools cannot escape the ledger; it is charged, receives no automatic retry, and escalates. Hard process preemption is deferred with modify-local execution.
 
 ## Scheduler and manual operation
@@ -112,10 +115,11 @@ Development defaults:
 - Monday through Friday;
 - `America/Phoenix`;
 - $5 daily budget;
-- small emergency reserve;
-- one roadmap item and one creative idea maximum per run.
+- $0.25 emergency reserve, leaving $4.75 for ordinary work;
+- at most ten distinct roadmap items and 120 minutes per session;
+- one Lumen batch containing at most three proposed ideas after roadmap exhaustion.
 
-The Telegram command `/autorun dry-run` is always safe. A local CLI command provides the same selection/report path without importing Telegram or invoking paid APIs.
+The Telegram command `/autorun dry-run` is always safe: it performs one no-spend planning pass and does not enter the live continuation loop. A local CLI command provides the same selection/report path without importing Telegram or invoking paid APIs. `/autorun live` is group-only and starts one bounded session under the same lock and limits as the scheduler.
 
 ## Safety boundaries
 
@@ -139,7 +143,7 @@ The Telegram command `/autorun dry-run` is always safe. A local CLI command prov
 
 ## Deferred limitations
 
-- Autonomous runs are sequential and select one roadmap item at a time.
+- Autonomous sessions are sequential, select one roadmap item at a time, and stop after ten distinct selections or 120 minutes even when budget remains.
 - The JSON/file-lock store assumes all replicas share one filesystem volume; it is not a distributed database.
 - Existing helper functions can still be imported directly, outside the centralized tool authorization path.
 - Pending Telegram confirmations are still process-memory state.

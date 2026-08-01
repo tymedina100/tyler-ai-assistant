@@ -350,6 +350,176 @@ class HardeningTests(unittest.TestCase):
         execute.assert_not_called()
         self.assertIn("Tool call denied", str(responses.inputs[-1]))
 
+    def test_budgeted_tool_call_counts_input_and_caps_provider_output(self):
+        main = self.main
+        create_calls = []
+        count_calls = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                count_calls.append(kwargs)
+                return types.SimpleNamespace(input_tokens=1000)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                create_calls.append(kwargs)
+                return types.SimpleNamespace(
+                    output=[], output_text="bounded answer",
+                    usage=FakeUsage(input_tokens=1000, output_tokens=100),
+                )
+
+        sink = {
+            "cost_usd": 0.0,
+            "usage_records": [],
+            "artifacts": [],
+            "budget_cap_usd": 0.05,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ):
+                result = main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[], max_iterations=1, model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(result, "bounded answer")
+        self.assertEqual(len(count_calls), 1)
+        self.assertEqual(len(create_calls), 1)
+        self.assertGreaterEqual(create_calls[0]["max_output_tokens"], 16)
+        self.assertLessEqual(create_calls[0]["max_output_tokens"], 1200)
+        self.assertEqual(count_calls[0]["tools"], [])
+
+    def test_budgeted_tool_call_fails_before_generation_when_input_does_not_fit(self):
+        main = self.main
+        generations = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=100000)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                generations.append(kwargs)
+                raise AssertionError("generation must not start")
+
+        sink = {
+            "cost_usd": 0.0,
+            "usage_records": [],
+            "artifacts": [],
+            "budget_cap_usd": 0.001,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ), self.assertRaises(main.ExecutionBudgetExceededError):
+                main.run_with_tools(
+                    "too large", [{"role": "user", "content": "inspect"}],
+                    tools=[], max_iterations=1, model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(generations, [])
+        self.assertTrue(sink["budget_guard_blocked"])
+
+    def test_controlled_ideation_uses_same_strict_output_envelope(self):
+        main = self.main
+        create_calls = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=500)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                create_calls.append(kwargs)
+                return types.SimpleNamespace(
+                    output_text=json.dumps({"ideas": [{"idea": "Small experiment"}]}),
+                    usage=FakeUsage(input_tokens=500, output_tokens=100),
+                )
+
+        sink = {
+            "cost_usd": 0.0,
+            "usage_records": [],
+            "artifacts": [],
+            "budget_cap_usd": 0.05,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ):
+                ideas = main.generate_controlled_ideas(
+                    "{}", limit=1, model=main.FAST_MODEL
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(ideas[0]["idea"], "Small experiment")
+        self.assertEqual(len(create_calls), 1)
+        self.assertIn("max_output_tokens", create_calls[0])
+
+    def test_measured_cost_overrun_is_recorded_and_stops_the_call(self):
+        main = self.main
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=0)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                return types.SimpleNamespace(
+                    output=[], output_text="too expensive",
+                    usage=FakeUsage(input_tokens=10000, output_tokens=10000),
+                )
+
+        sink = {
+            "cost_usd": 0.0,
+            "usage_records": [],
+            "artifacts": [],
+            "budget_cap_usd": 0.01,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ), self.assertRaises(main.ExecutionBudgetExceededError):
+                main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[], max_iterations=1, model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertGreater(sink["cost_usd"], sink["budget_cap_usd"])
+        self.assertEqual(len(sink["usage_records"]), 1)
+        self.assertTrue(sink["budget_guard_blocked"])
+
     def test_autonomous_model_call_can_exclude_conversation_memories(self):
         main = self.main
         with patch.object(main, "build_augmented_prompt") as augment, patch.object(

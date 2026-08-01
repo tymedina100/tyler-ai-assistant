@@ -8,7 +8,7 @@ Scope: point-in-time baseline captured before the vertical-slice implementation.
 
 This repository is already a capable Telegram-first multi-agent assistant, not a blank chatbot. It has named specialists, a manager, a sequential Company Mode runner, a persisted daily budget, token-cost reconciliation, a final editor, bounded revision rounds, approval gates, project/Linear integration, and APScheduler jobs. The missing layer is a reliable autonomous control plane: structured roadmaps, scheduled work selection, transactional budget reservations, task-level model routing, durable run records, and typed escalation.
 
-The highest-value next step is therefore a single-task, weekday daily run built on the existing Company Mode runner. It should select one actionable roadmap item, reserve budget atomically, route the task to an appropriate configured model, reuse the existing worker/editor path, stop on no progress or missing access, persist a run report, and summarize the result in Telegram. Parallel autonomous execution should wait until locking and budget enforcement are trustworthy.
+The highest-value next step was therefore a locked, sequential weekday daily run built on the existing Company Mode runner. The bounded-session follow-up keeps that architecture but allows the manager to select additional useful, affordable items without introducing parallel execution. Parallel autonomous workers should still wait until locking and budget enforcement are trustworthy.
 
 ## Verification against the 2026-07-28 working tree
 
@@ -18,12 +18,13 @@ The sections below remain the preimplementation baseline. The current branch now
 - structured project/roadmap selection with dependencies, blockers, recent-run metadata, and mandatory acceptance criteria;
 - a shared Company Mode budget preflight plus atomic worker/reviewer reservations and reconciliation;
 - configurable model routing, execution/review attempt caps, and typed terminal escalation;
+- a bounded sequential session of up to ten distinct roadmap items or 120 minutes, with one attempt per item per session and unrelated work allowed to continue past task-local blockers;
 - Telegram delivery through the existing group runtime; and
 - durable run, routing, attempt, usage, cost, review, and outcome records.
 
 The verification pass also closed failure paths that were not safe enough in the initial implementation: corrupt autonomy state now leaves a durable recovery-required marker instead of silently reseeding on the next run; a crashed/cancelled Company runner blocks its project and closes reservations; cancellation waits for an already-started paid worker thread before budget reconciliation; larger bounded internal worker results and explicit latest-candidate prompts prevent review feedback from chasing the smaller Telegram/report copy; an item with no explicit acceptance criteria cannot route or execute; and `/autorun retry <item-id>` provides a locked, audited owner recovery path without starting paid work.
 
-Remaining production verification is operational rather than architectural: credentialed OpenAI/Telegram execution, Railway mounted-volume behavior, and Docker images still require a controlled smoke test. Runs remain single-item and sequential; owner retry is supported, while skip, accept-as-is, criteria editing, and automatic rescoping remain deferred.
+Credentialed OpenAI/Telegram execution, Railway mounted-volume behavior, Docker images, and the bounded multi-item session still require controlled production verification. Sessions remain sequential; owner retry is supported, while skip, accept-as-is, criteria editing, and automatic rescoping remain deferred.
 
 ## 1. What the system currently does
 
@@ -118,19 +119,21 @@ There are few literal TODO/FIXME markers; the unfinished work is architectural. 
 
 ## 7. Highest-value implementation step
 
-Implement one locked, sequential autonomous daily-run path that reuses Company Mode:
+Implement one locked, sequential autonomous daily-session path that reuses Company Mode:
 
 1. Load structured project and roadmap state.
-2. Select one highest-priority actionable item with satisfied dependencies and no blockers.
+2. Select the highest-priority actionable item with satisfied dependencies and no blockers, excluding items already attempted in this session.
 3. Refuse overlap using a persistent run lock and scheduled-date idempotency.
 4. Route the item/tasks with a configurable model catalog and record the reason.
 5. Reserve estimated cost transactionally while preserving an emergency reserve.
 6. Reuse the existing manager, specialist, artifact handoff, editor, Telegram, Linear, and approval mechanisms.
-7. Stop on repeated feedback, no progress, missing access, unavailable tools, budget exhaustion, or the configured attempt limit.
-8. Reconcile actual token usage, update the roadmap item, save a structured run report, and post an action-oriented Telegram summary.
-9. In dry-run mode, select and report without invoking paid models or performing external/destructive actions.
+7. Stop spending on the affected item after repeated feedback, no progress, missing access, unavailable tools, budget exhaustion, or the configured attempt limit; continue with unrelated actionable work when safe.
+8. Before each new item, enforce the ordinary-budget, ten-item, 120-minute, and one-attempt-per-item session ceilings.
+9. Reconcile actual token usage, update every selected roadmap item, save one aggregate structured run report, and post one action-oriented Telegram summary.
+10. After roadmap exhaustion, allow one Lumen batch of at most three deduplicated `proposed` ideas; never auto-build them.
+11. In dry-run mode, perform one planning pass and report without invoking paid models or performing external/destructive actions.
 
-This creates useful daily autonomy without introducing parallel execution, replacing the agent system, or granting broader permissions.
+This creates useful daily autonomy without introducing parallel execution, replacing the agent system, granting broader permissions, or manufacturing work merely to spend the daily budget. With the default $5 ceiling and $0.25 emergency reserve, ordinary work may use up to $4.75 and should stop below that amount when no useful complete unit fits.
 
 ## 8. Security, reliability, and runaway-cost risks
 
@@ -147,4 +150,4 @@ This creates useful daily autonomy without introducing parallel execution, repla
 
 ## Scope decision
 
-The first vertical slice should remain single-task and sequential. It should include controlled idea-backlog support only as an idle fallback; ideas must never auto-execute. Parallel agents, automatic deployment/merge/publish, broad helper rewrites, database replacement, and a full UI are intentionally deferred.
+The autonomous session should remain sequential and bounded: at most ten distinct roadmap items, one attempt per item, and 120 minutes. Task-local blockers should not prevent unrelated work from continuing. Controlled Lumen ideation is an idle fallback only, runs as one batch of at most three ideas, and writes `proposed` backlog records that never auto-execute. Parallel agents, automatic deployment/merge/publish, broad helper rewrites, database replacement, and a full UI are intentionally deferred.

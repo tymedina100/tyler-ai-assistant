@@ -164,16 +164,29 @@ class AutonomyTeamTests(unittest.TestCase):
         self.assertEqual(result["failure_classification"], "permission_denied")
         self.assertIn("permission", result["human_action"].lower())
 
-    def test_idea_context_excludes_descriptions_and_unrelated_fields(self):
-        context = autonomy_team.idea_project_context({"projects": [{
-            "id": "p1", "name": "Project", "status": "active", "secret": "TOKEN-123",
-            "goals": [{"id": "g1", "title": "Goal", "status": "active", "private": "hide"}],
-            "roadmap_items": [{"id": "i1", "title": "Item", "status": "done", "description": "hide"}],
-        }]})
+    def test_idea_context_includes_bounded_history_but_excludes_private_fields(self):
+        context = autonomy_team.idea_project_context({
+            "projects": [{
+                "id": "p1", "name": "Project", "status": "active", "secret": "TOKEN-123",
+                "goals": [{"id": "g1", "title": "Goal", "status": "active", "private": "hide"}],
+                "roadmap_items": [{"id": "i1", "title": "Item", "status": "done", "description": "hide"}],
+            }],
+            "idea_backlog": [{
+                "id": "idea-1", "idea": "Deployment health digest", "status": "proposed",
+                "relationship_to_current_goals": "Improves reliability", "risks": "hide",
+            }],
+            "run_control": {"recent_runs": [{
+                "run_id": "run-1", "final_status": "completed", "trigger_source": "scheduled",
+                "private_result": "hide",
+            }]},
+        })
         self.assertIn("Project", context)
+        self.assertIn("Deployment health digest", context)
+        self.assertIn("run-1", context)
         self.assertNotIn("TOKEN-123", context)
         self.assertNotIn("private", context)
         self.assertNotIn("description", context)
+        self.assertNotIn("risks", context)
 
 
 if __name__ == "__main__":
