@@ -1,6 +1,7 @@
 import contextvars
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -183,6 +184,94 @@ _execution_sink = contextvars.ContextVar("execution_sink", default=None)
 _company_execution = contextvars.ContextVar("company_execution", default=False)
 
 
+class ExecutionBudgetExceededError(RuntimeError):
+    """Raised before another autonomous model call can exceed its reserved envelope."""
+
+
+_BUDGET_INPUT_SAFETY_MULTIPLIER = 1.25
+_BUDGET_USABLE_FRACTION = 0.90
+_MIN_BUDGETED_OUTPUT_TOKENS = 16
+
+
+def _configured_budget_output_tokens():
+    try:
+        value = int(os.environ.get("AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL", "1200"))
+    except (TypeError, ValueError):
+        value = 1200
+    return min(8000, max(_MIN_BUDGETED_OUTPUT_TOKENS, value))
+
+
+def _budgeted_response_options(openai_client, model, instructions, input_items, tools=None):
+    """Cap one Responses call to the unspent portion of its reserved task budget.
+
+    The provider's output limit includes reasoning tokens. The provider counts the
+    exact request input first; admission pricing assumes fresh input and adds a safety
+    allowance. Ordinary non-metered chat has no ``budget_cap_usd`` and is unchanged.
+    """
+
+    sink = current_execution_sink()
+    if sink is None or sink.get("budget_cap_usd") is None:
+        return {}
+
+    cap = max(0.0, float(sink.get("budget_cap_usd") or 0.0))
+    already_spent = max(0.0, float(sink.get("cost_usd") or 0.0))
+    usable_remaining = max(0.0, cap * _BUDGET_USABLE_FRACTION - already_spent)
+    spec = MODEL_CATALOG.get(model)
+    if spec is None:
+        sink["budget_guard_blocked"] = True
+        sink["budget_guard_reason"] = (
+            f"Strict budget enforcement has no configured pricing for model {model!r}."
+        )
+        raise ExecutionBudgetExceededError(sink["budget_guard_reason"])
+    input_per_million = float(spec.input_usd_per_million)
+    output_per_million = float(spec.output_usd_per_million)
+
+    count_kwargs = {
+        "model": model,
+        "instructions": instructions,
+        "input": input_items,
+    }
+    if tools is not None:
+        count_kwargs["tools"] = tools
+    try:
+        counted = call_with_retries(
+            lambda: openai_client.responses.input_tokens.count(**count_kwargs),
+            label="OpenAI input-token count",
+        )
+        input_tokens = int(getattr(counted, "input_tokens"))
+        if input_tokens < 0:
+            raise ValueError("provider returned a negative input-token count")
+    except Exception as exc:
+        sink["budget_guard_blocked"] = True
+        sink["budget_guard_reason"] = (
+            f"Strict budget enforcement could not count the next {model} request: {exc}"
+        )
+        raise ExecutionBudgetExceededError(sink["budget_guard_reason"]) from exc
+
+    conservative_input_tokens = math.ceil(
+        input_tokens * _BUDGET_INPUT_SAFETY_MULTIPLIER
+    )
+    input_cost = conservative_input_tokens * input_per_million / 1_000_000.0
+    output_budget = usable_remaining - input_cost
+    affordable_output_tokens = (
+        math.floor(output_budget * 1_000_000.0 / output_per_million)
+        if output_per_million > 0
+        else _configured_budget_output_tokens()
+    )
+    max_output_tokens = min(
+        _configured_budget_output_tokens(),
+        affordable_output_tokens,
+    )
+    if max_output_tokens < _MIN_BUDGETED_OUTPUT_TOKENS:
+        sink["budget_guard_blocked"] = True
+        sink["budget_guard_reason"] = (
+            f"The next {model} request cannot fit safely inside the task's "
+            f"${cap:.4f} reserved budget envelope."
+        )
+        raise ExecutionBudgetExceededError(sink["budget_guard_reason"])
+    return {"max_output_tokens": int(max_output_tokens)}
+
+
 def set_execution_sink(sink):
     """Point the current turn's cost/artifact accrual at `sink` (a dict with keys
     cost_usd, artifacts, context) or None to disable it."""
@@ -338,6 +427,14 @@ def _accrue_cost(model, usage):
             return
         sink["cost_usd"] = round(sink.get("cost_usd", 0.0) + record["cost_usd"], 6)
         sink.setdefault("usage_records", []).append(record)
+        cap = sink.get("budget_cap_usd")
+        if cap is not None and sink["cost_usd"] > float(cap) + 0.000001:
+            sink["budget_guard_blocked"] = True
+            sink["budget_guard_reason"] = (
+                f"Measured model spend ${sink['cost_usd']:.4f} exceeded the task's "
+                f"${float(cap):.4f} reserved budget envelope; no further calls are allowed."
+            )
+            raise ExecutionBudgetExceededError(sink["budget_guard_reason"])
 
 
 def _record_artifact(note):
@@ -644,6 +741,12 @@ everyone into one voice.
 
 
 def call_with_retries(func, max_attempts=3, delay_seconds=2, label="API call"):
+    sink = current_execution_sink()
+    if sink is not None and sink.get("budget_cap_usd") is not None:
+        # A network retry can create a second provider charge when the first response
+        # was generated but not received. Bounded autonomous calls therefore get one
+        # transport attempt; the workflow's persisted execution retry is the safe retry.
+        max_attempts = 1
     for attempt in range(1, max_attempts + 1):
         try:
             return func()
@@ -739,13 +842,19 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
     try:
         openai_client = get_openai_client()
         for _ in range(max_iterations):
+            request_kwargs = {
+                "model": model,
+                "instructions": instructions,
+                "input": input_items,
+                "tools": tools,
+            }
+            request_kwargs.update(
+                _budgeted_response_options(
+                    openai_client, model, instructions, input_items, tools
+                )
+            )
             response = call_with_retries(
-                lambda: openai_client.responses.create(
-                    model=model,
-                    instructions=instructions,
-                    input=input_items,
-                    tools=tools
-                ),
+                lambda: openai_client.responses.create(**request_kwargs),
                 label="OpenAI chat call"
             )
 
@@ -783,22 +892,31 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
             # final call with NO tools so the model is forced to synthesize an answer
             # from what it already has. This turns a wasted, answer-less run (e.g. a
             # research agent that kept searching) into a usable, if partial, reply.
+            final_instructions = instructions + (
+                "\n\nYou have used all of your tool calls for this turn. Do not "
+                "request any more tools - answer now using what you have already "
+                "gathered, and clearly note anything you could not fully verify."
+            )
+            final_kwargs = {
+                "model": model,
+                "instructions": final_instructions,
+                "input": input_items,
+            }
+            final_kwargs.update(
+                _budgeted_response_options(
+                    openai_client, model, final_instructions, input_items
+                )
+            )
             final_response = call_with_retries(
-                lambda: openai_client.responses.create(
-                    model=model,
-                    instructions=instructions + (
-                        "\n\nYou have used all of your tool calls for this turn. Do not "
-                        "request any more tools - answer now using what you have already "
-                        "gathered, and clearly note anything you could not fully verify."
-                    ),
-                    input=input_items,
-                ),
+                lambda: openai_client.responses.create(**final_kwargs),
                 label="OpenAI final synthesis call",
             )
             _accrue_cost(model, getattr(final_response, "usage", None))
             if final_response.output_text:
                 assistant_response = final_response.output_text
 
+    except ExecutionBudgetExceededError:
+        raise
     except Exception:
         assistant_response = "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
 
@@ -3223,7 +3341,9 @@ def generate_controlled_ideas(project_context, limit=1, model=None):
     instructions = f"""You are {CREATIVE_AGENT_NAME}, a disciplined product-ideation
 specialist. Existing roadmap work always outranks speculation. Given the current project
 context, propose at most {limit} small, testable idea(s). Do not build, publish, send, or
-change anything. Prefer ideas related to current goals and inexpensive validation.
+change anything. Prefer ideas related to current goals and inexpensive validation. Treat
+the `existing_ideas` section as a do-not-repeat list. If no genuinely distinct useful idea
+remains, return an empty `ideas` array instead of inventing a duplicate.
 
 Reply with ONLY a JSON object shaped as {{"ideas": [{{
   "idea": "...",
@@ -3239,15 +3359,23 @@ Reply with ONLY a JSON object shaped as {{"ideas": [{{
 
     try:
         openai_client = get_openai_client()
+        selected_model = model or FAST_MODEL
+        idea_input = [{"role": "user", "content": project_context}]
+        request_kwargs = {
+            "model": selected_model,
+            "instructions": instructions,
+            "input": idea_input,
+        }
+        request_kwargs.update(
+            _budgeted_response_options(
+                openai_client, selected_model, instructions, idea_input
+            )
+        )
         response = call_with_retries(
-            lambda: openai_client.responses.create(
-                model=model or FAST_MODEL,
-                instructions=instructions,
-                input=[{"role": "user", "content": project_context}],
-            ),
+            lambda: openai_client.responses.create(**request_kwargs),
             label="Controlled ideation call",
         )
-        _accrue_cost(model or FAST_MODEL, getattr(response, "usage", None))
+        _accrue_cost(selected_model, getattr(response, "usage", None))
         raw = (response.output_text or "").strip()
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
@@ -3270,6 +3398,8 @@ Reply with ONLY a JSON object shaped as {{"ideas": [{{
                 idea["estimated_ai_cost_usd"] = 0.0
             ideas.append(idea)
         return ideas
+    except ExecutionBudgetExceededError:
+        raise
     except Exception as e:
         logger.error(f"Controlled ideation failed: {e}")
         return []

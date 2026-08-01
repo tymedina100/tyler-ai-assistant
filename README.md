@@ -363,8 +363,9 @@ Catalog capability claims, context limits, model availability, and prices are
 not guaranteed current OpenAI prices or a substitute for provider billing. The enabled
 snapshot (GPT-5.4 nano, GPT-5.4 mini, and GPT-5.6 Sol) and source URLs were refreshed on
 2026-07-27; still verify the catalog against the models and prices available to your
-account before enabling live autonomy. Unknown models use a conservative fallback for
-Company Mode metering instead of silently recording zero cost.
+account before enabling live autonomy. Reactive Company Mode metering uses a conservative
+unknown-model fallback rather than silently recording zero cost; strict autonomous calls
+fail closed when the selected model has no catalog price.
 
 Two related token-cost guards also live in `main.py`:
 - **History window (`MAX_HISTORY_MESSAGES`).** Plain chat resends recent conversation
@@ -489,10 +490,12 @@ team message you unprompted:
 - **Company Mode daily report.** At `DAILY_REPORT_TIME`, Miles posts a supervised
   startup-style report with the active project, open work, reserved/spent budget, and
   the next recommended move.
-- **Autonomous roadmap run.** When `AUTONOMY_ENABLED=true`, a separate weekday cron job
-  selects at most one actionable roadmap item and applies the configured budget and
-  authorization gates. Live runs post the final summary/escalations; scheduled dry-runs
-  write the audit report without sending Telegram.
+- **Autonomous roadmap session.** When `AUTONOMY_ENABLED=true`, a separate weekday cron
+  job works sequentially through useful, affordable roadmap items under one persistent
+  run lock. It selects each item at most once, stops at the configured task/time/budget
+  ceilings, and applies the authorization gates. Live sessions post one aggregate final
+  summary plus actionable escalations; scheduled dry-runs write an audit report without
+  sending Telegram.
 
 These scheduled jobs run only in the group interface (that's where a persistent process
 lives); the standalone autonomy CLI can still trigger a manual dry-run. The CLI and
@@ -501,25 +504,30 @@ jobs via `.env`:
 `HOME_LOCATION`, `BRIEFING_TIME` (e.g. `08:00`), `TIMEZONE` (e.g. `America/New_York`),
 `EVENT_ALERT_MINUTES` (e.g. `15`), and `DAILY_REPORT_TIME` (e.g. `18:00`).
 
-## Autonomous daily runs (safe vertical slice)
+## Autonomous daily sessions (safe vertical slice)
 
 The autonomous layer extends the current system rather than replacing it:
 
-1. `autonomous_workflow.py` loads structured project/roadmap state, claims a
-   cross-process file lock, and selects the highest-priority unblocked item whose
-   dependencies are complete.
-2. `model_router.py` chooses a configured capable model and records why.
-3. `autonomy_team.py` converts a selected item into one bounded worker task plus a
+1. `autonomous_workflow.py` loads structured project/roadmap state and claims one
+   cross-process file lock for the whole bounded session.
+2. Miles repeatedly selects the highest-priority unblocked item whose dependencies are
+   complete, but never selects the same item twice in one session.
+3. `model_router.py` chooses a configured capable model and records why.
+4. `autonomy_team.py` converts each selected item into one bounded worker task plus a
    separately routed Vera acceptance-criteria review, while intersecting the agent's
    normal tool set with the roadmap authorization level.
-4. A live run uses the existing Company Mode sequential runner, artifact handoff,
-   bounded revisions, budget ledger, and approval gates.
-5. The coordinator reconciles usage, updates state, writes a JSON run report, posts the
-   substantive completed worker result through the existing chunked Telegram transport,
-   and then posts a concise summary or owner escalation. Reviewer feedback remains
-   separate from the worker deliverable in the audit record.
-6. Only when no roadmap work is actionable may Lumen propose a limited, deduplicated
-   idea. It enters the backlog as `proposed`; it is not automatically built.
+5. A live session uses the existing Company Mode sequential runner, artifact handoff,
+   bounded revisions, budget ledger, and approval gates. A task-local `blocked` or
+   `needs_human` result is escalated, then unrelated actionable work may continue.
+6. Before another item starts, the coordinator refreshes the shared ledger and checks
+   the session ceilings. It stops when no useful unit fits, no roadmap work remains, ten
+   items have been selected, or 120 minutes have elapsed. Available budget is a ceiling,
+   not a target to burn.
+7. Only after roadmap work is exhausted may Lumen produce one controlled batch of up to
+   three deduplicated ideas. Each enters the backlog as `proposed`; none is automatically
+   promoted, assigned, or built.
+8. The coordinator writes one aggregate JSON report and Telegram summary covering every
+   selected task, model decision, attempt, token/cost record, result, blocker, and idea.
 
 ### Safe setup and manual dry-run
 
@@ -564,16 +572,18 @@ room** without starting work or spending model budget:
 ```
 
 The retry command preserves previous attempts and costs, clears the terminal owner-action
-fields, and makes the item eligible for a future run. It never starts execution itself;
-run `/autorun dry-run` next to verify selection before using `/autorun live`.
+fields, and makes the item eligible for a future session. It never starts execution
+itself; run `/autorun dry-run` next to verify selection before using `/autorun live`.
 
 After reviewing dry-run selection, routing, budget, and authorization output, live mode
 requires deliberate configuration: set `AUTONOMY_ENABLED=true`, set
 `AUTONOMY_DRY_RUN=false`, and choose an appropriate
 `AUTONOMY_MAX_AUTHORIZATION`, then restart `group_bot.py`. `/autorun live` in the
 **group operating room**
-invokes the bounded Company Mode path; live starts are refused in DMs. It can spend API
-budget only within the configured authorization ceiling. This vertical slice
+invokes one bounded daily session; live starts are refused in DMs. The manual command
+uses the same overlap lock, budget, per-item, task-count, and time ceilings as the
+scheduled session. It can spend API budget only within the configured authorization
+ceiling. This vertical slice
 auto-executes only `observe` and `propose`; `modify_local` and `external_action` stop for
 owner review because the existing Python/GitHub helpers are not a true isolated-local
 boundary. Existing `/confirm`, PR, deployment, publishing, email, and delete gates still
@@ -587,7 +597,10 @@ Telegram confirmation is already waiting for the owner.
 
 The autonomous job is registered only inside the long-running `group_bot.py` process.
 Development defaults are **08:00, Monday-Friday, America/Phoenix, $5/day**, with a
-**$0.25 emergency reserve**, one roadmap item, and at most one proposed idea per run.
+**$0.25 emergency reserve**, up to ten sequential roadmap items, a 120-minute session
+ceiling, and one Lumen batch of at most three proposed ideas. The reserve leaves
+**$4.75 for ordinary work**; the team stops below that ceiling when no useful complete
+unit fits rather than generating activity merely to spend the balance.
 Use these canonical environment variables (the complete copy-ready block is in
 `.env.example`):
 
@@ -601,9 +614,12 @@ Use these canonical environment variables (the complete copy-ready block is in
 | `BUDGET_TIMEZONE` | `America/Phoenix`; Company ledger day boundary, normally aligned with autonomy |
 | `AUTONOMY_DAILY_BUDGET_USD` | `5.00`; standalone/control-plane fallback ceiling |
 | `AUTONOMY_EMERGENCY_RESERVE_USD` | `0.25`; standalone/control-plane fallback reserve |
+| `AUTONOMY_MAX_TASKS_PER_RUN` | `10`; maximum distinct roadmap items selected sequentially in one session |
+| `AUTONOMY_MAX_SESSION_MINUTES` | `120`; elapsed-time ceiling checked before another item starts |
 | `AUTONOMY_COST_ESTIMATE_MULTIPLIER` | `4.0`; expands one-response estimates for bounded tool loops |
 | `AUTONOMY_MIN_TASK_RESERVATION_USD` | `0.05`; minimum live worker/reviewer reservation |
-| `AUTONOMY_MAX_IDEAS_PER_RUN` | `1`; set `0` to disable idle ideation |
+| `AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL` | `1200`; per-request ceiling, reduced automatically to fit the task's unspent reservation |
+| `AUTONOMY_MAX_IDEAS_PER_RUN` | `3`; maximum ideas in Lumen's one idle batch; set `0` to disable ideation |
 | `AUTONOMY_IDEA_BACKLOG_LIMIT` | `50` proposed ideas retained |
 | `AUTONOMY_MAX_EXECUTION_ATTEMPTS` | `2` roadmap-level failed attempts before owner escalation |
 | `AUTONOMY_TASK_TIMEOUT_SECONDS` | `900`; monitoring ceiling; late threads are awaited, charged, and not retried |
@@ -618,7 +634,15 @@ In the Telegram runtime, the persisted Company Mode ledger is the authoritative 
 source for routing and reports, including spend and reservations from other work. Use
 `/setbudget` to change its daily limit. `COMPANY_EMERGENCY_RESERVE_USD` seeds the reserve
 for new/legacy state; an existing `company_state.json` retains its stored value. Keep the
-`AUTONOMY_*` fallback values aligned if you also use the standalone CLI.
+`AUTONOMY_*` fallback values aligned if you also use the standalone CLI. The coordinator
+does not promise invoice-level provider spend: it starts another worker/reviewer unit only
+when the complete estimate fits within ordinary remaining budget, and preserves the
+emergency reserve for control-plane recovery and escalation. Each metered autonomous
+Responses call also receives a provider-side output-token ceiling calculated from the
+task's unspent reservation, conservatively priced fresh input, and a safety margin. It
+fails closed before another request when that envelope cannot fit. Network ambiguity and
+stale provider pricing still require an OpenAI project spending limit for an absolute
+invoice-level guarantee.
 
 `MAX_REVISION_ROUNDS` and `MAX_EXECUTION_ATTEMPTS` bound Company Mode's review and task
 loops. Company Mode retains a larger bounded non-file worker result for review and marks
@@ -666,11 +690,11 @@ quarantined file, restore a verified `autonomy_state.json`, remove the recovery 
 and run `/autorun dry-run` before enabling live execution. The coordinator never silently
 reseeds while that marker exists.
 
-Live reports include nested worker/reviewer agents, models, and cost splits by project,
-task, agent, and model. The top-level route reason is in the run report; each nested
+Live session reports aggregate all nested worker/reviewer agents, models, and cost splits
+by project, task, agent, and model. The top-level route reasons are in the run report; each nested
 Company Mode task retains its own `model_reason` in `company_state.json`. Scheduled live
-runs keep intermediate agent chatter quiet and send only actionable escalations plus the
-final summary.
+sessions keep intermediate agent chatter quiet and send only actionable escalations plus
+one final aggregate summary.
 
 Authorization levels are ceilings, not grants: `observe` inspects, `propose` drafts,
 `modify_local` conceptually covers an isolated local/branch workspace, and
@@ -679,8 +703,9 @@ or production mutation. The current runtime has no killable isolated checkout ex
 so both `modify_local` and `external_action` remain human-gated even if the configured
 ceiling is raised. Raising the ceiling never adds tools or bypasses confirmation.
 
-Current limitations: runs are sequential and select one roadmap item; the JSON/file-lock
-design assumes every replica shares one mounted filesystem; pending Telegram
+Current limitations: sessions are sequential, select at most ten distinct roadmap items,
+and attempt each item only once per session; the JSON/file-lock design assumes every
+replica shares one mounted filesystem; pending Telegram
 confirmations remain process-memory state; exact provider billing is unavailable when a
 response lacks usage and is then conservatively charged at the held estimate; the task
 time ceiling prevents another attempt but cannot preempt a Python thread, so the runner

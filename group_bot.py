@@ -714,12 +714,14 @@ async def _run_metered(
     project_id=None,
     task_id=None,
     return_receipt=False,
+    strict_budget=False,
 ):
     """Reserve before a paid call, then reconcile measured usage atomically.
 
     This is intentionally used by reactive chat and idle ideation as well as the
-    autonomous runner.  It does not enable Company Mode's produce bypass, so normal
-    confirmation behavior remains unchanged outside a persisted company task.
+    autonomous runner. Strict request-level enforcement is opt-in so ordinary chat
+    behavior stays unchanged; persisted Company tasks install their own task envelope.
+    This helper does not enable Company Mode's produce bypass.
     """
     if estimate_usd is None:
         try:
@@ -743,6 +745,8 @@ async def _run_metered(
         "usage_records": [],
         "context": context,
     }
+    if strict_budget:
+        sink["budget_cap_usd"] = float(reservation["amount_usd"])
 
     def work():
         main.set_execution_sink(sink)
@@ -767,14 +771,21 @@ async def _run_metered(
         raise
     finally:
         try:
-            reconciled_actual = sink["cost_usd"] if sink["usage_records"] else None
+            known_zero = bool(sink.get("budget_guard_blocked")) and not sink["usage_records"]
+            reconciled_actual = (
+                0.0
+                if known_zero
+                else sink["cost_usd"]
+                if sink["usage_records"]
+                else None
+            )
             receipt = await asyncio.to_thread(
                 company_mode.reconcile_budget,
                 reservation["id"],
                 reconciled_actual,
                 company_mode.COMPANY_STATE_FILE,
                 usage_records=sink["usage_records"],
-                estimated=not bool(sink["usage_records"]),
+                estimated=not bool(sink["usage_records"]) and not known_zero,
                 context=context,
                 project_id=project_id,
                 task_id=task_id,
@@ -1138,6 +1149,8 @@ def _sink_spend_for_reconciliation(sink):
     reconcile the conservative held estimate and label it estimated instead of
     incorrectly reopening the budget as a zero-cost call.
     """
+    if sink.get("budget_guard_blocked") and not sink.get("usage_records"):
+        return 0.0
     return sink["cost_usd"] if sink.get("usage_records") else None
 
 
@@ -1366,7 +1379,15 @@ async def _run_one_task(project, task):
     """Execute one task with a routed model, bounded retries, and hard tool scope."""
     owner = task["owner"] if task["owner"] in main.SPECIALISTS else None
     context = f"Project {project['id']} / task {task['id']}"
-    sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": context}
+    sink = {
+        "cost_usd": 0.0,
+        "artifacts": [],
+        "usage_records": [],
+        "context": context,
+    }
+    task_budget_cap = float(task.get("reserved_usd", 0.0) or 0.0)
+    if task_budget_cap > 0:
+        sink["budget_cap_usd"] = task_budget_cap
 
     # Feed earlier tasks' summaries AND the current deliverable's real content into this
     # task's prompt so the agent builds on the actual file (even one a teammate saved to
@@ -1712,6 +1733,22 @@ def _autonomy_executor_callback(project, item, decision, run_id):
 
 
 async def _generate_autonomy_ideas(state, limit):
+    backlog = state.get("idea_backlog", []) if isinstance(state, dict) else []
+    if isinstance(backlog, list) and len(backlog) >= AUTONOMY_CONFIG.idea_backlog_limit:
+        return {
+            "ideas": [],
+            "model": None,
+            "model_reason": "Creative routing was skipped because the idea backlog is full.",
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "deferred": True,
+            "idle": True,
+            "deferral_kind": "backlog_full",
+            "deferral_reason": (
+                f"The idea backlog already contains {len(backlog)} proposals, which "
+                f"meets the configured limit of {AUTONOMY_CONFIG.idea_backlog_limit}."
+            ),
+        }
     runtime_deferral = await _autonomy_runtime_deferral()
     if runtime_deferral:
         return {
@@ -1755,6 +1792,7 @@ async def _generate_autonomy_ideas(state, limit):
             project_id="idea_backlog",
             task_id="controlled-idle-ideation",
             return_receipt=True,
+            strict_budget=True,
         )
         receipt = receipt or {}
         return {
@@ -1772,6 +1810,16 @@ async def _generate_autonomy_ideas(state, limit):
             "agent": "creative",
             "project_id": "idea_backlog",
             "task_id": "controlled-idle-ideation",
+        }
+    except main.ExecutionBudgetExceededError as exc:
+        return {
+            "ideas": [],
+            "model": decision.model_id,
+            "model_reason": decision.reason,
+            "estimated_cost_usd": autonomy_team.reservation_estimate(decision),
+            "actual_cost_usd": 0.0,
+            "deferred": True,
+            "deferral_reason": str(exc),
         }
     except company_mode.BudgetExceededError:
         return {
@@ -1804,10 +1852,10 @@ def _get_autonomy_workflow():
     return _autonomy_workflow_instance
 
 
-async def _run_autonomy_cycle(trigger_source, *, dry_run=None):
+async def _run_autonomy_session(trigger_source, *, dry_run=None):
     workflow = _get_autonomy_workflow()
     return await asyncio.to_thread(
-        workflow.run,
+        workflow.run_session,
         trigger_source=trigger_source,
         dry_run=dry_run,
     )
@@ -1818,15 +1866,33 @@ async def _run_and_post_autonomy(trigger_source, *, dry_run=None):
     current = asyncio.current_task()
     autonomy_runner_task = current
     try:
-        report = await _run_autonomy_cycle(trigger_source, dry_run=dry_run)
-        # A configured dry run performs no outbound action. A user-invoked dry run
-        # is returned directly by its command handler instead of coming through here.
+        report = await _run_autonomy_session(trigger_source, dry_run=dry_run)
+        # Scheduled and user-invoked dry runs perform no group broadcast. The command
+        # handler may still return the aggregate dry-run report to its requesting user.
         if not report.get("dry_run"):
+            seen_escalations = set()
+            cycle_reports = report.get("cycle_reports", []) or []
+            for child in cycle_reports:
+                if not isinstance(child, dict):
+                    continue
+                for escalation in child.get("escalations", []) or []:
+                    message = str(autonomous_workflow.redact_secrets(str(escalation))).strip()
+                    if not message or message in seen_escalations:
+                        continue
+                    seen_escalations.add(message)
+                    await post_to_group(message, "manager")
+                # The formatter handles both approved roadmap deliverables and
+                # controlled Lumen idea-plan proposals. Child summaries are never
+                # posted; the session emits one aggregate summary below.
+                deliverable = autonomous_workflow.format_telegram_deliverable(child)
+                if deliverable:
+                    await post_to_group(deliverable, "manager")
             for escalation in report.get("escalations", []) or []:
-                await post_to_group(str(escalation), "manager")
-            deliverable = autonomous_workflow.format_telegram_deliverable(report)
-            if deliverable:
-                await post_to_group(deliverable, "manager")
+                message = str(autonomous_workflow.redact_secrets(str(escalation))).strip()
+                if not message or message in seen_escalations:
+                    continue
+                seen_escalations.add(message)
+                await post_to_group(message, "manager")
             await post_to_group(report["telegram_summary"], "manager")
         else:
             main.logger.info(f"Autonomy dry run completed: {report.get('report_path')}")
@@ -1852,6 +1918,9 @@ def _autonomy_status_text():
         f"Scheduler: {'enabled' if AUTONOMY_CONFIG.enabled else 'disabled'}; "
         f"{AUTONOMY_CONFIG.schedule_days} at {AUTONOMY_CONFIG.schedule_time} ({AUTONOMY_CONFIG.timezone})",
         f"Mode: {'dry-run' if AUTONOMY_CONFIG.dry_run else 'live'}; authorization ceiling {AUTONOMY_CONFIG.max_authorization.value}",
+        f"Session cap: {AUTONOMY_CONFIG.max_tasks_per_run} distinct roadmap items; "
+        f"{AUTONOMY_CONFIG.max_session_minutes} minutes",
+        f"Creative: Lumen; one idle batch of up to {AUTONOMY_CONFIG.max_ideas_per_run} proposed ideas",
         f"Budget: ${budget['spent_today_usd']:.4f} spent, ${budget['reserved_today_usd']:.4f} reserved, "
         f"${budget['remaining_usd']:.4f} ordinary remaining of ${budget['daily_budget_usd']:.2f}",
         f"Next actionable item: {next_item.get('id')} - {next_item.get('title')}" if next_item else "Next actionable item: none",
@@ -1877,7 +1946,7 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         if autonomy_runner_task and not autonomy_runner_task.done():
             await update.message.reply_text("An autonomous run is already active; this trigger was not started.")
             return
-        report = await _run_autonomy_cycle("telegram", dry_run=True)
+        report = await _run_and_post_autonomy("telegram", dry_run=True)
         await reply_chunks(update.message, report["telegram_summary"] + f"\nReport: {report['report_path']}")
         return
     if argument == "status":
@@ -1927,7 +1996,10 @@ async def handle_autorun_command(update, text, *, allow_live=True):
             await update.message.reply_text("An autonomous run is already active; this trigger was not started.")
             return
         autonomy_runner_task = asyncio.create_task(_run_and_post_autonomy("telegram", dry_run=False))
-        await update.message.reply_text("Started one bounded autonomous run. Miles will post the final report or an exact owner action.")
+        await update.message.reply_text(
+            "Started one bounded autonomous session. Miles will continue safe, useful work "
+            "within its configured limits and post one final report or an exact owner action."
+        )
         return
     await update.message.reply_text(
         "Usage: /autorun dry-run | /autorun status | "

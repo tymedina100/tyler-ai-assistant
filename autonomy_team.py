@@ -414,7 +414,13 @@ def aggregate_company_result(
 
 
 def idea_project_context(state: Mapping[str, Any]) -> str:
-    """Serialize only roadmap metadata needed by the no-tools creative callback."""
+    """Serialize bounded planning context for the no-tools creative callback.
+
+    Existing idea titles and recent outcomes are included so Lumen can plan around
+    what the team has already proposed or attempted.  Descriptions, artifacts, task
+    results, blocker text, and arbitrary state fields stay outside this prompt
+    boundary because they may contain private or unnecessarily large content.
+    """
 
     projects = []
     for project in state.get("projects", []) or []:
@@ -433,7 +439,38 @@ def idea_project_context(state: Mapping[str, Any]) -> str:
                 if isinstance(item, Mapping)
             ],
         })
-    return json.dumps({"projects": projects}, ensure_ascii=True, separators=(",", ":"))
+    existing_ideas = [
+        {
+            "id": idea.get("id"),
+            "idea": idea.get("idea"),
+            "status": idea.get("status"),
+            "relationship_to_current_goals": idea.get(
+                "relationship_to_current_goals"
+            ),
+        }
+        for idea in (state.get("idea_backlog", []) or [])[-20:]
+        if isinstance(idea, Mapping)
+    ]
+    recent_runs = [
+        {
+            "run_id": run.get("run_id"),
+            "final_status": run.get("final_status"),
+            "trigger_source": run.get("trigger_source"),
+        }
+        for run in (
+            (state.get("run_control", {}) or {}).get("recent_runs", []) or []
+        )[-10:]
+        if isinstance(run, Mapping)
+    ]
+    return json.dumps(
+        {
+            "projects": projects,
+            "existing_ideas": existing_ideas,
+            "recent_runs": recent_runs,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
 
 __all__ = [
