@@ -56,6 +56,7 @@ RETRY_RESET_FIELDS = {
     "needs_human_reason",
     "terminal_reason",
 }
+_UNSET = object()
 
 
 class AuthorizationLevel(str, Enum):
@@ -278,6 +279,10 @@ class RoadmapItemRetryError(ValueError):
     """Raised when a persisted roadmap item cannot be safely reset for retry."""
 
 
+class IdeaPromotionError(ValueError):
+    """Raised when a proposed idea cannot be safely converted to roadmap work."""
+
+
 _SECRET_KEY_RE = re.compile(
     r"(?i)^(?:(?:[a-z0-9]+[_-])*(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|bot[_-]?token|password|secret|client[_-]?secret|private[_-]?key|database[_-]?url)|authorization|cookie|credential)$"
 )
@@ -428,6 +433,277 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
     return state
 
 
+def _active_promotion_projects(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    inactive = RETRY_BLOCKED_PROJECT_STATUSES | {"done"}
+    return [
+        project
+        for project in state.get("projects", []) or []
+        if isinstance(project, dict)
+        and str(project.get("status") or "active").strip().lower() not in inactive
+    ]
+
+
+def _find_unique_idea(state: Mapping[str, Any], idea_id: str) -> dict[str, Any]:
+    target_id = str(idea_id or "").strip()
+    if not target_id:
+        raise IdeaPromotionError("A non-empty idea ID is required for promotion.")
+    matches = [
+        idea
+        for idea in state.get("idea_backlog", []) or []
+        if isinstance(idea, dict) and str(idea.get("id") or "").strip() == target_id
+    ]
+    if not matches:
+        raise IdeaPromotionError(f"Idea {target_id!r} was not found in the persistent backlog.")
+    if len(matches) != 1:
+        raise IdeaPromotionError(
+            f"Idea ID {target_id!r} is ambiguous: {len(matches)} backlog records match; "
+            "no state was changed."
+        )
+    return matches[0]
+
+
+def _resolve_promotion_project(
+    state: Mapping[str, Any],
+    idea: Mapping[str, Any],
+    requested_project_id: Optional[str],
+) -> dict[str, Any]:
+    active_projects = _active_promotion_projects(state)
+    explicit_id = str(requested_project_id or "").strip()
+    linked_id = str(idea.get("target_project_id") or "").strip()
+    target_id = explicit_id or linked_id
+    if target_id:
+        matches = [
+            project
+            for project in active_projects
+            if str(project.get("id") or "").strip() == target_id
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise IdeaPromotionError(
+                f"Project ID {target_id!r} is ambiguous; no promotion was staged."
+            )
+        raise IdeaPromotionError(
+            f"Project {target_id!r} is missing or inactive; no promotion was staged."
+        )
+    if len(active_projects) == 1:
+        return active_projects[0]
+    if not active_projects:
+        raise IdeaPromotionError(
+            "No active project can receive this idea; activate a project before promotion."
+        )
+    choices = ", ".join(
+        str(project.get("id") or project.get("name") or "unknown")
+        for project in active_projects[:10]
+    )
+    raise IdeaPromotionError(
+        "Several active projects could receive this idea. Choose one explicitly with "
+        f"/autorun promote {str(idea.get('id') or '<idea-id>')} <project-id>. "
+        f"Active projects: {choices}."
+    )
+
+
+def _promotion_goal_id(project: Mapping[str, Any], idea: Mapping[str, Any]) -> Optional[str]:
+    requested = str(idea.get("target_goal_id") or "").strip()
+    goals = [goal for goal in project.get("goals", []) or [] if isinstance(goal, Mapping)]
+    if requested:
+        matches = [
+            goal for goal in goals if str(goal.get("id") or "").strip() == requested
+        ]
+        if len(matches) != 1:
+            raise IdeaPromotionError(
+                f"Goal {requested!r} is missing or ambiguous; no promotion was staged."
+            )
+        goal_status = str(matches[0].get("status") or "active").strip().lower()
+        if goal_status in {"archived", "cancelled", "complete", "completed", "done"}:
+            raise IdeaPromotionError(
+                f"Goal {requested!r} is inactive; no promotion was staged."
+            )
+        return requested
+    active = [
+        goal
+        for goal in goals
+        if str(goal.get("status") or "active").strip().lower()
+        not in {"archived", "cancelled", "complete", "completed", "done"}
+    ]
+    return str(active[0].get("id")) if len(active) == 1 and active[0].get("id") else None
+
+
+def _promotion_roadmap_id(state: Mapping[str, Any], idea_id: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "-", str(idea_id)).strip("-").upper()
+    if token.startswith("IDEA-"):
+        token = token[5:]
+    token = token[:32] or hashlib.sha256(str(idea_id).encode("utf-8")).hexdigest()[:10].upper()
+    candidate = f"AUTO-IDEA-{token}"
+    existing_ids = {
+        str(item.get("id") or "").strip()
+        for project in state.get("projects", []) or []
+        if isinstance(project, Mapping)
+        for item in project.get("roadmap_items", []) or []
+        if isinstance(item, Mapping)
+    }
+    if candidate in existing_ids:
+        raise IdeaPromotionError(
+            f"Roadmap item ID {candidate!r} already exists; no state was changed."
+        )
+    return candidate
+
+
+def _promotion_acceptance_criteria(idea: Mapping[str, Any]) -> list[str]:
+    next_step = re.sub(
+        r"\s+", " ", str(idea.get("recommended_next_validation_step") or "")
+    ).strip()[:600]
+    expected_value = re.sub(
+        r"\s+", " ", str(idea.get("expected_value") or "")
+    ).strip()[:600]
+    return [
+        (
+            f"Complete and document this validation step: {next_step}"
+            if next_step
+            else "Complete one bounded validation of the proposed idea and document the method."
+        ),
+        (
+            f"Evaluate the evidence against the expected value: {expected_value}"
+            if expected_value
+            else "Evaluate the evidence against a clearly stated expected value."
+        ),
+        "Record the evidence and a build, revise, or reject recommendation in a reviewable deliverable.",
+        "Do not implement, deploy, publish, or take another external action in this proposal-only task.",
+    ]
+
+
+def _promotion_description(idea: Mapping[str, Any]) -> str:
+    fields = [
+        ("Problem", idea.get("problem_addressed")),
+        ("Expected value", idea.get("expected_value")),
+        ("Target user", idea.get("target_user")),
+        ("Relationship to goals", idea.get("relationship_to_current_goals")),
+        ("Recommended validation", idea.get("recommended_next_validation_step")),
+    ]
+    return "\n".join(
+        f"{label}: {str(value).strip()[:800]}"
+        for label, value in fields
+        if str(value or "").strip()
+    )
+
+
+def _idea_promotion_revision(idea: Mapping[str, Any]) -> str:
+    fields = (
+        "id",
+        "idea",
+        "problem_addressed",
+        "expected_value",
+        "target_user",
+        "estimated_effort",
+        "estimated_ai_cost_usd",
+        "risks",
+        "relationship_to_current_goals",
+        "recommended_next_validation_step",
+        "target_project_id",
+        "target_goal_id",
+        "status",
+        "source_run_id",
+    )
+    payload = {field: idea.get(field) for field in fields}
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_idea_promotion(
+    state: Mapping[str, Any],
+    idea_id: str,
+    requested_project_id: Optional[str] = None,
+    *,
+    expected_revision: Optional[str] = None,
+    expected_roadmap_item_id: Optional[str] = None,
+    expected_goal_id: Any = _UNSET,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    active_run = (state.get("run_control", {}) or {}).get("active_run")
+    if active_run:
+        run_id = str(active_run.get("run_id") or "unknown")
+        raise IdeaPromotionError(
+            f"Idea promotion is unavailable while autonomous run {run_id!r} is active."
+        )
+    idea = _find_unique_idea(state, idea_id)
+    status = str(idea.get("status") or "proposed").strip().lower()
+    if status != "proposed":
+        raise IdeaPromotionError(
+            f"Idea {str(idea.get('id'))!r} is {status!r}; only proposed ideas can be promoted."
+        )
+    revision = _idea_promotion_revision(idea)
+    if expected_revision and revision != str(expected_revision):
+        raise IdeaPromotionError(
+            f"Idea {str(idea.get('id'))!r} changed after approval was staged; review it again."
+        )
+    existing_source_items = [
+        item
+        for candidate_project in state.get("projects", []) or []
+        if isinstance(candidate_project, Mapping)
+        for item in candidate_project.get("roadmap_items", []) or []
+        if isinstance(item, Mapping)
+        and str(item.get("source_idea_id") or "").strip() == str(idea.get("id") or "").strip()
+    ]
+    if existing_source_items:
+        raise IdeaPromotionError(
+            f"Idea {str(idea.get('id'))!r} already has linked roadmap work; "
+            "no duplicate was created."
+        )
+    project = _resolve_promotion_project(state, idea, requested_project_id)
+    roadmap_item_id = _promotion_roadmap_id(state, str(idea.get("id")))
+    if expected_roadmap_item_id and roadmap_item_id != str(expected_roadmap_item_id):
+        raise IdeaPromotionError(
+            "The reviewed roadmap destination changed after approval was staged; review it again."
+        )
+    title = re.sub(r"\s+", " ", str(idea.get("idea") or "")).strip()
+    if not title:
+        raise IdeaPromotionError("The proposed idea has no title; no promotion was staged.")
+    title = title[:200]
+    if not str(idea.get("recommended_next_validation_step") or "").strip():
+        raise IdeaPromotionError(
+            f"Idea {str(idea.get('id'))!r} has no recommended validation step; "
+            "no promotion was staged."
+        )
+    effort = str(idea.get("estimated_effort") or "").strip().lower()
+    complexity = {"small": "lightweight", "medium": "standard", "large": "advanced"}.get(
+        effort, "standard"
+    )
+    goal_id = _promotion_goal_id(project, idea)
+    if expected_goal_id is not _UNSET and goal_id != expected_goal_id:
+        raise IdeaPromotionError(
+            "The reviewed roadmap goal changed after approval was staged; review it again."
+        )
+    roadmap_item = {
+        "id": roadmap_item_id,
+        "goal_id": goal_id,
+        "title": f"Validate idea: {title}",
+        "description": _promotion_description(idea),
+        "priority": 50,
+        "status": "ready",
+        "dependencies": [],
+        "blockers": [],
+        "acceptance_criteria": _promotion_acceptance_criteria(idea),
+        "agent_owner": "manager",
+        "task_type": "planning",
+        "complexity": complexity,
+        "risk": "low",
+        "required_capabilities": ["text", "reasoning", "planning"],
+        "authorization_level": AuthorizationLevel.PROPOSE.value,
+        "estimated_input_tokens": 2200,
+        "estimated_output_tokens": 700,
+        "estimated_ai_cost_usd": _money(idea.get("estimated_ai_cost_usd", 0.0)),
+        "previous_attempts": [],
+        "previous_models": [],
+        "human_resolution_history": [],
+        "human_decision_required": False,
+        "human_action": "",
+        "source_idea_id": str(idea.get("id")),
+        "source_idea_fingerprint": str(idea.get("fingerprint") or _idea_fingerprint(idea)),
+        "source_run_id": str(idea.get("source_run_id") or ""),
+        "proposal_revision": revision,
+    }
+    return idea, project, roadmap_item
+
+
 class AutonomyStateStore:
     """File-locked, atomic, versioned JSON state store."""
 
@@ -505,6 +781,106 @@ class AutonomyStateStore:
                     self.path, pending_recovery, self.recovery_path
                 )
             _atomic_write_json(self.path, normalized)
+
+    def _inspect_idea_promotion(
+        self,
+        idea_id: str,
+        *,
+        project_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Build a deterministic promotion preview without changing persistent state."""
+
+        with self.lock:
+            state = self._load_unlocked()
+            idea, project, roadmap_item = _build_idea_promotion(
+                state, idea_id, project_id
+            )
+            return redact_secrets({
+                "idea_id": str(idea.get("id")),
+                "idea": str(idea.get("idea") or ""),
+                "problem_addressed": str(idea.get("problem_addressed") or ""),
+                "expected_value": str(idea.get("expected_value") or ""),
+                "project_id": str(project.get("id") or ""),
+                "project_name": str(project.get("name") or project.get("id") or ""),
+                "goal_id": roadmap_item.get("goal_id"),
+                "roadmap_item_id": roadmap_item["id"],
+                "title": roadmap_item["title"],
+                "status": roadmap_item["status"],
+                "authorization_level": roadmap_item["authorization_level"],
+                "acceptance_criteria": deepcopy(roadmap_item["acceptance_criteria"]),
+                "estimated_ai_cost_usd": roadmap_item["estimated_ai_cost_usd"],
+                "proposal_revision": _idea_promotion_revision(idea),
+            })
+
+    def _promote_idea(
+        self,
+        idea_id: str,
+        *,
+        project_id: str,
+        expected_revision: str,
+        expected_roadmap_item_id: str,
+        expected_goal_id: Optional[str],
+        promoted_at: datetime,
+        approval_source: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        """Atomically promote one revalidated idea and preserve its provenance."""
+
+        with self.lock:
+            state = self._load_unlocked()
+            idea = _find_unique_idea(state, idea_id)
+            status = str(idea.get("status") or "proposed").strip().lower()
+            if status == "promoted":
+                linked_id = str(idea.get("promoted_roadmap_item_id") or "").strip()
+                linked = [
+                    (project, item)
+                    for project in state.get("projects", []) or []
+                    if isinstance(project, dict)
+                    for item in project.get("roadmap_items", []) or []
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "").strip() == linked_id
+                    and str(item.get("source_idea_id") or "").strip() == str(idea_id).strip()
+                ]
+                if len(linked) == 1:
+                    project, item = linked[0]
+                    linked_project_id = str(project.get("id") or "").strip()
+                    linked_revision = str(item.get("proposal_revision") or "").strip()
+                    if (
+                        linked_id != str(expected_roadmap_item_id)
+                        or linked_project_id != str(project_id)
+                        or linked_revision != str(expected_revision)
+                        or item.get("goal_id") != expected_goal_id
+                    ):
+                        raise IdeaPromotionError(
+                            f"Idea {str(idea_id)!r} was already promoted through a "
+                            "different reviewed destination; no duplicate was created."
+                        )
+                    return deepcopy(item), deepcopy(project), True
+                raise IdeaPromotionError(
+                    f"Idea {str(idea_id)!r} is marked promoted but its linked roadmap "
+                    "item is missing or ambiguous; no state was changed."
+                )
+            idea, project, roadmap_item = _build_idea_promotion(
+                state,
+                idea_id,
+                project_id,
+                expected_revision=expected_revision,
+                expected_roadmap_item_id=expected_roadmap_item_id,
+                expected_goal_id=expected_goal_id,
+            )
+            timestamp = _aware_utc(promoted_at).isoformat()
+            roadmap_item["created_at"] = timestamp
+            roadmap_item["updated_at"] = timestamp
+            roadmap_item["promoted_at"] = timestamp
+            roadmap_item["approval_source"] = str(approval_source or "owner_confirmation")
+            project.setdefault("roadmap_items", []).append(roadmap_item)
+            idea["status"] = "promoted"
+            idea["promoted_at"] = timestamp
+            idea["promoted_project_id"] = str(project.get("id") or "")
+            idea["promoted_goal_id"] = roadmap_item.get("goal_id")
+            idea["promoted_roadmap_item_id"] = roadmap_item["id"]
+            idea["promotion_approval_source"] = roadmap_item["approval_source"]
+            _atomic_write_json(self.path, state)
+            return deepcopy(roadmap_item), deepcopy(project), False
 
     def _reset_item_for_retry(self, item_id: str, *, reset_at: datetime) -> str:
         """Atomically reset one unambiguous human-blocked item to ``ready``.
@@ -764,7 +1140,13 @@ def format_telegram_summary(report: Mapping[str, Any]) -> str:
     idea_proposals = [
         idea for idea in (report.get("idea_proposals", []) or []) if isinstance(idea, Mapping)
     ]
-    idea_titles = [str(idea.get("idea") or idea.get("id") or "Untitled idea") for idea in idea_proposals]
+    idea_titles = []
+    for idea in idea_proposals:
+        idea_id = str(idea.get("id") or "").strip()
+        title = re.sub(r"\s+", " ", str(idea.get("idea") or "Untitled idea")).strip()
+        if len(title) > 120:
+            title = title[:117].rstrip() + "..."
+        idea_titles.append(f"{idea_id}: {title}" if idea_id else title)
     if not idea_titles:
         idea_titles = [str(value) for value in (report.get("ideas_added", []) or [])]
     deferred = report.get("deferred", []) or []
@@ -816,11 +1198,22 @@ def format_telegram_idea_plan(report: Mapping[str, Any]) -> str:
     ]
     if not proposals:
         return ""
-    lines = ["Lumen idea plan"]
+    lines = ["Lumen idea plan", "", "Proposed ideas:"]
+    for idea in proposals:
+        idea_id = str(idea.get("id") or "unknown-id").strip()
+        title = re.sub(r"\s+", " ", str(idea.get("idea") or "Untitled idea")).strip()
+        if len(title) > 120:
+            title = title[:117].rstrip() + "..."
+        lines.append(f"- {idea_id}: {title}")
+    lines.extend([
+        "",
+        "To queue one for owner approval: /autorun promote <idea-id>",
+    ])
     for index, idea in enumerate(proposals, 1):
+        idea_id = str(idea.get("id") or "unknown-id").strip()
         lines.extend([
             "",
-            f"{index}. {idea.get('idea') or 'Untitled idea'}",
+            f"{index}. [{idea_id}] {idea.get('idea') or 'Untitled idea'}",
             f"Problem: {idea.get('problem_addressed') or 'Not specified'}",
             f"Expected value: {idea.get('expected_value') or 'Not specified'}",
             f"Effort: {idea.get('estimated_effort') or 'unknown'}; estimated AI cost: ${_money(idea.get('estimated_ai_cost_usd')):.4f}",
@@ -923,6 +1316,76 @@ class AutonomousWorkflow:
 
     def load_state(self) -> dict[str, Any]:
         return self.store.load()
+
+    def preview_idea_promotion(
+        self,
+        idea_id: str,
+        project_id: Optional[str] = None,
+    ) -> tuple[bool, dict[str, Any] | str]:
+        """Inspect one owner-gated idea promotion without writing or invoking a model."""
+
+        run_lock = FileLock(
+            str(self.run_lock_path), timeout=self.config.lock_timeout_seconds
+        )
+        try:
+            with run_lock:
+                preview = self.store._inspect_idea_promotion(
+                    idea_id, project_id=project_id
+                )
+        except FileLockTimeout:
+            return False, _redact_text(
+                "Idea promotion was not staged because another autonomous run holds "
+                "the persistent run lock."
+            )
+        except IdeaPromotionError as exc:
+            return False, _redact_text(str(exc))
+        return True, preview
+
+    def promote_idea(
+        self,
+        idea_id: str,
+        *,
+        project_id: str,
+        expected_revision: str,
+        expected_roadmap_item_id: str,
+        expected_goal_id: Optional[str],
+        approval_source: str = "telegram_owner_confirmation",
+    ) -> tuple[bool, str]:
+        """Atomically queue one approved proposal without starting autonomous work."""
+
+        run_lock = FileLock(
+            str(self.run_lock_path), timeout=self.config.lock_timeout_seconds
+        )
+        try:
+            with run_lock:
+                roadmap_item, project, already_promoted = self.store._promote_idea(
+                    idea_id,
+                    project_id=project_id,
+                    expected_revision=expected_revision,
+                    expected_roadmap_item_id=expected_roadmap_item_id,
+                    expected_goal_id=expected_goal_id,
+                    promoted_at=self._now(),
+                    approval_source=approval_source,
+                )
+        except FileLockTimeout:
+            return False, _redact_text(
+                "Idea promotion did not run because another autonomous run holds the "
+                "persistent run lock. The approval can be retried after that run finishes."
+            )
+        except IdeaPromotionError as exc:
+            return False, _redact_text(str(exc))
+        project_id_text = str(project.get("id") or project.get("name") or "unknown")
+        item_id = str(roadmap_item.get("id") or "unknown")
+        if already_promoted:
+            return True, _redact_text(
+                f"Idea {str(idea_id)!r} was already promoted to roadmap item {item_id!r} "
+                f"in project {project_id_text!r}; no duplicate was created."
+            )
+        return True, _redact_text(
+            f"Promoted idea {str(idea_id)!r} to ready roadmap item {item_id!r} in "
+            f"project {project_id_text!r}. No model was invoked and no autonomous run "
+            "was started. Run /autorun dry-run to inspect selection before /autorun live."
+        )
 
     def retry_item(self, item_id: str) -> tuple[bool, str]:
         """Safely make one human-blocked item eligible for a future run.
@@ -1202,6 +1665,11 @@ class AutonomousWorkflow:
             for idea in backlog
             if isinstance(idea, dict)
         }
+        used_ids = {
+            str(idea.get("id") or "").strip()
+            for idea in backlog
+            if isinstance(idea, dict) and str(idea.get("id") or "").strip()
+        }
         added = 0
         for candidate in candidates:
             if added >= addition_limit or not isinstance(candidate, Mapping):
@@ -1212,8 +1680,13 @@ class AutonomousWorkflow:
             raw_risks = candidate.get("risks", []) or []
             if isinstance(raw_risks, str):
                 raw_risks = [raw_risks]
+            idea_id = str(candidate.get("id") or "").strip()
+            if not idea_id or idea_id in used_ids:
+                idea_id = f"idea_{uuid.uuid4().hex[:10]}"
+                while idea_id in used_ids:
+                    idea_id = f"idea_{uuid.uuid4().hex[:10]}"
             idea = {
-                "id": str(candidate.get("id") or f"idea_{uuid.uuid4().hex[:10]}"),
+                "id": idea_id,
                 "idea": idea_text,
                 "problem_addressed": str(candidate.get("problem_addressed", "")),
                 "expected_value": str(candidate.get("expected_value", "")),
@@ -1228,6 +1701,12 @@ class AutonomousWorkflow:
                 "created_at": self._now().isoformat(),
                 "source_run_id": report["run_id"],
             }
+            target_project_id = str(candidate.get("target_project_id") or "").strip()
+            target_goal_id = str(candidate.get("target_goal_id") or "").strip()
+            if target_project_id:
+                idea["target_project_id"] = target_project_id
+            if target_goal_id:
+                idea["target_goal_id"] = target_goal_id
             fingerprint = _idea_fingerprint(idea)
             if fingerprint in fingerprints:
                 continue
@@ -1235,6 +1714,7 @@ class AutonomousWorkflow:
             safe_idea = redact_secrets(idea)
             backlog.append(safe_idea)
             fingerprints.add(fingerprint)
+            used_ids.add(idea_id)
             report["ideas_added"].append(idea["id"])
             report.setdefault("idea_proposals", []).append(deepcopy(safe_idea))
             added += 1
