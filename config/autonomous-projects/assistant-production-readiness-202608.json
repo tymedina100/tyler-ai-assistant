@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "manifest_id": "assistant-production-readiness-202608",
+  "summary": "A bounded, source-backed production-readiness review of the autonomous assistant itself.",
+  "target_project_id": "assistant",
+  "goal": {
+    "id": "assistant-production-readiness-202608",
+    "title": "Produce a source-backed autonomous production-readiness review",
+    "description": "Use recent run evidence and the current repository to identify concrete reliability, budget, authorization, recovery, review-loop, and operator-control improvements without changing production.",
+    "status": "active"
+  },
+  "roadmap_items": [
+    {
+      "id": "AUTO-PROD-202608-001",
+      "goal_id": "assistant-production-readiness-202608",
+      "title": "Establish the recent autonomous-run evidence baseline",
+      "description": "Analyze the allowlisted snapshot of up to five recent autonomous runs and produce a concise operational baseline. Use only supplied evidence; do not infer omitted task narratives.",
+      "priority": 100,
+      "status": "ready",
+      "dependencies": [],
+      "blockers": [],
+      "acceptance_criteria": [
+        "Account for every supplied run using run ID, trigger, final status, and whether human review was required; explicitly state when fewer than five runs were supplied and that per-run cost is unavailable unless supplied.",
+        "Keep global run metadata separate from Tyler AI Assistant project details and label unknown information rather than inferring it.",
+        "Identify no more than three recurring operational patterns and give one evidence-based next action for each.",
+        "Expose no secrets, private narratives, or report paths, and perform no external action."
+      ],
+      "agent_owner": "manager",
+      "task_type": "review",
+      "complexity": "standard",
+      "risk": "medium",
+      "required_capabilities": [
+        "text",
+        "reasoning",
+        "review"
+      ],
+      "authorization_level": "observe",
+      "estimated_input_tokens": 7000,
+      "estimated_output_tokens": 1000,
+      "requires_recent_run_evidence": true,
+      "previous_attempts": [],
+      "previous_models": [],
+      "human_decision_required": false,
+      "human_action": ""
+    },
+    {
+      "id": "AUTO-PROD-202608-002",
+      "goal_id": "assistant-production-readiness-202608",
+      "title": "Audit budget reservations, routing, and reconciliation",
+      "description": "Inspect the current budget ledger, model router, autonomous adapter, and their tests. Trace cost control from estimate through reservation and reconciliation. Propose hardening only; do not modify code.",
+      "priority": 95,
+      "status": "ready",
+      "dependencies": [],
+      "blockers": [],
+      "acceptance_criteria": [
+        "Trace estimate, reservation, affordable-output enforcement, provider usage, reconciliation, and budget-day rollover with source-file plus function or test-name evidence.",
+        "Cover success, provider failure, cancellation or timeout, and competing reservations, distinguishing code-proven behavior from live behavior that remains unverified.",
+        "List at most five material gaps, each with failure impact and the smallest practical mitigation or test.",
+        "Read only repository evidence; expose no secret values and perform no mutation or external action."
+      ],
+      "agent_owner": "code",
+      "task_type": "security_review",
+      "complexity": "advanced",
+      "risk": "high",
+      "required_capabilities": [
+        "text",
+        "reasoning",
+        "security_review",
+        "tool_use"
+      ],
+      "authorization_level": "observe",
+      "estimated_input_tokens": 18000,
+      "estimated_output_tokens": 1200,
+      "requires_recent_run_evidence": false,
+      "previous_attempts": [],
+      "previous_models": [],
+      "human_decision_required": false,
+      "human_action": ""
+    },
+    {
+      "id": "AUTO-PROD-202608-003",
+      "goal_id": "assistant-production-readiness-202608",
+      "title": "Audit scheduling, locking, persistence, and restart recovery",
+      "description": "Inspect the autonomous workflow, its tests, and deployment documentation. Produce a fail-closed recovery assessment without touching Railway or persistent state.",
+      "priority": 90,
+      "status": "ready",
+      "dependencies": [],
+      "blockers": [],
+      "acceptance_criteria": [
+        "Trace scheduler registration, run locking, scheduled-date idempotency, task claiming, report persistence, and run completion with named source or test evidence.",
+        "Document state-path precedence, seed-versus-persistent-state behavior, atomic writes, stale-run recovery, and the shared-filesystem assumption.",
+        "Provide a failure matrix for overlap, process restart, stale run, corrupt state, and interrupted write, including the expected safe state for each.",
+        "Provide an owner recovery checklist that proposes no deletion, redeploy, or state mutation."
+      ],
+      "agent_owner": "code",
+      "task_type": "architecture",
+      "complexity": "advanced",
+      "risk": "high",
+      "required_capabilities": [
+        "text",
+        "reasoning",
+        "architecture",
+        "tool_use"
+      ],
+      "authorization_level": "observe",
+      "estimated_input_tokens": 24000,
+      "estimated_output_tokens": 1200,
+      "requires_recent_run_evidence": false,
+      "previous_attempts": [],
+      "previous_models": [],
+      "human_decision_required": false,
+      "human_action": ""
+    },
+    {
+      "id": "AUTO-PROD-202608-004",
+      "goal_id": "assistant-production-readiness-202608",
+      "title": "Audit autonomous authorization and external-action gates",
+      "description": "Inspect authorization filtering, specialist tool profiles, confirmation gates, and relevant tests. Assess bypass risk without requesting broader permissions.",
+      "priority": 85,
+      "status": "ready",
+      "dependencies": [],
+      "blockers": [],
+      "acceptance_criteria": [
+        "Produce a source-backed matrix mapping observe, propose, modify_local, and external_action to automatic tools, blocked tools, and required human gates.",
+        "Identify remote-mutation-capable tools and direct-helper bypass paths, clearly distinguishing reachable autonomous paths from general architectural risk.",
+        "Rank at most five authorization risks by severity and give one narrowly scoped mitigation or test for each.",
+        "Do not inspect secret values, grant permissions, create branches, send messages, deploy, or mutate external state."
+      ],
+      "agent_owner": "code",
+      "task_type": "security_review",
+      "complexity": "advanced",
+      "risk": "high",
+      "required_capabilities": [
+        "text",
+        "reasoning",
+        "security_review",
+        "tool_use"
+      ],
+      "authorization_level": "observe",
+      "estimated_input_tokens": 16000,
+      "estimated_output_tokens": 1200,
+      "requires_recent_run_evidence": false,
+      "previous_attempts": [],
+      "previous_models": [],
+      "human_decision_required": false,
+      "human_action": ""
+    },
+    {
+      "id": "AUTO-PROD-202608-005",
+      "goal_id": "assistant-production-readiness-202608",
+      "title": "Audit review-loop termination and Telegram escalation behavior",
+      "description": "Inspect Company Mode, autonomous aggregation, Telegram behavior, and related tests. Verify that failed work stops spending and produces an actionable terminal outcome.",
+      "priority": 80,
+      "status": "ready",
+      "dependencies": [],
+      "blockers": [],
+      "acceptance_criteria": [
+        "Trace acceptance criteria from roadmap item through worker prompt, reviewer verdict, revisions, terminal state, persisted report, and Telegram output using named source or test evidence.",
+        "Provide expected outcomes for approval, ordinary revision, repeated feedback, missing access, permission failure, budget exhaustion, timeout, task-local blocker, and blocked-session ideation.",
+        "Verify or explicitly flag uncertainty around retry caps, no-progress fingerprints, unrelated-work continuation, creative suppression, redaction, chunking, and the trigger/final/human-review row.",
+        "List at most five concrete discrepancies or weak spots with the smallest proposed correction; make no changes."
+      ],
+      "agent_owner": "code",
+      "task_type": "complex_debugging",
+      "complexity": "advanced",
+      "risk": "high",
+      "required_capabilities": [
+        "text",
+        "reasoning",
+        "debugging",
+        "review",
+        "tool_use"
+      ],
+      "authorization_level": "observe",
+      "estimated_input_tokens": 20000,
+      "estimated_output_tokens": 1200,
+      "requires_recent_run_evidence": false,
+      "previous_attempts": [],
+      "previous_models": [],
+      "human_decision_required": false,
+      "human_action": ""
+    },
+    {
+      "id": "AUTO-PROD-202608-006",
+      "goal_id": "assistant-production-readiness-202608",
+      "title": "Create the critical autonomous-workflow test-gap matrix",
+      "description": "Inspect existing tests and produce a ranked, implementation-ready test plan. Do not run or edit tests.",
+      "priority": 70,
+      "status": "ready",
+      "dependencies": [
+        "AUTO-PROD-202608-002",
+        "AUTO-PROD-202608-003",
+        "AUTO-PROD-202608-004",
+        "AUTO-PROD-202608-005"
+      ],
+      "blockers": [],
+      "acceptance_criteria": [
+        "Map existing test functions to selection, overlap prevention, budget reservation, reconciliation, review caps, blocker continuation, dry-run safety, and redaction.",
+        "Identify exactly six highest-value missing or weak scenarios, each with target test file, setup, mocked boundary, expected assertion, and failure prevented.",
+        "Avoid proposing duplicate coverage and rank the six scenarios by production risk.",
+        "Do not claim tests were executed and do not create or modify files."
+      ],
+      "agent_owner": "code",
+      "task_type": "planning",
+      "complexity": "standard",
+      "risk": "medium",
+      "required_capabilities": [
+        "text",
+        "reasoning",
+        "planning",
+        "debugging",
+        "tool_use"
+      ],
+      "authorization_level": "observe",
+      "estimated_input_tokens": 9000,
+      "estimated_output_tokens": 1200,
+      "requires_recent_run_evidence": false,
+      "previous_attempts": [],
+      "previous_models": [],
+      "human_decision_required": false,
+      "human_action": ""
+    },
+    {
+      "id": "AUTO-PROD-202608-007",
+      "goal_id": "assistant-production-readiness-202608",
+      "title": "Produce the owner go-or-no-go autonomous operations runbook",
+      "description": "Use current repository documentation and tests to create a concise Telegram-first checklist for approving the next scheduled live run. Independently inspect its sources rather than relying on prior roadmap-item output.",
+      "priority": 60,
+      "status": "ready",
+      "dependencies": [
+        "AUTO-PROD-202608-001",
+        "AUTO-PROD-202608-006"
+      ],
+      "blockers": [],
+      "acceptance_criteria": [
+        "Provide a one-page pre-run, during-run, post-run, and escalation checklist suitable for the Telegram owner.",
+        "Use only commands confirmed by current documentation and explain the exact intent of each command.",
+        "Define explicit go-or-no-go conditions for an active Company project, pending confirmation, absent roadmap work, insufficient budget, recovery-required state, and a needs-human task.",
+        "State clearly that $5.00 is a ceiling, $0.25 is reserved, exact spending is not guaranteed, and no deploy, merge, permission expansion, or forced token consumption is authorized."
+      ],
+      "agent_owner": "code",
+      "task_type": "documentation",
+      "complexity": "standard",
+      "risk": "medium",
+      "required_capabilities": [
+        "text",
+        "reasoning",
+        "documentation",
+        "planning",
+        "tool_use"
+      ],
+      "authorization_level": "observe",
+      "estimated_input_tokens": 9000,
+      "estimated_output_tokens": 1200,
+      "requires_recent_run_evidence": false,
+      "previous_attempts": [],
+      "previous_models": [],
+      "human_decision_required": false,
+      "human_action": ""
+    }
+  ]
+}

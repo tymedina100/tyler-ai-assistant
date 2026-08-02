@@ -315,6 +315,225 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             update.message.reply_text.await_args.args[0],
         )
 
+    async def test_autorun_queue_stages_owner_confirmation_without_mutating_state(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        preview = {
+            "manifest_id": "assistant-production-v1",
+            "manifest_revision": "revision-pack-1",
+            "project_id": "assistant",
+            "project_name": "Tyler AI Assistant",
+            "goal_id": "assistant-production-autonomy",
+            "goal_title": "Harden production autonomy",
+            "item_count": 3,
+            "roadmap_item_ids": ["AUTO-PROD-001", "AUTO-PROD-002", "AUTO-PROD-003"],
+            "authorization_levels": ["observe", "propose"],
+            "already_queued": False,
+        }
+        workflow = types.SimpleNamespace(
+            preview_roadmap_pack=Mock(return_value=(True, preview)),
+            queue_roadmap_pack=Mock(),
+        )
+        with patch.object(self.group, "autonomy_runner_task", None), patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(
+            self.group, "_run_autonomy_session", new=AsyncMock()
+        ) as run, patch.object(
+            self.group, "reply_chunks", new=AsyncMock()
+        ) as reply:
+            await self.group.handle_autorun_command(
+                update, "/autorun queue assistant-production-v1", allow_live=True
+            )
+
+        workflow.preview_roadmap_pack.assert_called_once_with("assistant-production-v1")
+        workflow.queue_roadmap_pack.assert_not_called()
+        run.assert_not_awaited()
+        pending = self.fake_main.pending_actions["group"]
+        self.assertEqual(pending["type"], "autonomy_roadmap_pack")
+        self.assertEqual(pending["manifest_id"], "assistant-production-v1")
+        self.assertEqual(pending["expected_revision"], "revision-pack-1")
+        self.assertEqual(pending["project_id"], "assistant")
+        self.assertEqual(pending["goal_id"], "assistant-production-autonomy")
+        self.assertEqual(pending["item_count"], 3)
+        self.assertEqual(pending["requested_by_user_id"], 42)
+        rendered = reply.await_args.args[1]
+        self.assertIn("assistant-production-v1", rendered)
+        self.assertIn("revision-pack-1", rendered)
+        self.assertIn("Tyler AI Assistant", rendered)
+        self.assertIn("Harden production autonomy", rendered)
+        self.assertIn("AUTO-PROD-001", rendered)
+        self.assertIn("observe, propose", rendered)
+        self.assertIn("Already queued: no", rendered)
+        self.assertIn("Reply /confirm", rendered)
+
+    async def test_autorun_queue_reports_an_already_queued_pack_without_staging(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        preview = {
+            "manifest_id": "assistant-production-v1",
+            "manifest_revision": "revision-pack-1",
+            "project_id": "assistant",
+            "project_name": "Tyler AI Assistant",
+            "goal_id": "assistant-production-autonomy",
+            "goal_title": "Harden production autonomy",
+            "item_count": 3,
+            "roadmap_item_ids": ["AUTO-PROD-001", "AUTO-PROD-002", "AUTO-PROD-003"],
+            "authorization_levels": ["propose"],
+            "already_queued": True,
+        }
+        workflow = types.SimpleNamespace(
+            preview_roadmap_pack=Mock(return_value=(True, preview)),
+            queue_roadmap_pack=Mock(),
+        )
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(self.group, "reply_chunks", new=AsyncMock()) as reply:
+            await self.group.handle_autorun_command(
+                update, "/autorun queue assistant-production-v1", allow_live=True
+            )
+
+        workflow.queue_roadmap_pack.assert_not_called()
+        self.assertNotIn("group", self.fake_main.pending_actions)
+        rendered = reply.await_args.args[1]
+        self.assertIn("already queued", rendered.lower())
+        self.assertIn("Already queued: yes", rendered)
+        self.assertIn("No approval was staged", rendered)
+
+    async def test_autorun_queue_requires_manifest_group_and_idle_runners(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        workflow = types.SimpleNamespace(preview_roadmap_pack=Mock())
+
+        await self.group.handle_autorun_command(
+            update, "/autorun queue", allow_live=True
+        )
+        self.assertIn("Usage", update.message.reply_text.await_args.args[0])
+
+        update.message.reply_text.reset_mock()
+        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            await self.group.handle_autorun_command(
+                update, "/autorun queue assistant-production-v1", allow_live=False
+            )
+        self.assertIn("group operating room", update.message.reply_text.await_args.args[0])
+        workflow.preview_roadmap_pack.assert_not_called()
+
+        update.message.reply_text.reset_mock()
+        active = types.SimpleNamespace(done=lambda: False)
+        with patch.object(self.group, "autonomy_runner_task", active), patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ):
+            await self.group.handle_autorun_command(
+                update, "/autorun queue assistant-production-v1", allow_live=True
+            )
+        self.assertIn("already active", update.message.reply_text.await_args.args[0])
+        workflow.preview_roadmap_pack.assert_not_called()
+
+        update.message.reply_text.reset_mock()
+        with patch.object(self.group, "autonomy_runner_task", None), patch.object(
+            self.group, "company_runner_task", active
+        ), patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            await self.group.handle_autorun_command(
+                update, "/autorun queue assistant-production-v1", allow_live=True
+            )
+        self.assertIn("Company Mode is already running", update.message.reply_text.await_args.args[0])
+        workflow.preview_roadmap_pack.assert_not_called()
+
+    async def test_confirmed_roadmap_pack_queues_once_and_clears_approval(self):
+        self.fake_main.pending_actions["group"] = {
+            "type": "autonomy_roadmap_pack",
+            "manifest_id": "assistant-production-v1",
+            "expected_revision": "revision-pack-1",
+            "project_id": "assistant",
+            "goal_id": "assistant-production-autonomy",
+            "item_count": 3,
+            "requested_by_user_id": 42,
+        }
+        workflow = types.SimpleNamespace(
+            queue_roadmap_pack=Mock(return_value=(
+                True,
+                "Queued 3 ready roadmap items. No autonomous run was started.",
+            ))
+        )
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(self.group, "reply_chunks", new=AsyncMock()) as reply:
+            handled = await self.group._handle_pending_confirmation(
+                update, "/confirm@TyManagerBot"
+            )
+
+        self.assertTrue(handled)
+        workflow.queue_roadmap_pack.assert_called_once_with(
+            "assistant-production-v1",
+            expected_revision="revision-pack-1",
+            approval_source="telegram_owner:42",
+        )
+        self.assertNotIn("group", self.fake_main.pending_actions)
+        self.assertIn("Queued 3", reply.await_args.args[1])
+
+    async def test_roadmap_pack_confirmation_is_owner_bound_and_cancel_is_safe(self):
+        pending = {
+            "type": "autonomy_roadmap_pack",
+            "manifest_id": "assistant-production-v1",
+            "expected_revision": "revision-pack-1",
+            "requested_by_user_id": 42,
+        }
+        self.fake_main.pending_actions["group"] = pending
+        workflow = types.SimpleNamespace(queue_roadmap_pack=Mock())
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=99),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            handled = await self.group._handle_pending_confirmation(update, "/confirm")
+
+        self.assertTrue(handled)
+        workflow.queue_roadmap_pack.assert_not_called()
+        self.assertIn("group", self.fake_main.pending_actions)
+        self.assertIn("Only the owner", update.message.reply_text.await_args.args[0])
+
+        update.effective_user.id = 42
+        update.message.reply_text.reset_mock()
+        handled = await self.group._handle_pending_confirmation(update, "/cancel")
+        self.assertTrue(handled)
+        self.assertNotIn("group", self.fake_main.pending_actions)
+        self.assertIn("No roadmap state changed", update.message.reply_text.await_args.args[0])
+        workflow.queue_roadmap_pack.assert_not_called()
+
+    async def test_failed_roadmap_pack_confirmation_retains_staged_approval(self):
+        self.fake_main.pending_actions["group"] = {
+            "type": "autonomy_roadmap_pack",
+            "manifest_id": "assistant-production-v1",
+            "expected_revision": "revision-pack-1",
+            "requested_by_user_id": 42,
+        }
+        workflow = types.SimpleNamespace(
+            queue_roadmap_pack=Mock(return_value=(
+                False,
+                "Another autonomous run holds the lock.",
+            ))
+        )
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(self.group, "reply_chunks", new=AsyncMock()) as reply:
+            await self.group._handle_pending_confirmation(update, "/confirm")
+
+        self.assertIn("group", self.fake_main.pending_actions)
+        self.assertIn("approval remains staged", reply.await_args.args[1])
+
     async def test_autorun_promote_stages_owner_confirmation_without_mutating_state(self):
         update = types.SimpleNamespace(
             effective_user=types.SimpleNamespace(id=42),

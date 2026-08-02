@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import time
@@ -29,6 +30,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ROADMAP_FILE = BASE_DIR / "config" / "autonomous-roadmap.json"
+DEFAULT_ROADMAP_PACK_DIR = BASE_DIR / "config" / "autonomous-projects"
 STATE_VERSION = 1
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_RESULT_PREVIEW_CHARS = 360
@@ -46,6 +48,9 @@ RETRY_BLOCKED_PROJECT_STATUSES = {
     "completed",
 }
 HUMAN_RESOLUTION_HISTORY_LIMIT = 50
+ROADMAP_PACK_MAX_ITEMS = 25
+ROADMAP_PACK_MAX_BYTES = 512 * 1024
+ROADMAP_PACK_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}")
 RETRY_RESET_FIELDS = {
     "blocked_reason",
     "blocker",
@@ -178,6 +183,7 @@ class AutonomyConfig:
     max_authorization: AuthorizationLevel = AuthorizationLevel.PROPOSE
     data_dir: Path = BASE_DIR
     roadmap_seed_path: Path = DEFAULT_ROADMAP_FILE
+    roadmap_pack_dir: Path = DEFAULT_ROADMAP_PACK_DIR
     lock_timeout_seconds: float = 0.0
 
     @property
@@ -213,6 +219,14 @@ class AutonomyConfig:
         seed_path = Path(
             _env_first("AUTONOMY_ROADMAP_FILE", "AUTONOMOUS_ROADMAP_FILE", default=str(DEFAULT_ROADMAP_FILE))
             or DEFAULT_ROADMAP_FILE
+        )
+        pack_dir = Path(
+            _env_first(
+                "AUTONOMY_PROJECT_PACK_DIR",
+                "AUTONOMOUS_PROJECT_PACK_DIR",
+                default=str(DEFAULT_ROADMAP_PACK_DIR),
+            )
+            or DEFAULT_ROADMAP_PACK_DIR
         )
         return cls(
             enabled=_safe_bool(_env_first("AUTONOMY_ENABLED", "AUTONOMOUS_ENABLED"), False),
@@ -264,6 +278,7 @@ class AutonomyConfig:
             ),
             data_dir=data_dir,
             roadmap_seed_path=seed_path,
+            roadmap_pack_dir=pack_dir,
             lock_timeout_seconds=_safe_float(_env_first("AUTONOMY_LOCK_TIMEOUT_SECONDS"), 0.0),
         )
 
@@ -284,6 +299,10 @@ class RoadmapItemRetryError(ValueError):
 
 class IdeaPromotionError(ValueError):
     """Raised when a proposed idea cannot be safely converted to roadmap work."""
+
+
+class RoadmapPackError(ValueError):
+    """Raised when an owner-approved roadmap pack cannot be queued safely."""
 
 
 _SECRET_KEY_RE = re.compile(
@@ -351,6 +370,7 @@ def _default_state() -> dict[str, Any]:
         "schema_version": STATE_VERSION,
         "projects": [],
         "idea_backlog": [],
+        "roadmap_pack_history": [],
         "run_control": {
             "active_run": None,
             "scheduled_dates": {},
@@ -375,6 +395,7 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
         raise ValueError(f"Unsupported autonomy state version {state['version']}")
     state.setdefault("projects", [])
     state.setdefault("idea_backlog", [])
+    state.setdefault("roadmap_pack_history", [])
     state.setdefault("run_control", {})
     if not isinstance(state["run_control"], dict):
         raise ValueError("Autonomy run_control must be an object")
@@ -396,8 +417,14 @@ def _normalize_state(raw: Any) -> dict[str, Any]:
     state["budget_tracking"].setdefault("date", None)
     state["budget_tracking"].setdefault("actual_or_reconciled_cost_usd", 0.0)
     state["budget_tracking"].setdefault("cost_is_estimated", True)
-    if not isinstance(state["projects"], list) or not isinstance(state["idea_backlog"], list):
-        raise ValueError("Autonomy projects and idea_backlog must be lists")
+    if (
+        not isinstance(state["projects"], list)
+        or not isinstance(state["idea_backlog"], list)
+        or not isinstance(state["roadmap_pack_history"], list)
+    ):
+        raise ValueError(
+            "Autonomy projects, idea_backlog, and roadmap_pack_history must be lists"
+        )
     for project in state["projects"]:
         if not isinstance(project, dict):
             raise ValueError("Every autonomy project must be an object")
@@ -714,6 +741,721 @@ def _build_idea_promotion(
     return idea, project, roadmap_item
 
 
+_ROADMAP_PACK_TOP_LEVEL_FIELDS = {
+    "schema_version",
+    "manifest_id",
+    "summary",
+    "target_project_id",
+    "goal",
+    "roadmap_items",
+}
+_ROADMAP_PACK_GOAL_FIELDS = {"id", "title", "description", "status"}
+_ROADMAP_PACK_ITEM_FIELDS = {
+    "id",
+    "goal_id",
+    "title",
+    "description",
+    "priority",
+    "status",
+    "dependencies",
+    "blockers",
+    "acceptance_criteria",
+    "agent_owner",
+    "task_type",
+    "complexity",
+    "risk",
+    "required_capabilities",
+    "authorization_level",
+    "estimated_input_tokens",
+    "estimated_cached_input_tokens",
+    "estimated_output_tokens",
+    "estimated_ai_cost_usd",
+    "requires_recent_run_evidence",
+    "previous_attempts",
+    "previous_models",
+    "human_decision_required",
+    "human_action",
+}
+_ROADMAP_RECORD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}")
+_ROADMAP_PACK_GOAL_HASH_FIELDS = ("id", "title", "description")
+_ROADMAP_PACK_ITEM_HASH_FIELDS = (
+    "id",
+    "goal_id",
+    "title",
+    "description",
+    "priority",
+    "dependencies",
+    "acceptance_criteria",
+    "agent_owner",
+    "task_type",
+    "complexity",
+    "risk",
+    "required_capabilities",
+    "authorization_level",
+    "estimated_input_tokens",
+    "estimated_cached_input_tokens",
+    "estimated_output_tokens",
+    "estimated_ai_cost_usd",
+    "requires_recent_run_evidence",
+)
+
+
+def _roadmap_pack_revision(manifest: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _roadmap_pack_record_hash(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _roadmap_pack_record_projection(
+    value: Mapping[str, Any],
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    return {field: deepcopy(value.get(field)) for field in fields}
+
+
+def _load_roadmap_pack(
+    pack_dir: Path,
+    manifest_id: str,
+) -> tuple[dict[str, Any], str]:
+    """Load one repository-owned pack without permitting path traversal or symlinks."""
+
+    requested_id = str(manifest_id or "").strip()
+    if not ROADMAP_PACK_ID_RE.fullmatch(requested_id):
+        raise RoadmapPackError(
+            "Roadmap pack IDs must use lowercase letters, numbers, dots, dashes, or "
+            "underscores and be at most 80 characters."
+        )
+    root = Path(pack_dir)
+    if not root.is_absolute():
+        root = BASE_DIR / root
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise RoadmapPackError(
+            f"The configured roadmap-pack directory is unavailable for {requested_id!r}."
+        ) from exc
+    source = resolved_root / f"{requested_id}.json"
+    if source.is_symlink():
+        raise RoadmapPackError("Roadmap pack symlinks are not accepted.")
+    try:
+        resolved_source = source.resolve(strict=True)
+        resolved_source.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise RoadmapPackError(
+            f"Roadmap pack {requested_id!r} was not found in the configured pack directory."
+        ) from exc
+    if not resolved_source.is_file():
+        raise RoadmapPackError(f"Roadmap pack {requested_id!r} is not a regular file.")
+    try:
+        with resolved_source.open("rb") as stream:
+            raw = stream.read(ROADMAP_PACK_MAX_BYTES + 1)
+        if len(raw) > ROADMAP_PACK_MAX_BYTES:
+            raise RoadmapPackError(
+                f"Roadmap pack {requested_id!r} exceeds the {ROADMAP_PACK_MAX_BYTES}-byte limit."
+            )
+        loaded = json.loads(raw.decode("utf-8"))
+    except RoadmapPackError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RoadmapPackError(
+            f"Roadmap pack {requested_id!r} is not readable valid JSON."
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise RoadmapPackError("A roadmap pack must be a JSON object.")
+    if str(loaded.get("manifest_id") or "").strip() != requested_id:
+        raise RoadmapPackError(
+            "The roadmap pack manifest_id does not match its requested filename."
+        )
+    try:
+        revision = _roadmap_pack_revision(loaded)
+    except (TypeError, ValueError) as exc:
+        raise RoadmapPackError("The roadmap pack contains unsupported JSON values.") from exc
+    return deepcopy(loaded), revision
+
+
+def _pack_text(
+    value: Any,
+    field: str,
+    *,
+    maximum: int = 4000,
+) -> str:
+    if not isinstance(value, str):
+        raise RoadmapPackError(f"Roadmap pack field {field!r} must be text.")
+    text = value.strip()
+    if not text:
+        raise RoadmapPackError(f"Roadmap pack field {field!r} must be non-empty.")
+    if len(text) > maximum:
+        raise RoadmapPackError(
+            f"Roadmap pack field {field!r} exceeds its {maximum}-character limit."
+        )
+    return text
+
+
+def _pack_string_list(
+    value: Any,
+    field: str,
+    *,
+    require_values: bool = False,
+    maximum_items: int = 20,
+    maximum_chars: int = 2000,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise RoadmapPackError(f"Roadmap pack field {field!r} must be a list.")
+    if len(value) > maximum_items:
+        raise RoadmapPackError(
+            f"Roadmap pack field {field!r} exceeds its {maximum_items}-item limit."
+        )
+    result: list[str] = []
+    for index, entry in enumerate(value):
+        if not isinstance(entry, str):
+            raise RoadmapPackError(
+                f"Roadmap pack field {field!r} entry {index + 1} must be text."
+            )
+        result.append(_pack_text(entry, f"{field}[{index}]", maximum=maximum_chars))
+    if require_values and not result:
+        raise RoadmapPackError(f"Roadmap pack field {field!r} must not be empty.")
+    if len(result) != len(set(result)):
+        raise RoadmapPackError(f"Roadmap pack field {field!r} contains duplicates.")
+    return result
+
+
+def _roadmap_pack_records_are_intact(
+    state: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    *,
+    manifest_id: str,
+    revision: str,
+    project_id: str,
+    goal_record: Mapping[str, Any],
+    item_records: list[Mapping[str, Any]],
+) -> bool:
+    goal_id = str(goal_record.get("id") or "")
+    item_ids = [str(item.get("id") or "") for item in item_records]
+    receipt_item_ids = receipt.get("roadmap_item_ids")
+    receipt_item_hashes = receipt.get("roadmap_item_hashes")
+    if not isinstance(receipt_item_ids, list) or not isinstance(
+        receipt_item_hashes, Mapping
+    ):
+        return False
+    goal_hash = _roadmap_pack_record_hash(
+        _roadmap_pack_record_projection(goal_record, _ROADMAP_PACK_GOAL_HASH_FIELDS)
+    )
+    item_hashes = {
+        str(item.get("id") or ""): _roadmap_pack_record_hash(
+            _roadmap_pack_record_projection(item, _ROADMAP_PACK_ITEM_HASH_FIELDS)
+        )
+        for item in item_records
+    }
+    if (
+        str(receipt.get("manifest_revision") or "") != revision
+        or str(receipt.get("project_id") or "") != project_id
+        or str(receipt.get("goal_id") or "") != goal_id
+        or receipt_item_ids != item_ids
+        or str(receipt.get("goal_record_hash") or "") != goal_hash
+        or dict(receipt_item_hashes) != item_hashes
+    ):
+        return False
+    projects = [
+        project
+        for project in state.get("projects", []) or []
+        if isinstance(project, Mapping)
+        and str(project.get("id") or "").strip() == project_id
+    ]
+    if len(projects) != 1:
+        return False
+    project = projects[0]
+    goals = [
+        goal
+        for goal in project.get("goals", []) or []
+        if isinstance(goal, Mapping)
+        and str(goal.get("id") or "").strip() == goal_id
+        and str(goal.get("source_manifest_id") or "") == manifest_id
+        and str(goal.get("source_manifest_revision") or "") == revision
+    ]
+    if len(goals) != 1:
+        return False
+    persisted_goal = goals[0]
+    if (
+        str(persisted_goal.get("source_manifest_record_hash") or "") != goal_hash
+        or _roadmap_pack_record_hash(
+            _roadmap_pack_record_projection(
+                persisted_goal, _ROADMAP_PACK_GOAL_HASH_FIELDS
+            )
+        )
+        != goal_hash
+    ):
+        return False
+    for item_id, expected_hash in item_hashes.items():
+        matches = [
+            (candidate_project, item)
+            for candidate_project in state.get("projects", []) or []
+            if isinstance(candidate_project, Mapping)
+            for item in candidate_project.get("roadmap_items", []) or []
+            if isinstance(item, Mapping)
+            and str(item.get("id") or "").strip() == item_id
+        ]
+        if len(matches) != 1:
+            return False
+        candidate_project, persisted_item = matches[0]
+        if (
+            str(candidate_project.get("id") or "").strip() != project_id
+            or str(persisted_item.get("source_manifest_id") or "") != manifest_id
+            or str(persisted_item.get("source_manifest_revision") or "") != revision
+            or str(persisted_item.get("source_manifest_record_hash") or "")
+            != expected_hash
+            or _roadmap_pack_record_hash(
+                _roadmap_pack_record_projection(
+                    persisted_item, _ROADMAP_PACK_ITEM_HASH_FIELDS
+                )
+            )
+            != expected_hash
+        ):
+            return False
+    return True
+
+
+def _prepare_roadmap_pack(
+    state: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    revision: str,
+    *,
+    queued_at: datetime,
+    approval_source: str,
+    backup_filename: Optional[str] = None,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """Validate a pack and build an additive candidate state without mutating input."""
+
+    active_run = (state.get("run_control", {}) or {}).get("active_run")
+    if active_run:
+        run_id = str(active_run.get("run_id") or "unknown")
+        raise RoadmapPackError(
+            f"Roadmap queueing is unavailable while autonomous run {run_id!r} is active."
+        )
+    unknown_top = set(manifest) - _ROADMAP_PACK_TOP_LEVEL_FIELDS
+    if unknown_top:
+        raise RoadmapPackError(
+            f"Roadmap pack contains unsupported top-level fields: {', '.join(sorted(unknown_top))}."
+        )
+    if manifest.get("schema_version") != 1:
+        raise RoadmapPackError("Roadmap pack schema_version must be 1.")
+    manifest_id = _pack_text(manifest.get("manifest_id"), "manifest_id", maximum=80)
+    if not ROADMAP_PACK_ID_RE.fullmatch(manifest_id):
+        raise RoadmapPackError("Roadmap pack manifest_id has an invalid format.")
+    project_id = _pack_text(
+        manifest.get("target_project_id"), "target_project_id", maximum=120
+    )
+    projects = [
+        project
+        for project in state.get("projects", []) or []
+        if isinstance(project, dict)
+        and str(project.get("id") or "").strip() == project_id
+    ]
+    if len(projects) != 1:
+        raise RoadmapPackError(
+            f"Target project {project_id!r} is missing or ambiguous; no state was changed."
+        )
+    project = projects[0]
+    project_status = str(project.get("status") or "active").strip().lower()
+    if project_status in RETRY_BLOCKED_PROJECT_STATUSES | {"done"}:
+        raise RoadmapPackError(
+            f"Target project {project_id!r} is {project_status!r}; activate it before queueing."
+        )
+
+    raw_goal = manifest.get("goal")
+    if not isinstance(raw_goal, Mapping):
+        raise RoadmapPackError("Roadmap pack goal must be an object.")
+    unknown_goal = set(raw_goal) - _ROADMAP_PACK_GOAL_FIELDS
+    if unknown_goal:
+        raise RoadmapPackError(
+            f"Roadmap pack goal contains unsupported fields: {', '.join(sorted(unknown_goal))}."
+        )
+    goal_id = _pack_text(raw_goal.get("id"), "goal.id", maximum=120)
+    if not _ROADMAP_RECORD_ID_RE.fullmatch(goal_id):
+        raise RoadmapPackError("Roadmap pack goal.id has an invalid format.")
+    goal_title = _pack_text(raw_goal.get("title"), "goal.title", maximum=240)
+    goal_description = _pack_text(
+        raw_goal.get("description"), "goal.description", maximum=4000
+    )
+    goal_status = str(raw_goal.get("status") or "active").strip().lower()
+    if goal_status != "active":
+        raise RoadmapPackError("A newly queued roadmap-pack goal must have status 'active'.")
+    clean_goal_record = {
+        "id": goal_id,
+        "title": goal_title,
+        "description": goal_description,
+        "status": "active",
+    }
+
+    raw_items = manifest.get("roadmap_items")
+    if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= ROADMAP_PACK_MAX_ITEMS:
+        raise RoadmapPackError(
+            f"Roadmap pack roadmap_items must contain 1 to {ROADMAP_PACK_MAX_ITEMS} items."
+        )
+    clean_items: list[dict[str, Any]] = []
+    item_ids: list[str] = []
+    authorization_levels: set[str] = set()
+    for index, raw_item in enumerate(raw_items):
+        prefix = f"roadmap_items[{index}]"
+        if not isinstance(raw_item, Mapping):
+            raise RoadmapPackError(f"Roadmap pack {prefix} must be an object.")
+        unknown_item = set(raw_item) - _ROADMAP_PACK_ITEM_FIELDS
+        if unknown_item:
+            raise RoadmapPackError(
+                f"Roadmap pack {prefix} contains unsupported fields: "
+                f"{', '.join(sorted(unknown_item))}."
+            )
+        item_id = _pack_text(raw_item.get("id"), f"{prefix}.id", maximum=120)
+        if not _ROADMAP_RECORD_ID_RE.fullmatch(item_id):
+            raise RoadmapPackError(f"Roadmap pack item ID {item_id!r} has an invalid format.")
+        item_goal_id = _pack_text(
+            raw_item.get("goal_id"), f"{prefix}.goal_id", maximum=120
+        )
+        if item_goal_id != goal_id:
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} must reference goal {goal_id!r}."
+            )
+        status = str(raw_item.get("status") or "").strip().lower()
+        if status != "ready":
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} must begin with status 'ready'."
+            )
+        authorization = str(raw_item.get("authorization_level") or "").strip().lower()
+        if authorization not in {
+            AuthorizationLevel.OBSERVE.value,
+            AuthorizationLevel.PROPOSE.value,
+        }:
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} exceeds the observe/propose authorization limit."
+            )
+        if raw_item.get("blockers") != []:
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} must not begin with blockers."
+            )
+        if raw_item.get("previous_attempts") != [] or raw_item.get("previous_models") != []:
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} must not contain prior execution history."
+            )
+        if raw_item.get("human_decision_required") is not False or str(
+            raw_item.get("human_action") or ""
+        ).strip():
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} must not begin with an owner blocker."
+            )
+        dependencies = _pack_string_list(
+            raw_item.get("dependencies"), f"{prefix}.dependencies", maximum_items=25, maximum_chars=120
+        )
+        criteria = _pack_string_list(
+            raw_item.get("acceptance_criteria"),
+            f"{prefix}.acceptance_criteria",
+            require_values=True,
+            maximum_items=12,
+            maximum_chars=2000,
+        )
+        capabilities = _pack_string_list(
+            raw_item.get("required_capabilities"),
+            f"{prefix}.required_capabilities",
+            require_values=True,
+            maximum_items=20,
+            maximum_chars=80,
+        )
+        for token_field, default in (
+            ("estimated_input_tokens", None),
+            ("estimated_cached_input_tokens", 0),
+            ("estimated_output_tokens", None),
+        ):
+            raw_value = raw_item.get(token_field, default)
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, int)
+                or raw_value < (0 if token_field == "estimated_cached_input_tokens" else 1)
+                or raw_value > 250000
+            ):
+                raise RoadmapPackError(
+                    f"Roadmap pack item {item_id!r} has an invalid {token_field}."
+                )
+        priority = raw_item.get("priority")
+        if (
+            isinstance(priority, bool)
+            or not isinstance(priority, (int, float))
+            or not math.isfinite(float(priority))
+        ):
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} has an invalid priority."
+            )
+        estimated_cost = raw_item.get("estimated_ai_cost_usd", 0.0)
+        if (
+            isinstance(estimated_cost, bool)
+            or not isinstance(estimated_cost, (int, float))
+            or not math.isfinite(float(estimated_cost))
+            or float(estimated_cost) < 0
+        ):
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} has an invalid estimated_ai_cost_usd."
+            )
+        requires_evidence = raw_item.get("requires_recent_run_evidence", False)
+        if not isinstance(requires_evidence, bool):
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} has a non-boolean requires_recent_run_evidence."
+            )
+        complexity = str(raw_item.get("complexity") or "").strip().lower()
+        if complexity not in {"lightweight", "standard", "advanced"}:
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} has an unsupported complexity."
+            )
+        risk = str(raw_item.get("risk") or "").strip().lower()
+        if risk not in {"low", "medium", "high", "critical"}:
+            raise RoadmapPackError(
+                f"Roadmap pack item {item_id!r} has an unsupported risk."
+            )
+        clean_item = {
+            "id": item_id,
+            "goal_id": item_goal_id,
+            "title": _pack_text(raw_item.get("title"), f"{prefix}.title", maximum=240),
+            "description": _pack_text(
+                raw_item.get("description"), f"{prefix}.description", maximum=4000
+            ),
+            "priority": priority,
+            "status": status,
+            "dependencies": dependencies,
+            "blockers": [],
+            "acceptance_criteria": criteria,
+            "agent_owner": _pack_text(
+                raw_item.get("agent_owner"), f"{prefix}.agent_owner", maximum=80
+            ),
+            "task_type": _pack_text(
+                raw_item.get("task_type"), f"{prefix}.task_type", maximum=80
+            ),
+            "complexity": complexity,
+            "risk": risk,
+            "required_capabilities": capabilities,
+            "authorization_level": authorization,
+            "estimated_input_tokens": int(raw_item["estimated_input_tokens"]),
+            "estimated_cached_input_tokens": int(
+                raw_item.get("estimated_cached_input_tokens", 0)
+            ),
+            "estimated_output_tokens": int(raw_item["estimated_output_tokens"]),
+            "estimated_ai_cost_usd": _money(estimated_cost),
+            "previous_attempts": [],
+            "previous_models": [],
+            "human_resolution_history": [],
+            "human_decision_required": False,
+            "human_action": "",
+            "requires_recent_run_evidence": requires_evidence,
+        }
+        clean_items.append(clean_item)
+        item_ids.append(item_id)
+        authorization_levels.add(authorization)
+
+    if len(item_ids) != len(set(item_ids)):
+        raise RoadmapPackError("Roadmap pack roadmap item IDs must be unique.")
+    existing_item_counts: dict[str, int] = {}
+    for candidate_project in state.get("projects", []) or []:
+        if not isinstance(candidate_project, Mapping):
+            continue
+        for existing_item in candidate_project.get("roadmap_items", []) or []:
+            if not isinstance(existing_item, Mapping):
+                continue
+            existing_id = str(existing_item.get("id") or "").strip()
+            if existing_id:
+                existing_item_counts[existing_id] = existing_item_counts.get(existing_id, 0) + 1
+
+    receipts = [
+        receipt
+        for receipt in state.get("roadmap_pack_history", []) or []
+        if isinstance(receipt, Mapping)
+        and str(receipt.get("manifest_id") or "").strip() == manifest_id
+    ]
+    source_records_exist = any(
+        str(goal.get("source_manifest_id") or "").strip() == manifest_id
+        for candidate_project in state.get("projects", []) or []
+        if isinstance(candidate_project, Mapping)
+        for goal in candidate_project.get("goals", []) or []
+        if isinstance(goal, Mapping)
+    ) or any(
+        str(existing_item.get("source_manifest_id") or "").strip() == manifest_id
+        for candidate_project in state.get("projects", []) or []
+        if isinstance(candidate_project, Mapping)
+        for existing_item in candidate_project.get("roadmap_items", []) or []
+        if isinstance(existing_item, Mapping)
+    )
+    if source_records_exist and not receipts:
+        raise RoadmapPackError(
+            f"Roadmap pack {manifest_id!r} has imported records but no persisted receipt; "
+            "no state was changed."
+        )
+    preview = {
+        "manifest_id": manifest_id,
+        "manifest_revision": revision,
+        "project_id": project_id,
+        "project_name": str(project.get("name") or project_id),
+        "goal_id": goal_id,
+        "goal_title": goal_title,
+        "item_count": len(clean_items),
+        "roadmap_item_ids": item_ids,
+        "authorization_levels": sorted(authorization_levels),
+        "already_queued": False,
+    }
+    if receipts:
+        if len(receipts) != 1 or not _roadmap_pack_records_are_intact(
+            state,
+            receipts[0],
+            manifest_id=manifest_id,
+            revision=revision,
+            project_id=project_id,
+            goal_record=clean_goal_record,
+            item_records=clean_items,
+        ):
+            raise RoadmapPackError(
+                f"Roadmap pack {manifest_id!r} conflicts with its persisted receipt or "
+                "queued records; no state was changed."
+            )
+        preview["already_queued"] = True
+        return deepcopy(dict(state)), redact_secrets(preview), True
+
+    if any(existing_item_counts.get(item_id, 0) for item_id in item_ids):
+        collisions = [item_id for item_id in item_ids if existing_item_counts.get(item_id, 0)]
+        raise RoadmapPackError(
+            f"Roadmap item IDs already exist: {', '.join(collisions)}; no state was changed."
+        )
+    existing_goals = [
+        goal
+        for goal in project.get("goals", []) or []
+        if isinstance(goal, Mapping)
+        and str(goal.get("id") or "").strip() == goal_id
+    ]
+    if existing_goals:
+        raise RoadmapPackError(
+            f"Goal ID {goal_id!r} already exists in project {project_id!r}; no state was changed."
+        )
+    known_item_ids = set(existing_item_counts) | set(item_ids)
+    for clean_item in clean_items:
+        for dependency in clean_item["dependencies"]:
+            if dependency == clean_item["id"]:
+                raise RoadmapPackError(
+                    f"Roadmap item {clean_item['id']!r} cannot depend on itself."
+                )
+            if dependency not in known_item_ids:
+                raise RoadmapPackError(
+                    f"Roadmap item {clean_item['id']!r} references missing dependency "
+                    f"{dependency!r}."
+                )
+            if existing_item_counts.get(dependency, 0) > 1:
+                raise RoadmapPackError(
+                    f"Roadmap dependency {dependency!r} is ambiguous in persistent state."
+                )
+    dependency_graph: dict[str, list[str]] = {}
+    for candidate_project in state.get("projects", []) or []:
+        if not isinstance(candidate_project, Mapping):
+            continue
+        for existing_item in candidate_project.get("roadmap_items", []) or []:
+            if not isinstance(existing_item, Mapping):
+                continue
+            existing_id = str(existing_item.get("id") or "").strip()
+            if existing_id and existing_item_counts.get(existing_id) == 1:
+                dependency_graph[existing_id] = _dependency_ids(existing_item)
+    for clean_item in clean_items:
+        dependency_graph[clean_item["id"]] = list(clean_item["dependencies"])
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(item_id: str) -> None:
+        if item_id in visiting:
+            raise RoadmapPackError("Roadmap pack dependencies contain a cycle.")
+        if item_id in visited:
+            return
+        visiting.add(item_id)
+        for dependency in dependency_graph.get(item_id, []):
+            if existing_item_counts.get(dependency, 0) > 1:
+                raise RoadmapPackError(
+                    f"Roadmap dependency {dependency!r} is ambiguous in persistent state."
+                )
+            if dependency in dependency_graph:
+                visit(dependency)
+        visiting.remove(item_id)
+        visited.add(item_id)
+
+    for item_id in item_ids:
+        visit(item_id)
+
+    candidate = deepcopy(dict(state))
+    candidate_projects = [
+        candidate_project
+        for candidate_project in candidate.get("projects", []) or []
+        if str(candidate_project.get("id") or "").strip() == project_id
+    ]
+    if len(candidate_projects) != 1:
+        raise RoadmapPackError("Target project changed during roadmap-pack preparation.")
+    candidate_project = candidate_projects[0]
+    timestamp = _aware_utc(queued_at).isoformat()
+    source = _redact_text(str(approval_source or "owner_confirmation")).strip()[:200]
+    goal_record_hash = _roadmap_pack_record_hash(
+        _roadmap_pack_record_projection(
+            clean_goal_record, _ROADMAP_PACK_GOAL_HASH_FIELDS
+        )
+    )
+    item_record_hashes = {
+        clean_item["id"]: _roadmap_pack_record_hash(
+            _roadmap_pack_record_projection(
+                clean_item, _ROADMAP_PACK_ITEM_HASH_FIELDS
+            )
+        )
+        for clean_item in clean_items
+    }
+    clean_goal = {
+        **clean_goal_record,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "queued_at": timestamp,
+        "approval_source": source,
+        "source_manifest_id": manifest_id,
+        "source_manifest_revision": revision,
+        "source_manifest_record_hash": goal_record_hash,
+    }
+    for clean_item in clean_items:
+        clean_item.update({
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "queued_at": timestamp,
+            "approval_source": source,
+            "source_manifest_id": manifest_id,
+            "source_manifest_revision": revision,
+            "source_manifest_record_hash": item_record_hashes[clean_item["id"]],
+        })
+    candidate_project.setdefault("goals", []).append(clean_goal)
+    candidate_project.setdefault("roadmap_items", []).extend(clean_items)
+    receipt = {
+        "manifest_id": manifest_id,
+        "manifest_revision": revision,
+        "project_id": project_id,
+        "goal_id": goal_id,
+        "roadmap_item_ids": item_ids,
+        "goal_record_hash": goal_record_hash,
+        "roadmap_item_hashes": item_record_hashes,
+        "queued_at": timestamp,
+        "approval_source": source,
+    }
+    if backup_filename:
+        receipt["backup_filename"] = str(backup_filename)
+    candidate.setdefault("roadmap_pack_history", []).append(receipt)
+    return _normalize_state(candidate), redact_secrets(preview), False
+
+
 class AutonomyStateStore:
     """File-locked, atomic, versioned JSON state store."""
 
@@ -791,6 +1533,70 @@ class AutonomyStateStore:
                     self.path, pending_recovery, self.recovery_path
                 )
             _atomic_write_json(self.path, normalized)
+
+    def _inspect_roadmap_pack(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        revision: str,
+        inspected_at: datetime,
+    ) -> dict[str, Any]:
+        """Build a deterministic, read-only preview while holding the state lock."""
+
+        with self.lock:
+            state = self._load_unlocked()
+            _, preview, _ = _prepare_roadmap_pack(
+                state,
+                manifest,
+                revision,
+                queued_at=inspected_at,
+                approval_source="preview_only",
+            )
+            return preview
+
+    def _queue_roadmap_pack(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        revision: str,
+        expected_revision: str,
+        queued_at: datetime,
+        approval_source: str,
+    ) -> tuple[dict[str, Any], bool, Optional[Path]]:
+        """Atomically append a revalidated pack and preserve an on-volume backup."""
+
+        if not expected_revision or revision != str(expected_revision):
+            raise RoadmapPackError(
+                "The roadmap pack changed after approval was staged; preview and approve it again."
+            )
+        with self.lock:
+            state = self._load_unlocked()
+            # First determine idempotency without creating an unnecessary backup.
+            _, preview, already_queued = _prepare_roadmap_pack(
+                state,
+                manifest,
+                revision,
+                queued_at=queued_at,
+                approval_source=approval_source,
+            )
+            if already_queued:
+                return preview, True, None
+            manifest_id = str(manifest.get("manifest_id") or "roadmap-pack")
+            timestamp = _aware_utc(queued_at).strftime("%Y%m%dT%H%M%S%fZ")
+            backup_path = self.path.with_name(
+                f"{self.path.name}.before-{manifest_id}-{timestamp}-{uuid.uuid4().hex[:8]}.json"
+            )
+            candidate, preview, _ = _prepare_roadmap_pack(
+                state,
+                manifest,
+                revision,
+                queued_at=queued_at,
+                approval_source=approval_source,
+                backup_filename=backup_path.name,
+            )
+            _atomic_write_json(backup_path, state)
+            _atomic_write_json(self.path, candidate)
+            return preview, False, backup_path
 
     def _inspect_idea_promotion(
         self,
@@ -1374,6 +2180,12 @@ class AutonomousWorkflow:
         self.base_dir = Path(state_path).parent if state_path is not None else Path(self.config.data_dir)
         self.state_path = Path(state_path) if state_path is not None else self.base_dir / "autonomy_state.json"
         self.seed_path = Path(seed_path) if seed_path is not None else Path(self.config.roadmap_seed_path)
+        configured_pack_dir = Path(self.config.roadmap_pack_dir)
+        self.roadmap_pack_dir = (
+            configured_pack_dir
+            if configured_pack_dir.is_absolute()
+            else BASE_DIR / configured_pack_dir
+        )
         self.report_dir = self.base_dir / "autonomous_runs"
         self.run_lock_path = self.base_dir / "autonomy_run.lock"
         self.store = AutonomyStateStore(self.state_path, self.seed_path)
@@ -1548,6 +2360,81 @@ class AutonomousWorkflow:
                 "summary_line": summary_line,
             })
         return evidence
+
+    def preview_roadmap_pack(
+        self,
+        manifest_id: str,
+    ) -> tuple[bool, dict[str, Any] | str]:
+        """Preview one repository-owned roadmap pack without changing state."""
+
+        run_lock = FileLock(
+            str(self.run_lock_path), timeout=self.config.lock_timeout_seconds
+        )
+        try:
+            with run_lock:
+                manifest, revision = _load_roadmap_pack(
+                    self.roadmap_pack_dir, manifest_id
+                )
+                preview = self.store._inspect_roadmap_pack(
+                    manifest,
+                    revision=revision,
+                    inspected_at=self._now(),
+                )
+        except FileLockTimeout:
+            return False, _redact_text(
+                "The roadmap pack was not staged because another autonomous run holds "
+                "the persistent run lock."
+            )
+        except RoadmapPackError as exc:
+            return False, _redact_text(str(exc))
+        return True, preview
+
+    def queue_roadmap_pack(
+        self,
+        manifest_id: str,
+        *,
+        expected_revision: str,
+        approval_source: str = "telegram_owner_confirmation",
+    ) -> tuple[bool, str]:
+        """Atomically append one owner-approved pack without invoking a model."""
+
+        run_lock = FileLock(
+            str(self.run_lock_path), timeout=self.config.lock_timeout_seconds
+        )
+        try:
+            with run_lock:
+                # Reload inside the run lock so confirmation is bound to the reviewed
+                # file revision and cannot race an autonomous task claim.
+                manifest, revision = _load_roadmap_pack(
+                    self.roadmap_pack_dir, manifest_id
+                )
+                preview, already_queued, backup_path = self.store._queue_roadmap_pack(
+                    manifest,
+                    revision=revision,
+                    expected_revision=expected_revision,
+                    queued_at=self._now(),
+                    approval_source=approval_source,
+                )
+        except FileLockTimeout:
+            return False, _redact_text(
+                "The roadmap pack was not queued because another autonomous run holds "
+                "the persistent run lock. The approval can be retried after it finishes."
+            )
+        except RoadmapPackError as exc:
+            return False, _redact_text(str(exc))
+        if already_queued:
+            return True, _redact_text(
+                f"Roadmap pack {preview['manifest_id']!r} was already queued with all "
+                f"{preview['item_count']} records intact; no duplicate was created."
+            )
+        backup_note = f" Backup: {backup_path.name}." if backup_path else ""
+        return True, _redact_text(
+            f"Queued roadmap pack {preview['manifest_id']!r}: goal "
+            f"{preview['goal_id']!r} and {preview['item_count']} ready items in project "
+            f"{preview['project_id']!r}.{backup_note} No model was invoked and no "
+            "autonomous run was started. Run /autorun dry-run to inspect selection "
+            "before /autorun live."
+        )
 
     def preview_idea_promotion(
         self,

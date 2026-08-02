@@ -595,6 +595,40 @@ run, ambiguous destination, or persistence failure stops without creating duplic
 work. After confirmation, use `/autorun dry-run` to inspect selection before starting
 live work.
 
+To queue a reviewed multi-item project into an existing persistent Railway state, place
+its versioned JSON manifest in `config/autonomous-projects/`, deploy it, and stage it from
+the **group operating room**:
+
+```text
+/autorun queue assistant-production-readiness-202608
+```
+
+Miles previews the manifest revision, target project and goal, all roadmap IDs, item
+count, and authorization levels. The preview does not invoke a model, change state, or
+start work. Reply `/confirm` in the same group to append the goal/items atomically, or
+`/cancel` to leave state unchanged. Confirmation is bound to the owner who staged it and
+to the exact reviewed file revision. The importer rejects ID collisions, missing or cyclic
+dependencies, active-run races, unsupported fields, and any authorization above
+`propose`; it preserves existing projects, attempts, ideas, run history, and budget data,
+writes a pre-import backup beside `autonomy_state.json`, and records an idempotency
+receipt. Repeating the same confirmed pack creates no duplicate work.
+
+Operators may perform the same no-model preview or explicit apply from the deployed
+service shell:
+
+```powershell
+python scripts/queue_autonomy_roadmap.py assistant-production-readiness-202608
+python scripts/queue_autonomy_roadmap.py assistant-production-readiness-202608 --apply --approval-source owner_approved
+```
+
+The included production-readiness pack adds seven read-only, source-backed tasks for the
+assistant project. Under the checked-in pricing snapshot and default reservation
+multiplier, its complete worker/reviewer units reserve about **$4.572** in total. That fits
+inside a fresh day's **$4.75 ordinary allowance** while preserving the $0.25 emergency
+reserve. Reservations are reconciled to reported usage, so actual provider spend may be
+lower and is never manufactured merely to reach $5. The pack produces reviewed audits and
+an owner runbook; current autonomy still does not modify or deploy code.
+
 When a run reaches `needs_human` or `blocked`, resolve the stated access problem or
 owner decision first. Then reset exactly that roadmap item from the **group operating
 room** without starting work or spending model budget:
@@ -662,6 +696,7 @@ Use these canonical environment variables (the complete copy-ready block is in
 | `AUTONOMY_LOCK_TIMEOUT_SECONDS` | `0`; an overlap is skipped immediately |
 | `AUTONOMY_DATA_DIR` | optional autonomy-only state override; normally leave blank and use `DATA_DIR` |
 | `AUTONOMY_ROADMAP_FILE` | `config/autonomous-roadmap.json`; first-use seed |
+| `AUTONOMY_PROJECT_PACK_DIR` | `config/autonomous-projects`; repository-owned manifests that require owner confirmation before additive import |
 | `MODEL_CATALOG_FILE` | `config/model-catalog.json`; routing/pricing snapshot |
 
 In the Telegram runtime, the persisted Company Mode ledger is the authoritative budget
@@ -702,6 +737,13 @@ criteria, agent owner, task type, complexity/risk, required capabilities, author
 estimates, previous attempts/models, and any human decision required. On first use it is
 copied into `autonomy_state.json`; after that, the persistent state is the source of truth
 and later seed-file edits are not automatically merged.
+
+Repository-owned roadmap packs solve that persistent-state boundary without reseeding or
+manually editing live JSON. [`config/autonomous-projects/assistant-production-readiness-202608.json`](config/autonomous-projects/assistant-production-readiness-202608.json)
+is the bounded example. A pack is inert until `/autorun queue <manifest-id>` plus
+same-owner `/confirm` (or the explicit shell `--apply` command) revalidates and atomically
+imports it under the run/state locks. Pack provenance and the pre-import backup filename
+are retained in `roadmap_pack_history`.
 
 Miles owns selection. If a roadmap item uses `agent_owner: "manager"`, the bounded worker
 task is delegated to Robin's general worker path so execution, Telegram identity, and cost
@@ -755,8 +797,9 @@ confirmations remain process-memory state; exact provider billing is unavailable
 response lacks usage and is then conservatively charged at the held estimate; the task
 time ceiling prevents another attempt but cannot preempt a Python thread, so the runner
 waits for it to finish and reconcile; modify-local automation awaits an isolated executor;
-owner resolution supports explicit `/autorun retry <item-id>` plus owner-confirmed idea
-promotion, but not skip, accept-as-is, acceptance-criteria editing, or automatic rescoping;
+owner resolution supports explicit `/autorun retry <item-id>`, owner-confirmed idea
+promotion, and owner-confirmed additive roadmap packs, but not skip, accept-as-is,
+acceptance-criteria editing, or automatic rescoping;
 model prices/availability are configuration snapshots; and live Telegram, OpenAI,
 Railway-volume, Docker, and external-connector behavior still require credentialed smoke
 tests.
