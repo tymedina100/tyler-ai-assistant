@@ -32,6 +32,9 @@ DEFAULT_ROADMAP_FILE = BASE_DIR / "config" / "autonomous-roadmap.json"
 STATE_VERSION = 1
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_RESULT_PREVIEW_CHARS = 360
+RECENT_RUN_EVIDENCE_LIMIT = 5
+RECENT_RUN_EVIDENCE_TEXT_CHARS = 180
+RECENT_RUN_REPORT_MAX_BYTES = 256 * 1024
 TERMINAL_TASK_STATUSES = {"complete", "completed", "done", "approved", "shipped"}
 ACTIONABLE_TASK_STATUSES = {"planned", "ready", "pending", "todo", "deferred", "retry"}
 RETRYABLE_HUMAN_STATUSES = {"blocked", "needs_human"}
@@ -672,16 +675,18 @@ def _build_idea_promotion(
         raise IdeaPromotionError(
             "The reviewed roadmap goal changed after approval was staged; review it again."
         )
+    acceptance_criteria = _promotion_acceptance_criteria(idea)
+    description = _promotion_description(idea)
     roadmap_item = {
         "id": roadmap_item_id,
         "goal_id": goal_id,
         "title": f"Validate idea: {title}",
-        "description": _promotion_description(idea),
+        "description": description,
         "priority": 50,
         "status": "ready",
         "dependencies": [],
         "blockers": [],
-        "acceptance_criteria": _promotion_acceptance_criteria(idea),
+        "acceptance_criteria": acceptance_criteria,
         "agent_owner": "manager",
         "task_type": "planning",
         "complexity": complexity,
@@ -696,6 +701,11 @@ def _build_idea_promotion(
         "human_resolution_history": [],
         "human_decision_required": False,
         "human_action": "",
+        "requires_recent_run_evidence": _requires_recent_run_evidence({
+            "title": title,
+            "description": description,
+            "acceptance_criteria": acceptance_criteria,
+        }),
         "source_idea_id": str(idea.get("id")),
         "source_idea_fingerprint": str(idea.get("fingerprint") or _idea_fingerprint(idea)),
         "source_run_id": str(idea.get("source_run_id") or ""),
@@ -807,6 +817,9 @@ class AutonomyStateStore:
                 "title": roadmap_item["title"],
                 "status": roadmap_item["status"],
                 "authorization_level": roadmap_item["authorization_level"],
+                "requires_recent_run_evidence": roadmap_item[
+                    "requires_recent_run_evidence"
+                ],
                 "acceptance_criteria": deepcopy(roadmap_item["acceptance_criteria"]),
                 "estimated_ai_cost_usd": roadmap_item["estimated_ai_cost_usd"],
                 "proposal_revision": _idea_promotion_revision(idea),
@@ -1027,6 +1040,42 @@ def _priority_value(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _requires_recent_run_evidence(item: Mapping[str, Any]) -> bool:
+    explicit = item.get("requires_recent_run_evidence")
+    if isinstance(explicit, bool):
+        return explicit
+    if isinstance(explicit, str):
+        explicit_text = explicit.strip().lower()
+        if explicit_text in {"true", "yes", "1"}:
+            return True
+        if explicit_text in {"false", "no", "0"}:
+            return False
+    searchable = " ".join(
+        [
+            str(item.get("title") or ""),
+            str(item.get("description") or ""),
+            *[
+                str(value)
+                for value in (item.get("acceptance_criteria", []) or [])
+                if value is not None
+            ],
+        ]
+    ).lower()
+    return bool(
+        re.search(
+            r"\b(?:last|most\s+recent|recent|prior|previous)\s+"
+            r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?"
+            r"(?:[a-z0-9]+(?:-[a-z0-9]+)?\s+){0,3}runs?\b",
+            searchable,
+        )
+        or re.search(
+            r"\b(?:autonomous\s+)?run\s+"
+            r"(?:history|reports?|records?|results?|summaries|evidence)\b",
+            searchable,
+        )
+    )
 
 
 def _select_project_and_item(
@@ -1316,6 +1365,169 @@ class AutonomousWorkflow:
 
     def load_state(self) -> dict[str, Any]:
         return self.store.load()
+
+    def _recent_run_evidence(
+        self,
+        state: Mapping[str, Any],
+        project_id: str,
+        limit: int = RECENT_RUN_EVIDENCE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Return bounded global run facts plus project-scoped task details.
+
+        Agents cannot read the control plane's state directory directly.  This
+        snapshot gives evidence-based roadmap tasks the operational facts they need
+        without exposing raw reports, arbitrary paths, secrets, private result text,
+        or other projects' task text. Missing/corrupt reports fall back to the
+        explicitly global thin recent-run index.
+        """
+
+        run_control = state.get("run_control", {}) or {}
+        indexed_runs = run_control.get("recent_runs", []) or []
+        if not isinstance(indexed_runs, list):
+            return []
+        bounded_limit = max(0, min(RECENT_RUN_EVIDENCE_LIMIT, int(limit or 0)))
+        if bounded_limit == 0:
+            return []
+
+        active_run = run_control.get("active_run") or {}
+        active_run_id = str(active_run.get("run_id") or "").strip()
+        valid_indexed_runs: list[Mapping[str, Any]] = []
+        for indexed in reversed(indexed_runs):
+            if not isinstance(indexed, Mapping):
+                continue
+            run_id = str(indexed.get("run_id") or "").strip()
+            if (
+                run_id == active_run_id
+                or not re.fullmatch(r"run_[A-Za-z0-9_-]{1,120}", run_id)
+            ):
+                continue
+            valid_indexed_runs.append(indexed)
+            if len(valid_indexed_runs) >= bounded_limit:
+                break
+
+        evidence: list[dict[str, Any]] = []
+        for indexed in reversed(valid_indexed_runs):
+            run_id = str(indexed.get("run_id") or "").strip()
+            report: Mapping[str, Any] = {}
+            report_available = False
+            try:
+                report_path = self.report_dir / f"{run_id}.json"
+                if report_path.is_symlink():
+                    raise OSError("Recent-run report symlinks are not accepted")
+                report_root = self.report_dir.resolve()
+                resolved_report = report_path.resolve(strict=True)
+                resolved_report.relative_to(report_root)
+                with resolved_report.open("rb") as stream:
+                    raw_report = stream.read(RECENT_RUN_REPORT_MAX_BYTES + 1)
+                if len(raw_report) > RECENT_RUN_REPORT_MAX_BYTES:
+                    raise ValueError("Recent-run report exceeds the evidence read limit")
+                loaded = json.loads(raw_report.decode("utf-8"))
+                if (
+                    isinstance(loaded, Mapping)
+                    and str(loaded.get("run_id") or "").strip() == run_id
+                    and bool(loaded.get("finish_time") or loaded.get("finished_at"))
+                    and bool(loaded.get("final_status"))
+                ):
+                    report = loaded
+                    report_available = True
+            except (OSError, ValueError, TypeError, RecursionError, RuntimeError):
+                report = {}
+
+            source = report if report_available else indexed
+
+            def bounded_text(value: Any, size: int = RECENT_RUN_EVIDENCE_TEXT_CHARS) -> str:
+                return _redact_text(str(value or "")).strip()[:size]
+
+            task_outcomes = []
+            raw_tasks = source.get("tasks_selected", []) or []
+            if isinstance(raw_tasks, list):
+                for raw_task in raw_tasks:
+                    if not isinstance(raw_task, Mapping):
+                        continue
+                    if str(raw_task.get("project_id") or "").strip() != project_id:
+                        continue
+                    task_outcomes.append({
+                        "id": bounded_text(raw_task.get("id"), 100),
+                        "title": bounded_text(raw_task.get("title")),
+                        "status": bounded_text(raw_task.get("status"), 40),
+                        "failure_classification": bounded_text(
+                            raw_task.get("failure_classification"), 40
+                        ),
+                    })
+                    if len(task_outcomes) >= 5:
+                        break
+
+            plans = [
+                outcome["title"]
+                for outcome in task_outcomes[:3]
+                if outcome.get("title")
+            ]
+
+            trigger = bounded_text(
+                source.get("trigger_source") or indexed.get("trigger_source"), 40
+            )
+            final_status = bounded_text(
+                source.get("final_status") or indexed.get("final_status"), 40
+            )
+            human_actions = source.get("human_actions", []) or []
+            escalations = source.get("escalations", []) or []
+            blockers = source.get("blockers", []) or []
+            deferred = source.get("deferred", []) or []
+            files_changed = source.get("files_changed", []) or []
+            project_needs_human = any(
+                outcome.get("status") in {"blocked", "needs_human"}
+                for outcome in task_outcomes
+            )
+            global_human_review_required = bool(
+                human_actions
+                or escalations
+                or final_status in {"blocked", "needs_human"}
+            )
+            planned_label = plans[0] if plans else "none for this project"
+            summary_line = bounded_text(
+                f"global trigger={trigger or 'unknown'}; "
+                f"global final={final_status or 'unknown'}; "
+                f"global human_review={'yes' if global_human_review_required else 'no'}; "
+                f"project planned={planned_label or 'none'}; "
+                f"project human_review={'yes' if project_needs_human else 'no'}",
+                320,
+            )
+            evidence.append({
+                "run_id": run_id,
+                "scope": "global_report" if report_available else "global_index",
+                "global_started_at": bounded_text(
+                    source.get("start_time")
+                    or source.get("started_at")
+                    or indexed.get("started_at"),
+                    60,
+                ),
+                "global_finished_at": bounded_text(
+                    source.get("finish_time")
+                    or source.get("finished_at")
+                    or indexed.get("finished_at"),
+                    60,
+                ),
+                "global_trigger_source": trigger,
+                "global_status": bounded_text(source.get("status"), 40),
+                "global_final_status": final_status,
+                "global_stop_reason": bounded_text(source.get("stop_reason"), 80),
+                "project_plans": plans,
+                "project_task_outcomes": task_outcomes,
+                "project_task_count": len(task_outcomes),
+                "project_human_review_required": project_needs_human,
+                "global_deferred_count": len(deferred) if isinstance(deferred, list) else 0,
+                "global_blocker_count": len(blockers) if isinstance(blockers, list) else 0,
+                "global_human_action_count": (
+                    len(human_actions) if isinstance(human_actions, list) else 0
+                ),
+                "global_files_changed_count": (
+                    len(files_changed) if isinstance(files_changed, list) else 0
+                ),
+                "global_human_review_required": global_human_review_required,
+                "report_available": report_available,
+                "summary_line": summary_line,
+            })
+        return evidence
 
     def preview_idea_promotion(
         self,
@@ -1847,10 +2059,22 @@ class AutonomousWorkflow:
             "model": _decision_field(decision, "model_id") or _decision_field(decision, "model"),
             "estimated_cost_usd": report["estimated_cost_usd"],
         }
+        execution_item = deepcopy(item)
+        recent_run_evidence = []
+        if _requires_recent_run_evidence(item):
+            recent_run_evidence = self._recent_run_evidence(
+                state,
+                str(project.get("id") or "").strip(),
+            )
+        if recent_run_evidence:
+            execution_item["recent_run_evidence"] = recent_run_evidence
+        context_run_ids = [entry["run_id"] for entry in recent_run_evidence]
+        attempt["context_run_ids"] = context_run_ids
+        report["tasks_selected"][0]["context_run_ids"] = context_run_ids
         try:
             if self.executor is None:
                 raise RuntimeError("No autonomous executor is configured")
-            raw_result = self.executor(project, item, decision, report["run_id"])
+            raw_result = self.executor(project, execution_item, decision, report["run_id"])
             if isinstance(raw_result, str):
                 result = {"status": "completed", "result": raw_result}
             elif isinstance(raw_result, Mapping):
@@ -1983,6 +2207,7 @@ class AutonomousWorkflow:
             terminal_failure = failure in {
                 "permission_denied",
                 "missing_access",
+                "missing_information",
                 "unavailable_tool",
                 "budget_exhausted",
                 "decision_required",
@@ -2368,6 +2593,10 @@ class AutonomousWorkflow:
             str(task.get("status") or "").lower() in TERMINAL_TASK_STATUSES
             for task in report.get("tasks_selected", [])
         )
+        needs_human = any(
+            str(task.get("status") or "").lower() in {"blocked", "needs_human"}
+            for task in report.get("tasks_selected", [])
+        )
         if report.get("dry_run"):
             status, final = "dry_run", "dry_run"
         elif stop_reason == "disabled":
@@ -2376,14 +2605,14 @@ class AutonomousWorkflow:
             status, final = "skipped", "overlap_prevented"
         elif stop_reason == "scheduled_date_already_claimed":
             status, final = "skipped", "idempotent_skip"
+        elif needs_human or report.get("human_actions"):
+            status, final = "blocked", "needs_human"
         elif completed:
             status, final = "completed", "completed"
         elif report.get("ideas_added"):
             status, final = "completed", "ideas_proposed"
         elif stop_reason in {"budget_floor", "budget_deferred"}:
             status, final = "deferred", "budget_deferred"
-        elif report.get("human_actions") or report.get("errors"):
-            status, final = "blocked", "needs_human"
         else:
             status, final = "completed", "idle"
         self._finish_report(report, status, final)
@@ -2422,6 +2651,7 @@ class AutonomousWorkflow:
         attempted_item_ids: set[str] = set()
         task_attempts = 0
         creative_attempted = False
+        blocked_task_seen = False
         started_monotonic = time.monotonic()
         stop_reason = "no_actionable_work"
 
@@ -2446,9 +2676,13 @@ class AutonomousWorkflow:
                 next_selected = _select_project_and_item(current_state, attempted_item_ids)
             except CorruptAutonomyStateError:
                 next_selected = None
-            if next_selected is None and creative_attempted:
-                stop_reason = "no_actionable_work"
-                break
+            if next_selected is None:
+                if blocked_task_seen:
+                    stop_reason = "needs_human"
+                    break
+                if creative_attempted:
+                    stop_reason = "no_actionable_work"
+                    break
 
             cycle = self._new_report(
                 report["trigger_source"] if not report["cycle_reports"] else "session_continuation",
@@ -2491,6 +2725,11 @@ class AutonomousWorkflow:
                     break
                 attempted_item_ids.add(item_id)
                 task_attempts += 1
+                if str(selected_tasks[0].get("status") or "").lower() in {
+                    "blocked",
+                    "needs_human",
+                }:
+                    blocked_task_seen = True
             else:
                 creative_attempted = True
                 if cycle.get("ideas_added"):

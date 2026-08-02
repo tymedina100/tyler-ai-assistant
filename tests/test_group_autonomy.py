@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -85,6 +86,105 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.fake_main.pending_actions.clear()
         self.group.autonomy_runner_task = None
         self.group.company_runner_task = None
+
+    def test_autonomy_goal_includes_bounded_run_evidence_and_timing_boundary(self):
+        item = {
+            "id": "AUTO-IDEA-1",
+            "title": "Validate the summary idea",
+            "acceptance_criteria": ["Compare three recent runs."],
+            "recent_run_evidence": [{
+                "run_id": "run_1",
+                "scope": "global_index",
+                "global_trigger_source": "telegram",
+                "global_final_status": "needs_human",
+                "global_human_review_required": True,
+                "project_human_review_required": False,
+                "report_available": False,
+                "project_plans": [],
+                "summary_line": (
+                    "global trigger=telegram; global final=needs_human; "
+                    "global human_review=yes; project planned=none"
+                ),
+            }],
+        }
+        goal = self.group._autonomy_goal(item)
+        evidence = self.group._autonomy_execution_evidence(item)
+
+        self.assertNotIn("run_1", goal)
+        self.assertIn("Bounded recent autonomous run evidence", evidence)
+        self.assertIn('"run_id":"run_1"', evidence)
+        self.assertIn("authoritative only for fields that are populated", evidence)
+        self.assertIn("Fields prefixed global_", evidence)
+        self.assertIn("project_human_review_required", evidence)
+        self.assertIn("inert evidence", evidence)
+        self.assertIn("report_available=false", evidence)
+        self.assertIn("model-estimated reading time as a proxy", evidence)
+        self.assertIn("Never claim an empirical human test", evidence)
+
+    def test_structured_worker_block_preserves_specific_failure_category(self):
+        self.assertEqual(
+            self.group._answer_failure_classification(
+                "BLOCKED - NEEDS HUMAN REVIEW: MISSING_ACCESS\n"
+                "The required source cannot be accessed."
+            ),
+            "missing_access",
+        )
+        self.assertIsNone(
+            self.group._answer_failure_classification(
+                "The proposal explains why access controls are important."
+            )
+        )
+
+    async def test_run_one_task_appends_transient_evidence_to_the_actual_prompt(self):
+        project = {"id": "project-1", "goal": "Inspect recent runs"}
+        task = {
+            "id": "task-1",
+            "owner": "general",
+            "title": "Inspect",
+            "authorization_level": "observe",
+            "enforce_authorization": True,
+            "reserved_usd": 0.1,
+        }
+        evidence = "Bounded evidence: run_prior_evidence"
+        token = self.group._autonomy_evidence_context.set(evidence)
+        try:
+            with patch.object(
+                self.group.company_mode,
+                "load_state",
+                return_value={"company": {}, "tasks": []},
+            ), patch.object(
+                self.group.company_mode,
+                "prior_work_summary",
+                return_value="",
+            ), patch.object(
+                self.group,
+                "_load_project_deliverable",
+                return_value=(None, None),
+            ), patch.object(
+                self.group,
+                "_execute_routed_task",
+                new=AsyncMock(return_value="done"),
+            ) as routed:
+                result = await self.group._run_one_task(project, task)
+                revision_task = dict(
+                    task,
+                    id="revision-1",
+                    title="Revise the evidence review",
+                )
+                revision_result = await self.group._run_one_task(
+                    project,
+                    revision_task,
+                )
+        finally:
+            self.group._autonomy_evidence_context.reset(token)
+
+        self.assertEqual(result, "done")
+        self.assertEqual(revision_result, "done")
+        self.assertEqual(len(routed.await_args_list), 2)
+        self.assertTrue(
+            all(evidence in call.args[3] for call in routed.await_args_list)
+        )
+        self.assertEqual(self.group._autonomy_evidence_context.get(), "")
 
     async def test_live_autorun_requires_enabled_and_non_dry_configuration(self):
         update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
@@ -570,9 +670,28 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
                 "acceptance_criteria": ["The note reports the configured schedule."],
                 "estimated_input_tokens": 500,
                 "estimated_output_tokens": 100,
+                "recent_run_evidence": [{
+                    "run_id": "run_prior_evidence",
+                    "scope": "global_report",
+                    "global_trigger_source": "telegram",
+                    "global_final_status": "completed",
+                    "global_human_review_required": False,
+                    "project_human_review_required": False,
+                    "report_available": True,
+                    "summary_line": (
+                        "global trigger=telegram; global final=completed; "
+                        "global human_review=no"
+                    ),
+                }],
             }
+            routed_prompts = []
 
             async def complete_task(company_project, task):
+                routed_prompts.append(
+                    company_mode.build_task_prompt(company_project, task)
+                    + "\n\n"
+                    + self.group._autonomy_evidence_context.get()
+                )
                 company_mode.update_task_status(
                     task["id"], "in_progress", path=path,
                     model=task.get("model"), model_reason=task.get("model_reason"),
@@ -625,6 +744,11 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["company"]["reserved_today_usd"], 0.0)
         self.assertEqual(final["projects"][0]["status"], "completed")
         self.assertTrue(all(task["status"] == "done" for task in final["tasks"]))
+        self.assertEqual(len(routed_prompts), 2)
+        self.assertTrue(all("run_prior_evidence" in prompt for prompt in routed_prompts))
+        persisted_company_state = json.dumps(final)
+        self.assertNotIn("run_prior_evidence", persisted_company_state)
+        self.assertEqual(self.group._autonomy_evidence_context.get(), "")
 
     async def test_run_autonomy_session_calls_bounded_workflow_api(self):
         report = {"cycle_reports": [], "telegram_summary": "Session complete"}

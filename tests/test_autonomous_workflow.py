@@ -455,6 +455,21 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertIn("under 30 seconds", preview["acceptance_criteria"][1])
         self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
 
+    def test_idea_promotion_persists_typed_recent_run_context_requirement(self):
+        workflow = self.workflow([])
+        state = workflow.load_state()
+        state["idea_backlog"] = [idea_record(
+            recommended_next_validation_step=(
+                "Compare the most recent Telegram-triggered runs."
+            ),
+        )]
+        workflow.store.save(state)
+
+        success, preview = workflow.preview_idea_promotion("idea-1")
+
+        self.assertTrue(success)
+        self.assertTrue(preview["requires_recent_run_evidence"])
+
     def test_idea_promotion_is_atomic_actionable_and_idempotent(self):
         workflow = self.workflow([])
         state = workflow.load_state()
@@ -735,6 +750,173 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(autonomy.format_telegram_deliverable(report), "")
         self.assertEqual(workflow.load_state()["projects"][0]["roadmap_items"][0]["status"], "ready")
 
+    def test_execution_receives_bounded_redacted_recent_run_evidence(self):
+        captured = {}
+
+        def execute(_project, selected, _decision, _run_id):
+            captured["item"] = selected
+            return {"status": "completed", "actual_cost_usd": 0.01}
+
+        workflow = self.workflow(
+            [item(acceptance_criteria=["Compare the last five runs."])],
+            executor=execute,
+        )
+        workflow.report_dir.mkdir(parents=True, exist_ok=True)
+        state = workflow.load_state()
+        recent = []
+        for index in range(6):
+            run_id = f"run_2026073{index}T120000_evidence{index}"
+            recent.append({
+                "run_id": run_id,
+                "started_at": f"2026-07-3{index}T12:00:00+00:00",
+                "finished_at": f"2026-07-3{index}T12:01:00+00:00",
+                "trigger_source": "telegram" if index % 2 else "scheduled",
+                "final_status": "needs_human" if index in {4, 5} else "completed",
+            })
+            report = {
+                "run_id": run_id,
+                "start_time": f"2026-07-3{index}T12:00:00+00:00",
+                "finish_time": f"2026-07-3{index}T12:01:00+00:00",
+                "trigger_source": "telegram" if index % 2 else "scheduled",
+                "status": "blocked" if index in {4, 5} else "completed",
+                "final_status": "needs_human" if index in {4, 5} else "completed",
+                "stop_reason": (
+                    "needs_human" if index in {4, 5} else "no_actionable_work"
+                ),
+                "daily_plan": [
+                    "OPENAI_API_KEY=do-not-leak" if index == 5 else f"Plan {index}"
+                ],
+                "tasks_selected": [
+                    {
+                        "project_id": "project-b",
+                        "id": f"private-task-{index}",
+                        "title": "Private Project B roadmap title",
+                        "status": "needs_human" if index == 4 else "completed",
+                        "failure_classification": (
+                            "missing_access" if index == 4 else ""
+                        ),
+                    },
+                    {
+                        "project_id": "project-a",
+                        "id": f"task-{index}",
+                        "title": (
+                            "OPENAI_API_KEY=do-not-leak"
+                            if index == 5
+                            else f"Task {index}"
+                        ),
+                        "status": "needs_human" if index == 5 else "completed",
+                        "failure_classification": "missing_access" if index == 5 else "",
+                    },
+                ],
+                "blockers": ["blocked"] if index in {4, 5} else [],
+                "human_actions": ["owner action"] if index in {4, 5} else [],
+                "escalations": ["escalated"] if index in {4, 5} else [],
+                "deferred": [],
+                "files_changed": [],
+                "private_result": "must never be copied",
+            }
+            if index == 1:
+                report["run_id"] = "run_mismatched_identity"
+            report_path = workflow.report_dir / f"{run_id}.json"
+            if index == 2:
+                report_path.write_text("{ malformed", encoding="utf-8")
+            elif index == 3:
+                report["padding"] = "x" * autonomy.RECENT_RUN_REPORT_MAX_BYTES
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+            else:
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+        # A malformed/path-like identifier is ignored rather than used as a filename.
+        recent.append({"run_id": "run_../../outside", "final_status": "completed"})
+        state["run_control"]["recent_runs"] = recent
+        workflow.store.save(state)
+
+        report = workflow.run(dry_run=False)
+
+        evidence = captured["item"]["recent_run_evidence"]
+        self.assertLessEqual(len(evidence), autonomy.RECENT_RUN_EVIDENCE_LIMIT)
+        self.assertEqual([entry["run_id"] for entry in evidence], [
+            "run_20260731T120000_evidence1",
+            "run_20260732T120000_evidence2",
+            "run_20260733T120000_evidence3",
+            "run_20260734T120000_evidence4",
+            "run_20260735T120000_evidence5",
+        ])
+        self.assertFalse(evidence[0]["report_available"])
+        self.assertFalse(evidence[1]["report_available"])
+        self.assertFalse(evidence[2]["report_available"])
+        self.assertTrue(evidence[-1]["global_human_review_required"])
+        self.assertTrue(evidence[-1]["project_human_review_required"])
+        self.assertTrue(evidence[3]["global_human_review_required"])
+        self.assertFalse(evidence[3]["project_human_review_required"])
+        self.assertIn("[REDACTED]", evidence[-1]["project_plans"][0])
+        self.assertNotIn("private_result", json.dumps(evidence))
+        self.assertNotIn("Private Project B", json.dumps(evidence))
+        self.assertNotIn("do-not-leak", json.dumps(evidence))
+        self.assertEqual(
+            report["tasks_selected"][0]["context_run_ids"],
+            [entry["run_id"] for entry in evidence],
+        )
+        persisted_item = workflow.load_state()["projects"][0]["roadmap_items"][0]
+        self.assertNotIn("recent_run_evidence", persisted_item)
+
+        state_with_active_duplicate = workflow.load_state()
+        state_with_active_duplicate["run_control"]["active_run"] = {
+            "run_id": "run_20260735T120000_evidence5"
+        }
+        active_filtered = workflow._recent_run_evidence(
+            state_with_active_duplicate,
+            "project-a",
+        )
+        self.assertNotIn(
+            "run_20260735T120000_evidence5",
+            [entry["run_id"] for entry in active_filtered],
+        )
+
+    def test_unrelated_task_does_not_receive_recent_run_context(self):
+        captured = {}
+
+        def execute(_project, selected, _decision, _run_id):
+            captured["item"] = selected
+            return {"status": "completed", "actual_cost_usd": 0.01}
+
+        workflow = self.workflow([item()], executor=execute)
+        workflow.run(dry_run=False)
+
+        self.assertNotIn("recent_run_evidence", captured["item"])
+
+    def test_recent_run_context_detection_supports_qualified_phrases_and_opt_out(self):
+        self.assertTrue(autonomy._requires_recent_run_evidence({
+            "acceptance_criteria": ["Inspect the last 5 Telegram-triggered runs."],
+        }))
+        self.assertTrue(autonomy._requires_recent_run_evidence({
+            "description": "Compare the most recent Telegram runs.",
+        }))
+        self.assertFalse(autonomy._requires_recent_run_evidence({
+            "requires_recent_run_evidence": "false",
+            "acceptance_criteria": ["Inspect the last five runs."],
+        }))
+
+    def test_missing_information_is_terminal_without_an_execution_retry(self):
+        workflow = self.workflow(
+            [item()],
+            executor=lambda *_args: {
+                "status": "failed",
+                "failure_classification": "missing_information",
+                "reason": "The owner must provide the required decision.",
+                "human_action": "Provide the required decision.",
+                "actual_cost_usd": 0.01,
+            },
+        )
+
+        report = workflow.run(dry_run=False)
+
+        self.assertEqual(report["final_status"], "needs_human")
+        self.assertEqual(report["tasks_selected"][0]["status"], "needs_human")
+        self.assertEqual(
+            report["tasks_selected"][0]["failure_classification"],
+            "missing_information",
+        )
+
     def test_creative_agent_runs_only_when_no_actionable_work_exists(self):
         ideas = Mock(
             return_value=[
@@ -759,6 +941,42 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(len(state["idea_backlog"]), 1)
         self.assertEqual(state["idea_backlog"][0]["status"], "proposed")
         self.assertEqual(state["projects"][0]["roadmap_items"][0]["status"], "completed")
+
+    def test_nonfatal_idle_ideation_failure_does_not_request_owner_action(self):
+        def fail_ideas(_state, _limit):
+            raise RuntimeError("creative provider unavailable")
+
+        workflow = self.workflow(
+            [item(status="completed")],
+            idea_generator=fail_ideas,
+        )
+
+        report = workflow.run_session(dry_run=False)
+
+        self.assertEqual(report["final_status"], "idle")
+        self.assertEqual(report["human_actions"], [])
+        self.assertTrue(report["errors"])
+        self.assertIn("no roadmap work was affected", report["blockers"][0].lower())
+
+    def test_completed_roadmap_work_remains_complete_if_idle_ideation_fails(self):
+        def fail_ideas(_state, _limit):
+            raise RuntimeError("creative provider unavailable")
+
+        workflow = self.workflow(
+            [item()],
+            executor=lambda *_args: {
+                "status": "completed",
+                "actual_cost_usd": 0.01,
+            },
+            idea_generator=fail_ideas,
+        )
+
+        report = workflow.run_session(dry_run=False)
+
+        self.assertEqual(report["final_status"], "completed")
+        self.assertEqual(report["tasks_selected"][0]["status"], "completed")
+        self.assertEqual(report["human_actions"], [])
+        self.assertTrue(report["errors"])
 
     def test_creative_ideas_are_deduplicated_and_never_auto_built(self):
         executor = Mock()
@@ -1323,6 +1541,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
     def test_session_continues_after_needs_human_to_unrelated_work(self):
         calls = []
+        ideas = Mock(return_value=[{"idea": "Should not run after a blocker"}])
 
         def execute(_project, selected, _decision, _run_id):
             calls.append(selected["id"])
@@ -1338,16 +1557,19 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         workflow = self.workflow([
             item("blocked-high", priority=20), item("unrelated", priority=10)
-        ], executor=execute)
+        ], executor=execute, idea_generator=ideas)
 
         report = workflow.run_session(dry_run=False)
 
         self.assertEqual(calls, ["blocked-high", "unrelated"])
-        self.assertEqual(report["final_status"], "completed")
+        self.assertEqual(report["final_status"], "needs_human")
+        self.assertEqual(report["stop_reason"], "needs_human")
         self.assertEqual([task["status"] for task in report["tasks_selected"]], [
             "needs_human", "completed",
         ])
         self.assertIn("Grant repository access.", report["human_actions"])
+        ideas.assert_not_called()
+        self.assertEqual(report["ideas_added"], [])
 
     def test_session_attempts_budget_deferred_item_once_then_continues(self):
         routed_types = []
