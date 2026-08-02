@@ -1178,6 +1178,22 @@ def _money(value: Any) -> float:
         return 0.0
 
 
+def _summary_human_review_needed(report: Mapping[str, Any]) -> bool:
+    """Return whether the run summary should direct the owner's attention."""
+
+    final_status = str(report.get("final_status") or report.get("status") or "").lower()
+    if final_status in {"blocked", "needs_human"}:
+        return True
+    return bool(report.get("human_actions") or report.get("escalations"))
+
+
+def _summary_token(value: Any, default: str = "unknown") -> str:
+    """Render a bounded single-line token for the Telegram at-a-glance row."""
+
+    token = re.sub(r"[^a-z0-9_.-]+", "_", str(value or "").strip().lower()).strip("_")
+    return (token or default)[:40]
+
+
 def format_telegram_summary(report: Mapping[str, Any]) -> str:
     """Format the required end-of-run fields without another model call."""
 
@@ -1207,8 +1223,12 @@ def format_telegram_summary(report: Mapping[str, Any]) -> str:
     remaining = _money(budget.get("remaining_usd", max(0.0, limit - used)))
     estimate_label = " (estimated where exact usage was unavailable)" if report.get("cost_is_estimated") else ""
     report_label = "session" if report.get("session") else "run"
+    trigger = _summary_token(report.get("trigger_source"))
+    final_status = _summary_token(report.get("final_status") or report.get("status"))
+    human_review = "yes" if _summary_human_review_needed(report) else "no"
     lines = [
         f"Autonomous {report_label}: {report.get('final_status') or report.get('status') or 'unknown'}",
+        f"trigger={trigger} | final={final_status} | human_review={human_review}",
         f"Planned: {planned}",
         f"Completed: {completed_text}",
         f"Changed: {', '.join(map(str, changed)) if changed else 'None'}",

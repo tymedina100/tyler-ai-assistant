@@ -724,6 +724,11 @@ retries, blockers, escalations, changed files, tests, artifacts, and final statu
 [`docs/sample-autonomous-daily-run-report.json`](docs/sample-autonomous-daily-run-report.json)
 for an illustrative dry-run report with no secrets.
 
+Every Telegram run summary includes a deterministic at-a-glance row immediately below
+its existing heading, such as `trigger=telegram | final=dry_run | human_review=no`. This
+row uses persisted run fields, requires no additional model call, and marks human review
+`yes` only when the run has an owner action or escalation, or ends blocked/needs-human.
+
 If autonomy state is corrupt, the unreadable file is quarantined and
 `autonomy_state.json.recovery-required` keeps every later run blocked. Inspect the
 quarantined file, restore a verified `autonomy_state.json`, remove the recovery marker,
