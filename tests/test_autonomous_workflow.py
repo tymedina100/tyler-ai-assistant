@@ -80,6 +80,49 @@ def idea_record(idea_id="idea-1", **overrides):
     return value
 
 
+def roadmap_pack(manifest_id="test-roadmap-pack", **overrides):
+    value = {
+        "schema_version": 1,
+        "manifest_id": manifest_id,
+        "summary": "Queue one bounded test initiative.",
+        "target_project_id": "project-a",
+        "goal": {
+            "id": "goal-pack",
+            "title": "Validate roadmap pack queueing",
+            "description": "Exercise the owner-approved additive queue path.",
+            "status": "active",
+        },
+        "roadmap_items": [
+            {
+                "id": "PACK-001",
+                "goal_id": "goal-pack",
+                "title": "Inspect the queue result",
+                "description": "Produce one read-only inspection result.",
+                "priority": 100,
+                "status": "ready",
+                "dependencies": [],
+                "blockers": [],
+                "acceptance_criteria": ["The inspection is source-backed."],
+                "agent_owner": "code",
+                "task_type": "review",
+                "complexity": "standard",
+                "risk": "medium",
+                "required_capabilities": ["text", "review"],
+                "authorization_level": "observe",
+                "estimated_input_tokens": 3000,
+                "estimated_output_tokens": 600,
+                "requires_recent_run_evidence": False,
+                "previous_attempts": [],
+                "previous_models": [],
+                "human_decision_required": False,
+                "human_action": "",
+            }
+        ],
+    }
+    value.update(overrides)
+    return value
+
+
 class FakeScheduler:
     def __init__(self):
         self.calls = []
@@ -96,11 +139,14 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.seed = self.root / "seed.json"
         self.state_path = self.root / "autonomy_state.json"
+        self.pack_dir = self.root / "packs"
+        self.pack_dir.mkdir()
         self.config = autonomy.AutonomyConfig(
             enabled=True,
             dry_run=True,
             data_dir=self.root,
             roadmap_seed_path=self.seed,
+            roadmap_pack_dir=self.pack_dir,
             max_authorization=autonomy.AuthorizationLevel.PROPOSE,
         )
 
@@ -133,17 +179,20 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(config.max_session_minutes, 120)
         self.assertEqual(config.min_task_reservation_usd, 0.05)
         self.assertEqual(config.max_authorization, autonomy.AuthorizationLevel.PROPOSE)
+        self.assertEqual(config.roadmap_pack_dir, autonomy.DEFAULT_ROADMAP_PACK_DIR)
 
     def test_session_limits_are_loaded_from_env_and_bounded(self):
         with patch.dict(os.environ, {
             "AUTONOMY_MAX_TASKS_PER_RUN": "12",
             "AUTONOMY_MAX_IDEAS_PER_RUN": "4",
             "AUTONOMY_MAX_SESSION_MINUTES": "90",
+            "AUTONOMY_PROJECT_PACK_DIR": "config/custom-autonomous-projects",
         }, clear=True):
             config = autonomy.AutonomyConfig.from_env()
         self.assertEqual(config.max_tasks_per_run, 12)
         self.assertEqual(config.max_ideas_per_run, 4)
         self.assertEqual(config.max_session_minutes, 90)
+        self.assertEqual(config.roadmap_pack_dir, Path("config/custom-autonomous-projects"))
 
         with patch.dict(os.environ, {
             "AUTONOMY_MAX_TASKS_PER_RUN": "51",
@@ -152,6 +201,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
             config = autonomy.AutonomyConfig.from_env()
         self.assertEqual(config.max_tasks_per_run, 10)
         self.assertEqual(config.max_session_minutes, 120)
+
+    def write_pack(self, value, manifest_id=None):
+        pack_id = manifest_id or value["manifest_id"]
+        path = self.pack_dir / f"{pack_id}.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
 
     def test_scheduler_registers_weekday_daily_callback(self):
         scheduler = FakeScheduler()
@@ -433,6 +488,248 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(
             workflow.load_state()["projects"][0]["roadmap_items"][0]["status"],
             "needs_human",
+        )
+
+    def test_roadmap_pack_preview_apply_and_idempotency_are_additive(self):
+        self.write_pack(roadmap_pack())
+        workflow = self.workflow([])
+        state = workflow.load_state()
+        state["idea_backlog"] = [idea_record()]
+        state["budget_tracking"].update(
+            date="2026-08-02",
+            actual_or_reconciled_cost_usd=1.25,
+            cost_is_estimated=False,
+        )
+        state["run_control"]["recent_runs"] = [{"run_id": "run-before-pack"}]
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+
+        success, preview = workflow.preview_roadmap_pack("test-roadmap-pack")
+
+        self.assertTrue(success)
+        self.assertFalse(preview["already_queued"])
+        self.assertEqual(preview["roadmap_item_ids"], ["PACK-001"])
+        self.assertEqual(preview["authorization_levels"], ["observe"])
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        success, message = workflow.queue_roadmap_pack(
+            "test-roadmap-pack",
+            expected_revision=preview["manifest_revision"],
+            approval_source="unit_test_owner",
+        )
+
+        self.assertTrue(success)
+        self.assertIn("No model was invoked", message)
+        persisted = workflow.load_state()
+        project = persisted["projects"][0]
+        self.assertEqual(len(project["goals"]), 2)
+        self.assertEqual(len(project["roadmap_items"]), 1)
+        self.assertEqual(project["roadmap_items"][0]["source_manifest_id"], "test-roadmap-pack")
+        self.assertEqual(persisted["idea_backlog"][0]["id"], "idea-1")
+        self.assertEqual(persisted["budget_tracking"]["actual_or_reconciled_cost_usd"], 1.25)
+        self.assertEqual(persisted["run_control"]["recent_runs"][0]["run_id"], "run-before-pack")
+        self.assertEqual(len(persisted["roadmap_pack_history"]), 1)
+        self.assertEqual(autonomy.select_actionable_item(persisted)["id"], "PACK-001")
+        backups = list(self.root.glob("autonomy_state.json.before-test-roadmap-pack-*.json"))
+        self.assertEqual(len(backups), 1)
+
+        again, again_message = workflow.queue_roadmap_pack(
+            "test-roadmap-pack",
+            expected_revision=preview["manifest_revision"],
+            approval_source="unit_test_owner",
+        )
+        self.assertTrue(again)
+        self.assertIn("already queued", again_message)
+        self.assertEqual(len(workflow.load_state()["projects"][0]["roadmap_items"]), 1)
+        self.assertEqual(
+            len(list(self.root.glob("autonomy_state.json.before-test-roadmap-pack-*.json"))),
+            1,
+        )
+
+        altered = workflow.load_state()
+        altered_item = altered["projects"][0]["roadmap_items"][0]
+        altered_item["acceptance_criteria"] = []
+        workflow.store.save(altered)
+        intact, mismatch = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertFalse(intact)
+        self.assertIn("conflicts with its persisted receipt", mismatch)
+
+        altered_item["acceptance_criteria"] = ["The inspection is source-backed."]
+        duplicate_project = json.loads(json.dumps(altered["projects"][0]))
+        duplicate_project["id"] = "project-duplicate"
+        duplicate_project["name"] = "Duplicate Project"
+        duplicate_project["goals"] = []
+        duplicate_project["roadmap_items"] = [json.loads(json.dumps(altered_item))]
+        altered["projects"].append(duplicate_project)
+        workflow.store.save(altered)
+        intact, mismatch = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertFalse(intact)
+        self.assertIn("conflicts with its persisted receipt", mismatch)
+
+    def test_roadmap_pack_revalidates_revision_and_rejects_unsafe_records(self):
+        pack = roadmap_pack()
+        pack_path = self.write_pack(pack)
+        workflow = self.workflow([])
+        workflow.load_state()
+        success, preview = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertTrue(success)
+
+        changed = roadmap_pack()
+        changed["roadmap_items"][0]["title"] = "Changed after owner review"
+        pack_path.write_text(json.dumps(changed), encoding="utf-8")
+        before = self.state_path.read_text(encoding="utf-8")
+        success, message = workflow.queue_roadmap_pack(
+            "test-roadmap-pack",
+            expected_revision=preview["manifest_revision"],
+            approval_source="unit_test_owner",
+        )
+        self.assertFalse(success)
+        self.assertIn("changed after approval", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        unsafe = roadmap_pack()
+        unsafe["roadmap_items"][0]["authorization_level"] = "external_action"
+        pack_path.write_text(json.dumps(unsafe), encoding="utf-8")
+        success, message = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertFalse(success)
+        self.assertIn("observe/propose", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        cyclic = roadmap_pack()
+        second = dict(cyclic["roadmap_items"][0])
+        second["id"] = "PACK-002"
+        second["title"] = "Inspect the second result"
+        cyclic["roadmap_items"][0]["dependencies"] = ["PACK-002"]
+        second["dependencies"] = ["PACK-001"]
+        cyclic["roadmap_items"].append(second)
+        pack_path.write_text(json.dumps(cyclic), encoding="utf-8")
+        success, message = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertFalse(success)
+        self.assertIn("contain a cycle", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        state = workflow.load_state()
+        state["projects"][0]["roadmap_items"] = [
+            item("OLD-ITEM", dependencies=["PACK-001"])
+        ]
+        workflow.store.save(state)
+        cross_cycle = roadmap_pack()
+        cross_cycle["roadmap_items"][0]["dependencies"] = ["OLD-ITEM"]
+        pack_path.write_text(json.dumps(cross_cycle), encoding="utf-8")
+        before_cycle_preview = self.state_path.read_text(encoding="utf-8")
+        success, message = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertFalse(success)
+        self.assertIn("contain a cycle", message)
+        self.assertEqual(
+            self.state_path.read_text(encoding="utf-8"), before_cycle_preview
+        )
+
+    def test_roadmap_pack_rejects_receiptless_manifest_reuse(self):
+        self.write_pack(roadmap_pack())
+        workflow = self.workflow([])
+        success, preview = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertTrue(success)
+        success, _ = workflow.queue_roadmap_pack(
+            "test-roadmap-pack",
+            expected_revision=preview["manifest_revision"],
+            approval_source="unit_test_owner",
+        )
+        self.assertTrue(success)
+        state = workflow.load_state()
+        state["roadmap_pack_history"][0]["roadmap_item_hashes"] = [1]
+        workflow.store.save(state)
+        success, message = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertFalse(success)
+        self.assertIn("conflicts with its persisted receipt", message)
+
+        state = workflow.load_state()
+        state["roadmap_pack_history"] = []
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+
+        success, message = workflow.preview_roadmap_pack("test-roadmap-pack")
+
+        self.assertFalse(success)
+        self.assertIn("imported records but no persisted receipt", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+    def test_roadmap_pack_respects_active_claim_and_run_lock(self):
+        self.write_pack(roadmap_pack())
+        workflow = self.workflow([])
+        state = workflow.load_state()
+        state["run_control"]["active_run"] = {"run_id": "run-active-pack"}
+        workflow.store.save(state)
+        success, message = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertFalse(success)
+        self.assertIn("run-active-pack", message)
+
+        state["run_control"]["active_run"] = None
+        workflow.store.save(state)
+        held = FileLock(str(workflow.run_lock_path))
+        held.acquire()
+        try:
+            success, message = workflow.preview_roadmap_pack("test-roadmap-pack")
+        finally:
+            held.release()
+        self.assertFalse(success)
+        self.assertIn("persistent run lock", message)
+
+    def test_roadmap_pack_primary_write_failure_preserves_state_and_backup(self):
+        self.write_pack(roadmap_pack())
+        workflow = self.workflow([])
+        workflow.load_state()
+        success, preview = workflow.preview_roadmap_pack("test-roadmap-pack")
+        self.assertTrue(success)
+        before = self.state_path.read_text(encoding="utf-8")
+        real_atomic_write = autonomy._atomic_write_json
+
+        def fail_primary(path, value):
+            if Path(path) == self.state_path:
+                raise OSError("simulated primary write failure")
+            return real_atomic_write(path, value)
+
+        with patch.object(autonomy, "_atomic_write_json", side_effect=fail_primary):
+            with self.assertRaises(OSError):
+                workflow.queue_roadmap_pack(
+                    "test-roadmap-pack",
+                    expected_revision=preview["manifest_revision"],
+                    approval_source="unit_test_owner",
+                )
+
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+        backups = list(self.root.glob("autonomy_state.json.before-test-roadmap-pack-*.json"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(
+            json.loads(backups[0].read_text(encoding="utf-8")),
+            json.loads(before),
+        )
+
+    def test_production_readiness_pack_is_valid_and_selects_highest_priority_item(self):
+        source_pack_dir = Path(__file__).resolve().parents[1] / "config" / "autonomous-projects"
+        state = roadmap_state([])
+        state["projects"][0].update(id="assistant", name="Tyler AI Assistant")
+        self.seed.write_text(json.dumps(state), encoding="utf-8")
+        workflow = autonomy.AutonomousWorkflow(
+            replace(self.config, roadmap_pack_dir=source_pack_dir),
+            state_path=self.state_path,
+            seed_path=self.seed,
+        )
+
+        success, preview = workflow.preview_roadmap_pack(
+            "assistant-production-readiness-202608"
+        )
+        self.assertTrue(success)
+        self.assertEqual(preview["item_count"], 7)
+        self.assertEqual(preview["authorization_levels"], ["observe"])
+        success, _ = workflow.queue_roadmap_pack(
+            "assistant-production-readiness-202608",
+            expected_revision=preview["manifest_revision"],
+            approval_source="unit_test_owner",
+        )
+        self.assertTrue(success)
+        self.assertEqual(
+            workflow.select_actionable_item()["id"],
+            "AUTO-PROD-202608-001",
         )
 
     def test_idea_promotion_preview_is_read_only_and_builds_explicit_criteria(self):

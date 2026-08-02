@@ -285,11 +285,11 @@ def _strip_bot_suffix(text):
 async def _handle_pending_confirmation(update, text):
     """If the CURRENT conversation (main.set_conversation must already be called for
     this chat) has a sensitive action staged, resolve it with this message and return
-    True. Idea promotion requires explicit /confirm or /cancel; existing staged-action
-    types retain their original /confirm-or-cancel-on-other-input behavior. Returns
-    False if nothing was staged, so the caller proceeds with normal handling. Per-chat,
-    so a write staged while DMing one agent is never confirmed or cancelled by a
-    message elsewhere."""
+    True. Roadmap-pack queueing and idea promotion require explicit /confirm or
+    /cancel; existing staged-action types retain their original
+    /confirm-or-cancel-on-other-input behavior. Returns False if nothing was staged,
+    so the caller proceeds with normal handling. Per-chat, so a write staged while
+    DMing one agent is never confirmed or cancelled by a message elsewhere."""
     pending = main.get_pending_action()
     if pending is None:
         return False
@@ -297,6 +297,57 @@ async def _handle_pending_confirmation(update, text):
     command = _strip_bot_suffix(text)
     pending_type = pending.get("type")
     user_id = getattr(getattr(update, "effective_user", None), "id", None)
+
+    if pending_type == "autonomy_roadmap_pack":
+        manifest_id = str(pending.get("manifest_id") or "unknown")
+        description = f"queueing of roadmap pack {manifest_id}"
+        requested_by = pending.get("requested_by_user_id")
+        if requested_by is not None and user_id != requested_by:
+            await update.message.reply_text(
+                "Only the owner who staged this roadmap pack can confirm or cancel it."
+            )
+            return True
+        if command == "/cancel":
+            main.clear_pending_action()
+            main.logger.info(f"Telegram user {user_id} cancelled {description}")
+            await update.message.reply_text(
+                f"Cancelled the {description}. No roadmap state changed."
+            )
+            return True
+        if command != "/confirm":
+            await update.message.reply_text(
+                "The roadmap pack is still staged. Reply /confirm to queue it or "
+                "/cancel to leave the roadmap unchanged."
+            )
+            return True
+        workflow = _get_autonomy_workflow()
+        try:
+            success, message = await asyncio.to_thread(
+                workflow.queue_roadmap_pack,
+                manifest_id,
+                expected_revision=str(pending.get("expected_revision") or ""),
+                approval_source=f"telegram_owner:{user_id}",
+            )
+        except Exception as exc:
+            main.logger.error(
+                f"Confirmed roadmap-pack queue failed without changing state: {exc}"
+            )
+            await update.message.reply_text(
+                "The roadmap pack was not persisted safely. Your approval remains "
+                "staged; retry /confirm after checking the Railway logs, or reply /cancel."
+            )
+            return True
+        if success:
+            main.clear_pending_action()
+            main.logger.info(f"Telegram user {user_id} confirmed {description}")
+            await reply_chunks(update.message, message)
+        else:
+            await reply_chunks(
+                update.message,
+                f"{message}\n\nThe approval remains staged. Retry /confirm after resolving "
+                "the issue, or reply /cancel.",
+            )
+        return True
 
     if pending_type == "autonomy_idea_promotion":
         idea_id = str(pending.get("idea_id") or "unknown")
@@ -2076,6 +2127,47 @@ def _format_idea_promotion_preview(preview):
     return autonomous_workflow.redact_secrets("\n".join(lines))
 
 
+def _format_roadmap_pack_preview(preview):
+    item_ids = [
+        str(value).strip()
+        for value in preview.get("roadmap_item_ids", []) or []
+        if str(value).strip()
+    ]
+    shown_ids = item_ids[:20]
+    item_id_text = ", ".join(shown_ids) or "none"
+    if len(item_ids) > len(shown_ids):
+        item_id_text += f", ...and {len(item_ids) - len(shown_ids)} more"
+    authorization_levels = sorted({
+        str(value).strip()
+        for value in preview.get("authorization_levels", []) or []
+        if str(value).strip()
+    })
+    already_queued = bool(preview.get("already_queued"))
+    lines = [
+        "Roadmap pack already queued" if already_queued else "Roadmap pack staged",
+        f"Manifest: {preview.get('manifest_id')}",
+        f"Revision: {preview.get('manifest_revision')}",
+        f"Target project: {preview.get('project_id')} - {preview.get('project_name')}",
+        f"Target goal: {preview.get('goal_id')} - {preview.get('goal_title')}",
+        f"Items: {int(preview.get('item_count') or 0)}",
+        f"Roadmap item IDs: {item_id_text}",
+        f"Authorization levels: {', '.join(authorization_levels) or 'unspecified'}",
+        f"Already queued: {'yes' if already_queued else 'no'}",
+        "",
+    ]
+    if already_queued:
+        lines.extend([
+            "No approval was staged and no work was started.",
+            "Run /autorun dry-run to inspect the next selection.",
+        ])
+    else:
+        lines.extend([
+            "No roadmap state has changed, no model was invoked, and no work was started.",
+            "Reply /confirm in this group to queue the pack, or /cancel to leave the roadmap unchanged.",
+        ])
+    return autonomous_workflow.redact_secrets("\n".join(lines))
+
+
 async def handle_autorun_command(update, text, *, allow_live=True):
     """Handle safe status/dry-run commands and explicitly gated live execution."""
     global autonomy_runner_task
@@ -2095,6 +2187,80 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         return
     if argument == "status":
         await reply_chunks(update.message, await asyncio.to_thread(_autonomy_status_text))
+        return
+    if argument == "queue" or argument.startswith("queue "):
+        parts = raw_argument.split()
+        if len(parts) != 2:
+            await update.message.reply_text(
+                "Usage: /autorun queue <manifest-id>"
+            )
+            return
+        if not allow_live:
+            await update.message.reply_text(
+                "Queue roadmap packs from the group operating room, not a DM."
+            )
+            return
+        if autonomy_runner_task and not autonomy_runner_task.done():
+            await update.message.reply_text(
+                "An autonomous run is already active; no roadmap pack was staged."
+            )
+            return
+        if company_runner_task and not company_runner_task.done():
+            await update.message.reply_text(
+                "Company Mode is already running; no roadmap pack was staged. "
+                "Wait for its final result or owner action."
+            )
+            return
+        if main.get_pending_action() is not None:
+            await update.message.reply_text(
+                "Another owner confirmation is already staged in this group. "
+                "Reply /confirm or /cancel before queueing a roadmap pack."
+            )
+            return
+        manifest_id = parts[1].strip()
+        workflow = _get_autonomy_workflow()
+        try:
+            success, preview_or_message = await asyncio.to_thread(
+                workflow.preview_roadmap_pack,
+                manifest_id,
+            )
+        except Exception as exc:
+            main.logger.error(
+                f"Roadmap-pack preview failed without changing state: {exc}"
+            )
+            await update.message.reply_text(
+                "The roadmap pack was not staged because persistent autonomy state "
+                "could not be read safely. Check the Railway logs or recovery marker."
+            )
+            return
+        if not success:
+            await update.message.reply_text(str(preview_or_message))
+            return
+        preview = preview_or_message
+        if preview.get("already_queued"):
+            await reply_chunks(update.message, _format_roadmap_pack_preview(preview))
+            return
+        if (
+            (autonomy_runner_task and not autonomy_runner_task.done())
+            or (company_runner_task and not company_runner_task.done())
+            or main.get_pending_action() is not None
+        ):
+            await update.message.reply_text(
+                "Owner or runner state changed while the roadmap-pack preview was built; "
+                "nothing was staged. Retry after the active work or confirmation closes."
+            )
+            return
+        requested_by = getattr(getattr(update, "effective_user", None), "id", None)
+        main.set_pending_action({
+            "type": "autonomy_roadmap_pack",
+            "manifest_id": preview["manifest_id"],
+            "expected_revision": preview["manifest_revision"],
+            "project_id": preview.get("project_id"),
+            "goal_id": preview.get("goal_id"),
+            "item_count": preview.get("item_count"),
+            "requested_by_user_id": requested_by,
+        })
+        await reply_chunks(update.message, _format_roadmap_pack_preview(preview))
         return
     if argument == "promote" or argument.startswith("promote "):
         parts = raw_argument.split()
@@ -2221,6 +2387,7 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         return
     await update.message.reply_text(
         "Usage: /autorun dry-run | /autorun status | "
+        "/autorun queue <manifest-id> | "
         "/autorun promote <idea-id> [project-id] | "
         "/autorun retry <roadmap-item-id> | /autorun live"
     )
