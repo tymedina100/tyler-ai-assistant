@@ -515,16 +515,24 @@ The autonomous layer extends the current system rather than replacing it:
 3. `model_router.py` chooses a configured capable model and records why.
 4. `autonomy_team.py` converts each selected item into one bounded worker task plus a
    separately routed Vera acceptance-criteria review, while intersecting the agent's
-   normal tool set with the roadmap authorization level.
+   normal tool set with the roadmap authorization level. The coordinator also supplies
+   an allowlisted, redacted snapshot of up to five prior runs when the item explicitly
+   needs run history. Global trigger/outcome fields are labeled as global; task titles
+   and outcomes are limited to the current project. The snapshot is transient execution
+   context: it is not copied into Company goals/events and never grants agents direct
+   access to the control-plane data directory.
 5. A live session uses the existing Company Mode sequential runner, artifact handoff,
-   bounded revisions, budget ledger, and approval gates. A task-local `blocked` or
-   `needs_human` result is escalated, then unrelated actionable work may continue.
+   bounded revisions, budget ledger, and approval gates. Explicit missing access,
+   unavailable evidence/tools, or required owner input blocks before another paid
+   revision. A task-local `blocked` or `needs_human` result is escalated, then unrelated
+   actionable work may continue.
 6. Before another item starts, the coordinator refreshes the shared ledger and checks
    the session ceilings. It stops when no useful unit fits, no roadmap work remains, ten
    items have been selected, or 120 minutes have elapsed. Available budget is a ceiling,
    not a target to burn.
-7. Only after roadmap work is exhausted may Lumen produce one controlled batch of up to
-   three deduplicated ideas. Each enters the backlog with a stable ID and `proposed`
+7. Only after roadmap work is exhausted, and only if this session has no unresolved
+   blocked task, may Lumen produce one controlled batch of up to three deduplicated
+   ideas. Each enters the backlog with a stable ID and `proposed`
    status. Nothing is automatically promoted, assigned, or built; the owner may stage one
    with `/autorun promote <idea-id>` and explicitly approve it with `/confirm`.
 8. The coordinator writes one aggregate JSON report and Telegram summary covering every
@@ -598,6 +606,8 @@ room** without starting work or spending model budget:
 The retry command preserves previous attempts and costs, clears the terminal owner-action
 fields, and makes the item eligible for a future session. It never starts execution
 itself; run `/autorun dry-run` next to verify selection before using `/autorun live`.
+If a session completes unrelated work after one item blocks, the aggregate result still
+remains `needs_human` and Lumen does not add ideas that could hide the owner action.
 
 After reviewing dry-run selection, routing, budget, and authorization output, live mode
 requires deliberate configuration: set `AUTONOMY_ENABLED=true`, set
@@ -672,6 +682,9 @@ invoice-level guarantee.
 loops. Company Mode retains a larger bounded non-file worker result for review and marks
 the latest revision candidate explicitly. `MAX_TASK_STORED_RESULT_CHARS` defaults to
 `20000`; reviewer feedback defaults to `12000` characters with ten history entries.
+Workers and reviewers must emit a structured human-blocked result when required evidence,
+access, tools, or owner decisions are unavailable; those cases do not consume a revision
+round. Ordinary, actionable review feedback remains eligible for a bounded revision.
 `MAX_TASK_RESULT_CHARS` defaults to `5000` and bounds the smaller copy placed in the run
 report and Telegram delivery. Each setting also has a defensive hard maximum. Live worker/reviewer
 estimates and controlled idle ideation are reserved atomically

@@ -1344,9 +1344,9 @@ def classify_failure(error):
     patterns = (
         ("budget", ("budget", "insufficient funds", "cost cap", "quota exhausted")),
         ("permission", ("permission denied", "forbidden", "unauthorized", "not authorized", "403")),
-        ("unavailable_tool", ("tool unavailable", "tool is unavailable", "command not found", "not installed", "missing tool")),
-        ("missing_access", ("missing access", "no access", "credentials", "api key", "access token", "sign in", "login required")),
-        ("missing_information", ("missing information", "need more information", "insufficient context", "ambiguous requirement")),
+        ("unavailable_tool", ("tool unavailable", "tool is unavailable", "unavailable_tool", "command not found", "not installed", "missing tool")),
+        ("missing_access", ("missing access", "missing_access", "no access", "credentials", "api key", "access token", "sign in", "login required")),
+        ("missing_information", ("missing information", "missing_information", "need more information", "insufficient context", "ambiguous requirement")),
         ("decision", ("needs approval", "need approval", "human decision", "choose between", "owner decision")),
         ("transient", ("timeout", "timed out", "rate limit", "429", "temporarily unavailable", "connection reset", "503")),
     )
@@ -1377,6 +1377,51 @@ def _substantially_same_feedback(left, right):
     return jaccard >= 0.9 or SequenceMatcher(None, left, right).ratio() >= 0.9
 
 
+def _explicit_external_dependency(value):
+    """Classify only explicit claims that a revision needs unavailable input.
+
+    Generic criticism such as "missing evidence" remains revisable.  These narrow
+    patterns cover dependencies the current team cannot fix by rewriting the same
+    submission, preventing paid review loops that cannot make progress.
+    """
+
+    text = re.sub(r"[_-]+", " ", str(value or "").strip().lower())
+    text = re.sub(r"\s+", " ", text)
+    structured = re.match(
+        r"^blocked\s+needs human review\b.{0,160}\b"
+        r"(missing access|missing information|unavailable tool)\b",
+        text,
+    )
+    if structured:
+        return {
+            "missing access": "missing_access",
+            "missing information": "missing_information",
+            "unavailable tool": "unavailable_tool",
+        }[structured.group(1)]
+    access_pattern = re.compile(
+        r"\b(?:i|we|the (?:current )?team|the worker|the reviewer)\s+"
+        r"(?:cannot|can't|am unable to|are unable to|is unable to|"
+        r"am not able to|are not able to|is not able to)\s+access (?:the )?"
+        r"(?:actual|required|source|original|last|run|logs?|records?|data|inputs?)\b"
+    )
+    if access_pattern.search(text):
+        return "missing_access"
+    owner_dependency = any(phrase in text for phrase in (
+        "owner must provide the missing",
+        "owner must provide the required",
+        "must be provided by the owner before",
+        "requires owner input before",
+        "requires an owner decision before",
+    ))
+    hypothetical = re.search(
+        r"\b(?:explain|document|describe|clarify)\b.{0,60}\bowner\b",
+        text,
+    )
+    if owner_dependency and not hypothetical:
+        return "missing_information"
+    return None
+
+
 def classify_editor_verdict(editor_answer):
     """Map the Managing Editor's reply to one of three outcomes:
       - "approved": ship it.
@@ -1386,6 +1431,8 @@ def classify_editor_verdict(editor_answer):
       - "revise":   the team can fix it themselves; run another revision round.
     A missing/garbled verdict is "revise" (never a silent pass)."""
     text = (editor_answer or "").strip().upper()
+    if _explicit_external_dependency(editor_answer):
+        return "blocked"
     if text.startswith("APPROVED"):
         return "approved"
     if text.startswith("BLOCKED") or "NEEDS HUMAN REVIEW" in text or "NEEDS YOUR REVIEW" in text:
@@ -1400,6 +1447,7 @@ def set_project_revision_flag(project_id, editor_answer, path=COMPANY_STATE_FILE
     a revision round or escalation can relay the requirements without allowing one
     provider response to grow persistent state indefinitely."""
     verdict = classify_editor_verdict(editor_answer)
+    dependency_failure = _explicit_external_dependency(editor_answer)
     feedback_text, feedback_truncated = _bounded_text(
         editor_answer, MAX_REVIEW_FEEDBACK_CHARS, strip=True
     )
@@ -1421,6 +1469,14 @@ def set_project_revision_flag(project_id, editor_answer, path=COMPANY_STATE_FILE
                 state,
                 "review_no_progress",
                 "Repeated substantially identical editor feedback; stopped revision loop.",
+                project_id=project_id,
+            )
+        elif verdict == "blocked" and dependency_failure:
+            project["failure_classification"] = dependency_failure
+            add_event(
+                state,
+                "review_external_dependency",
+                "Review identified required input the current team cannot access.",
                 project_id=project_id,
             )
         project["review_attempts"] = int(project.get("review_attempts", 0)) + 1
@@ -2032,6 +2088,24 @@ def build_task_prompt(project, task, prior_work="", deliverable_name=None, deliv
     if task.get("enforce_authorization"):
         authorization = str(task.get("authorization_level", "propose")).strip().lower()
         authorization = {"modify_locally": "modify_local"}.get(authorization, authorization)
+        if task.get("owner") == "editor":
+            prompt += (
+                "\nReview verdict contract: use REVISIONS REQUIRED only for concrete "
+                "changes the current team can make with the supplied evidence and allowed "
+                "tools. If required evidence, access, a tool, or an owner decision is "
+                "unavailable, start exactly with BLOCKED - NEEDS HUMAN REVIEW and include "
+                "one category: MISSING_ACCESS, MISSING_INFORMATION, or UNAVAILABLE_TOOL. "
+                "Do not spend a revision round asking the team to obtain unavailable input.\n"
+            )
+        else:
+            prompt += (
+                "\nFailure contract: if a required input, access grant, tool, or owner "
+                "decision is unavailable after using the supplied context and allowed "
+                "tools, do not invent a placeholder. Start exactly with BLOCKED - NEEDS "
+                "HUMAN REVIEW and include one category: MISSING_ACCESS, "
+                "MISSING_INFORMATION, or UNAVAILABLE_TOOL, followed by the exact action "
+                "the owner must take.\n"
+            )
         prompt += f"\nAuthorization level: {authorization}.\n"
         if authorization in {"observe", "propose"}:
             prompt += (

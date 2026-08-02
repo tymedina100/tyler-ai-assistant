@@ -245,6 +245,29 @@ class CompanyModeTests(unittest.TestCase):
         self.assertIn("[truncated]", prompt)
         self.assertEqual(prompt.count("x"), company_mode.DELIVERABLE_INJECT_CHARS)
 
+    def test_autonomous_prompts_stop_on_external_dependencies_without_revision_loops(self):
+        project = {"id": "p", "goal": "Validate supplied run evidence"}
+        worker = {
+            "owner": "general",
+            "title": "Draft the validation",
+            "enforce_authorization": True,
+            "authorization_level": "propose",
+        }
+        editor = {
+            "owner": "editor",
+            "title": "Review the validation",
+            "enforce_authorization": True,
+            "authorization_level": "observe",
+        }
+
+        worker_prompt = company_mode.build_task_prompt(project, worker)
+        editor_prompt = company_mode.build_task_prompt(project, editor)
+
+        self.assertIn("BLOCKED - NEEDS HUMAN REVIEW", worker_prompt)
+        self.assertIn("MISSING_ACCESS", worker_prompt)
+        self.assertIn("REVISIONS REQUIRED only", editor_prompt)
+        self.assertIn("Do not spend a revision round", editor_prompt)
+
     def test_assigned_project_starts_proposed(self):
         self._assign()
         state = company_mode.load_state(self.state_path)
@@ -794,6 +817,65 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(project["status"], "blocked")
         self.assertEqual(project["failure_classification"], "no_progress")
         self.assertFalse(project["needs_revision"])
+
+    def test_editor_external_dependency_blocks_before_any_revision_round(self):
+        self._assign()
+        project_id = company_mode.load_state(self.state_path)["company"]["active_project_id"]
+
+        verdict = company_mode.set_project_revision_flag(
+            project_id,
+            "REVISIONS REQUIRED: I cannot access the actual last five run records; "
+            "the owner must provide them.",
+            self.state_path,
+        )
+
+        project = company_mode.active_project(company_mode.load_state(self.state_path))
+        self.assertEqual(verdict, "blocked")
+        self.assertFalse(project["needs_revision"])
+        self.assertEqual(project["revision_round"], 0)
+        self.assertEqual(project["failure_classification"], "missing_access")
+
+        # Missing evidence that can be fixed from supplied context remains revisable.
+        company_mode.set_project_revision_flag(
+            project_id,
+            "APPROVED: reset the review state for the control assertion.",
+            self.state_path,
+        )
+        fixable = company_mode.set_project_revision_flag(
+            project_id,
+            "REVISIONS REQUIRED: cite the supplied run evidence in the comparison.",
+            self.state_path,
+        )
+        self.assertEqual(fixable, "revise")
+
+    def test_external_dependency_detection_is_fail_closed_without_false_access_matches(self):
+        self.assertEqual(
+            company_mode.classify_editor_verdict(
+                "APPROVED: The draft looks polished, but I cannot access the required logs."
+            ),
+            "blocked",
+        )
+        self.assertEqual(
+            company_mode.classify_editor_verdict(
+                "REVISIONS REQUIRED: Explain what users should do when they cannot "
+                "access the actual run data."
+            ),
+            "revise",
+        )
+        self.assertEqual(
+            company_mode.classify_editor_verdict(
+                "APPROVED: The deliverable correctly states that it cannot access "
+                "the actual run records."
+            ),
+            "approved",
+        )
+        self.assertEqual(
+            company_mode.classify_failure(
+                "cannot access local variable 'result' where it is not associated "
+                "with a value"
+            ),
+            "technical",
+        )
 
     def test_start_revision_round_enforces_cap_itself(self):
         self._assign()
