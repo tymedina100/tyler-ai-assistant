@@ -279,22 +279,82 @@ def _strip_bot_suffix(text):
 
 async def _handle_pending_confirmation(update, text):
     """If the CURRENT conversation (main.set_conversation must already be called for
-    this chat) has a sensitive action staged, resolve it with this message - /confirm
-    runs it, anything else cancels - and return True. Returns False if nothing was
-    staged, so the caller proceeds with normal handling. Per-chat, so a write staged
-    while DMing one agent is never confirmed or cancelled by a message elsewhere."""
+    this chat) has a sensitive action staged, resolve it with this message and return
+    True. Idea promotion requires explicit /confirm or /cancel; existing staged-action
+    types retain their original /confirm-or-cancel-on-other-input behavior. Returns
+    False if nothing was staged, so the caller proceeds with normal handling. Per-chat,
+    so a write staged while DMing one agent is never confirmed or cancelled by a
+    message elsewhere."""
     pending = main.get_pending_action()
     if pending is None:
         return False
 
-    main.clear_pending_action()  # resolved either way - confirm or cancel
-    description = main.describe_pending_action(pending)
     command = _strip_bot_suffix(text)
+    pending_type = pending.get("type")
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+
+    if pending_type == "autonomy_idea_promotion":
+        idea_id = str(pending.get("idea_id") or "unknown")
+        item_id = str(pending.get("expected_roadmap_item_id") or "unknown")
+        description = f"promotion of idea {idea_id} to roadmap item {item_id}"
+        requested_by = pending.get("requested_by_user_id")
+        if requested_by is not None and user_id != requested_by:
+            await update.message.reply_text(
+                "Only the owner who staged this idea promotion can confirm or cancel it."
+            )
+            return True
+        if command == "/cancel":
+            main.clear_pending_action()
+            main.logger.info(f"Telegram user {user_id} cancelled {description}")
+            await update.message.reply_text(
+                f"Cancelled the {description}. The idea remains proposed and no roadmap state changed."
+            )
+            return True
+        if command != "/confirm":
+            await update.message.reply_text(
+                "The idea promotion is still staged. Reply /confirm to queue it or "
+                "/cancel to leave the idea proposed."
+            )
+            return True
+        workflow = _get_autonomy_workflow()
+        try:
+            success, message = await asyncio.to_thread(
+                workflow.promote_idea,
+                idea_id,
+                project_id=str(pending.get("project_id") or ""),
+                expected_revision=str(pending.get("expected_revision") or ""),
+                expected_roadmap_item_id=item_id,
+                expected_goal_id=pending.get("expected_goal_id"),
+                approval_source=f"telegram_owner:{user_id}",
+            )
+        except Exception as exc:
+            main.logger.error(
+                f"Confirmed idea promotion failed without changing roadmap state: {exc}"
+            )
+            await update.message.reply_text(
+                "The promotion was not persisted safely. Your approval remains staged; "
+                "retry /confirm after checking the Railway logs, or reply /cancel."
+            )
+            return True
+        if success:
+            main.clear_pending_action()
+            main.logger.info(f"Telegram user {user_id} confirmed {description}")
+            await reply_chunks(update.message, message)
+        else:
+            await reply_chunks(
+                update.message,
+                f"{message}\n\nThe approval remains staged. Retry /confirm after resolving "
+                "the issue, or reply /cancel.",
+            )
+        return True
+
+    main.clear_pending_action()  # existing actions resolve on confirm or cancel
+    description = main.describe_pending_action(pending)
 
     # A "publish" approval is resolved here (in group_bot) rather than via
     # main.confirm_pending_action, since publishing is a Company Mode concept and
     # main.py stays independent of company_mode.
-    if pending.get("type") == "publish":
+    if pending_type == "publish":
         if command == "/confirm":
             msg = await asyncio.to_thread(company_mode.mark_project_published)
             main.logger.info(f"Telegram user {update.effective_user.id} confirmed {description}")
@@ -1913,6 +1973,12 @@ def _autonomy_status_text():
     last = recent[-1] if recent else None
     budget = _company_budget_snapshot()
     next_item = workflow.select_actionable_item(state)
+    proposed_ideas = [
+        idea
+        for idea in state.get("idea_backlog", []) or []
+        if isinstance(idea, dict)
+        and str(idea.get("status") or "proposed").strip().lower() == "proposed"
+    ]
     lines = [
         "Autonomous Team",
         f"Scheduler: {'enabled' if AUTONOMY_CONFIG.enabled else 'disabled'}; "
@@ -1921,6 +1987,7 @@ def _autonomy_status_text():
         f"Session cap: {AUTONOMY_CONFIG.max_tasks_per_run} distinct roadmap items; "
         f"{AUTONOMY_CONFIG.max_session_minutes} minutes",
         f"Creative: Lumen; one idle batch of up to {AUTONOMY_CONFIG.max_ideas_per_run} proposed ideas",
+        f"Proposed idea backlog: {len(proposed_ideas)}",
         f"Budget: ${budget['spent_today_usd']:.4f} spent, ${budget['reserved_today_usd']:.4f} reserved, "
         f"${budget['remaining_usd']:.4f} ordinary remaining of ${budget['daily_budget_usd']:.2f}",
         f"Next actionable item: {next_item.get('id')} - {next_item.get('title')}" if next_item else "Next actionable item: none",
@@ -1929,6 +1996,37 @@ def _autonomy_status_text():
             if last else "Last run: none"
         ),
     ]
+    for idea in proposed_ideas[:5]:
+        title = re.sub(r"\s+", " ", str(idea.get("idea") or "Untitled idea")).strip()
+        if len(title) > 100:
+            title = title[:97].rstrip() + "..."
+        lines.append(f"- {idea.get('id') or 'unknown-id'}: {title}")
+    if len(proposed_ideas) > 5:
+        lines.append(f"- ...and {len(proposed_ideas) - 5} more persisted proposals")
+    if proposed_ideas:
+        lines.append("Promote one: /autorun promote <idea-id>")
+    return autonomous_workflow.redact_secrets("\n".join(lines))
+
+
+def _format_idea_promotion_preview(preview):
+    criteria = preview.get("acceptance_criteria", []) or []
+    lines = [
+        "Idea promotion staged",
+        f"Idea: {preview.get('idea_id')} - {preview.get('idea')}",
+        f"Target project: {preview.get('project_id')} - {preview.get('project_name')}",
+        f"Target goal: {preview.get('goal_id') or 'unassigned'}",
+        f"Roadmap item: {preview.get('roadmap_item_id')}",
+        f"Status after approval: {preview.get('status')}",
+        f"Authorization: {preview.get('authorization_level')}",
+        f"Estimated AI cost: ${float(preview.get('estimated_ai_cost_usd') or 0.0):.4f}",
+        "Acceptance criteria:",
+    ]
+    lines.extend(f"{index}. {criterion}" for index, criterion in enumerate(criteria, 1))
+    lines.extend([
+        "",
+        "No roadmap state has changed, no model was invoked, and no work was started.",
+        "Reply /confirm in this group to queue the task, or /cancel to leave the idea proposed.",
+    ])
     return autonomous_workflow.redact_secrets("\n".join(lines))
 
 
@@ -1951,6 +2049,80 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         return
     if argument == "status":
         await reply_chunks(update.message, await asyncio.to_thread(_autonomy_status_text))
+        return
+    if argument == "promote" or argument.startswith("promote "):
+        parts = raw_argument.split()
+        if len(parts) not in {2, 3}:
+            await update.message.reply_text(
+                "Usage: /autorun promote <idea-id> [project-id]"
+            )
+            return
+        if not allow_live:
+            await update.message.reply_text(
+                "Promote ideas from the group operating room, not a DM."
+            )
+            return
+        if autonomy_runner_task and not autonomy_runner_task.done():
+            await update.message.reply_text(
+                "An autonomous run is already active; no idea promotion was staged."
+            )
+            return
+        if company_runner_task and not company_runner_task.done():
+            await update.message.reply_text(
+                "Company Mode is already running; no idea promotion was staged. "
+                "Wait for its final result or owner action."
+            )
+            return
+        if main.get_pending_action() is not None:
+            await update.message.reply_text(
+                "Another owner confirmation is already staged in this group. "
+                "Reply /confirm or /cancel before promoting an idea."
+            )
+            return
+        idea_id = parts[1].strip()
+        project_id = parts[2].strip() if len(parts) == 3 else None
+        workflow = _get_autonomy_workflow()
+        try:
+            success, preview_or_message = await asyncio.to_thread(
+                workflow.preview_idea_promotion,
+                idea_id,
+                project_id,
+            )
+        except Exception as exc:
+            main.logger.error(
+                f"Idea promotion preview failed without changing roadmap state: {exc}"
+            )
+            await update.message.reply_text(
+                "The promotion was not staged because persistent autonomy state could "
+                "not be read safely. Check the Railway logs or recovery marker."
+            )
+            return
+        if not success:
+            await update.message.reply_text(str(preview_or_message))
+            return
+        preview = preview_or_message
+        if (
+            (autonomy_runner_task and not autonomy_runner_task.done())
+            or (company_runner_task and not company_runner_task.done())
+            or main.get_pending_action() is not None
+        ):
+            await update.message.reply_text(
+                "Owner or runner state changed while the promotion preview was built; "
+                "nothing was staged. Retry after the active work or confirmation closes."
+            )
+            return
+        requested_by = getattr(getattr(update, "effective_user", None), "id", None)
+        main.set_pending_action({
+            "type": "autonomy_idea_promotion",
+            "idea_id": preview["idea_id"],
+            "project_id": preview["project_id"],
+            "expected_revision": preview["proposal_revision"],
+            "expected_roadmap_item_id": preview["roadmap_item_id"],
+            "expected_goal_id": preview.get("goal_id"),
+            "title": preview["title"],
+            "requested_by_user_id": requested_by,
+        })
+        await reply_chunks(update.message, _format_idea_promotion_preview(preview))
         return
     if argument == "retry" or argument.startswith("retry "):
         parts = raw_argument.split(maxsplit=1)
@@ -2003,6 +2175,7 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         return
     await update.message.reply_text(
         "Usage: /autorun dry-run | /autorun status | "
+        "/autorun promote <idea-id> [project-id] | "
         "/autorun retry <roadmap-item-id> | /autorun live"
     )
 

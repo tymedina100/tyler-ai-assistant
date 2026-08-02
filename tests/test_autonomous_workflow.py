@@ -59,6 +59,27 @@ def item(item_id="task-1", **overrides):
     return value
 
 
+def idea_record(idea_id="idea-1", **overrides):
+    value = {
+        "id": idea_id,
+        "idea": "Add a concise autonomous run summary",
+        "problem_addressed": "Run outcomes are hard to scan.",
+        "expected_value": "Operators can understand outcomes in under 30 seconds.",
+        "target_user": "Owner",
+        "estimated_effort": "small",
+        "estimated_ai_cost_usd": 0.01,
+        "risks": ["The summary could omit important evidence."],
+        "relationship_to_current_goals": "Improves safe autonomous operations.",
+        "recommended_next_validation_step": "Draft three examples and compare scan time.",
+        "status": "proposed",
+        "authorization_level": "propose",
+        "source_run_id": "run-ideas",
+    }
+    value["fingerprint"] = autonomy._idea_fingerprint(value)
+    value.update(overrides)
+    return value
+
+
 class FakeScheduler:
     def __init__(self):
         self.calls = []
@@ -413,6 +434,264 @@ class AutonomousWorkflowTests(unittest.TestCase):
             workflow.load_state()["projects"][0]["roadmap_items"][0]["status"],
             "needs_human",
         )
+
+    def test_idea_promotion_preview_is_read_only_and_builds_explicit_criteria(self):
+        workflow = self.workflow([])
+        state = workflow.load_state()
+        state["idea_backlog"] = [idea_record()]
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+
+        success, preview = workflow.preview_idea_promotion("idea-1")
+
+        self.assertTrue(success)
+        self.assertEqual(preview["idea_id"], "idea-1")
+        self.assertEqual(preview["project_id"], "project-a")
+        self.assertEqual(preview["roadmap_item_id"], "AUTO-IDEA-1")
+        self.assertEqual(preview["status"], "ready")
+        self.assertEqual(preview["authorization_level"], "propose")
+        self.assertEqual(len(preview["acceptance_criteria"]), 4)
+        self.assertIn("Draft three examples", preview["acceptance_criteria"][0])
+        self.assertIn("under 30 seconds", preview["acceptance_criteria"][1])
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+    def test_idea_promotion_is_atomic_actionable_and_idempotent(self):
+        workflow = self.workflow([])
+        state = workflow.load_state()
+        state["idea_backlog"] = [idea_record()]
+        workflow.store.save(state)
+        budget_before = workflow.load_state()["budget_tracking"]
+        success, preview = workflow.preview_idea_promotion("idea-1")
+        self.assertTrue(success)
+
+        promoted, message = workflow.promote_idea(
+            "idea-1",
+            project_id=preview["project_id"],
+            expected_revision=preview["proposal_revision"],
+            expected_roadmap_item_id=preview["roadmap_item_id"],
+            expected_goal_id=preview["goal_id"],
+        )
+
+        self.assertTrue(promoted)
+        self.assertIn("No model was invoked", message)
+        self.assertIn("no autonomous run was started", message)
+        self.assertIn("/autorun dry-run", message)
+        persisted = workflow.load_state()
+        proposal = persisted["idea_backlog"][0]
+        roadmap = persisted["projects"][0]["roadmap_items"]
+        self.assertEqual(proposal["status"], "promoted")
+        self.assertEqual(proposal["promoted_roadmap_item_id"], "AUTO-IDEA-1")
+        self.assertEqual(len(roadmap), 1)
+        self.assertEqual(roadmap[0]["status"], "ready")
+        self.assertEqual(roadmap[0]["source_idea_id"], "idea-1")
+        self.assertEqual(roadmap[0]["authorization_level"], "propose")
+        self.assertEqual(persisted["budget_tracking"], budget_before)
+        self.assertEqual(autonomy.select_actionable_item(persisted)["id"], "AUTO-IDEA-1")
+
+        again, again_message = workflow.promote_idea(
+            "idea-1",
+            project_id=preview["project_id"],
+            expected_revision=preview["proposal_revision"],
+            expected_roadmap_item_id=preview["roadmap_item_id"],
+            expected_goal_id=preview["goal_id"],
+        )
+        self.assertTrue(again)
+        self.assertIn("already promoted", again_message)
+        self.assertIn("no duplicate", again_message)
+        self.assertEqual(
+            len(workflow.load_state()["projects"][0]["roadmap_items"]), 1
+        )
+
+        mismatch, mismatch_message = workflow.promote_idea(
+            "idea-1",
+            project_id="different-project",
+            expected_revision=preview["proposal_revision"],
+            expected_roadmap_item_id=preview["roadmap_item_id"],
+            expected_goal_id=preview["goal_id"],
+        )
+        self.assertFalse(mismatch)
+        self.assertIn("different reviewed destination", mismatch_message)
+        self.assertEqual(
+            len(workflow.load_state()["projects"][0]["roadmap_items"]), 1
+        )
+
+    def test_idea_promotion_rejections_do_not_mutate_state(self):
+        workflow = self.workflow([])
+        state = workflow.load_state()
+        state["idea_backlog"] = [idea_record(), idea_record()]
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+
+        success, message = workflow.preview_idea_promotion("idea-1")
+        self.assertFalse(success)
+        self.assertIn("ambiguous: 2", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        success, message = workflow.preview_idea_promotion("missing")
+        self.assertFalse(success)
+        self.assertIn("was not found", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        state["idea_backlog"] = [idea_record(recommended_next_validation_step="")]
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+        success, message = workflow.preview_idea_promotion("idea-1")
+        self.assertFalse(success)
+        self.assertIn("no recommended validation step", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        state["idea_backlog"] = [idea_record(target_goal_id="missing-goal")]
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+        success, message = workflow.preview_idea_promotion("idea-1")
+        self.assertFalse(success)
+        self.assertIn("Goal 'missing-goal' is missing", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+    def test_idea_promotion_requires_unambiguous_active_project(self):
+        workflow = self.workflow([])
+        state = workflow.load_state()
+        state["idea_backlog"] = [idea_record()]
+        second = json.loads(json.dumps(state["projects"][0]))
+        second["id"] = "project-b"
+        second["name"] = "Project B"
+        second["roadmap_items"] = []
+        state["projects"].append(second)
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+
+        success, message = workflow.preview_idea_promotion("idea-1")
+        self.assertFalse(success)
+        self.assertIn("Several active projects", message)
+        self.assertIn("project-a", message)
+        self.assertIn("project-b", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        success, preview = workflow.preview_idea_promotion("idea-1", "project-b")
+        self.assertTrue(success)
+        self.assertEqual(preview["project_id"], "project-b")
+
+        state = workflow.load_state()
+        for project in state["projects"]:
+            project["status"] = "paused"
+        workflow.store.save(state)
+        success, message = workflow.preview_idea_promotion("idea-1")
+        self.assertFalse(success)
+        self.assertIn("No active project", message)
+
+    def test_idea_promotion_revalidates_revision_and_respects_run_lock(self):
+        workflow = self.workflow([])
+        state = workflow.load_state()
+        state["idea_backlog"] = [idea_record()]
+        workflow.store.save(state)
+        success, preview = workflow.preview_idea_promotion("idea-1")
+        self.assertTrue(success)
+
+        state = workflow.load_state()
+        state["idea_backlog"][0]["expected_value"] = "A materially different outcome."
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+        success, message = workflow.promote_idea(
+            "idea-1",
+            project_id=preview["project_id"],
+            expected_revision=preview["proposal_revision"],
+            expected_roadmap_item_id=preview["roadmap_item_id"],
+            expected_goal_id=preview["goal_id"],
+        )
+        self.assertFalse(success)
+        self.assertIn("changed after approval", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        state = workflow.load_state()
+        state["idea_backlog"][0] = idea_record()
+        workflow.store.save(state)
+        success, goal_preview = workflow.preview_idea_promotion("idea-1")
+        self.assertTrue(success)
+        state = workflow.load_state()
+        state["projects"][0]["goals"][0]["id"] = "goal-b"
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+        success, message = workflow.promote_idea(
+            "idea-1",
+            project_id=goal_preview["project_id"],
+            expected_revision=goal_preview["proposal_revision"],
+            expected_roadmap_item_id=goal_preview["roadmap_item_id"],
+            expected_goal_id=goal_preview["goal_id"],
+        )
+        self.assertFalse(success)
+        self.assertIn("reviewed roadmap goal changed", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        state = workflow.load_state()
+        state["run_control"]["active_run"] = {"run_id": "active-promotion-run"}
+        workflow.store.save(state)
+        success, message = workflow.preview_idea_promotion("idea-1")
+        self.assertFalse(success)
+        self.assertIn("active-promotion-run", message)
+
+        state["run_control"]["active_run"] = None
+        workflow.store.save(state)
+        held = FileLock(str(workflow.run_lock_path))
+        held.acquire()
+        try:
+            success, message = workflow.preview_idea_promotion("idea-1")
+        finally:
+            held.release()
+        self.assertFalse(success)
+        self.assertIn("persistent run lock", message)
+
+    def test_idea_promotion_collision_and_write_failure_leave_state_unchanged(self):
+        workflow = self.workflow([item("AUTO-IDEA-1")])
+        state = workflow.load_state()
+        state["idea_backlog"] = [idea_record()]
+        workflow.store.save(state)
+        before = self.state_path.read_text(encoding="utf-8")
+
+        success, message = workflow.preview_idea_promotion("idea-1")
+        self.assertFalse(success)
+        self.assertIn("already exists", message)
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+        state = workflow.load_state()
+        state["projects"][0]["roadmap_items"] = []
+        workflow.store.save(state)
+        success, preview = workflow.preview_idea_promotion("idea-1")
+        self.assertTrue(success)
+        before = self.state_path.read_text(encoding="utf-8")
+        with patch.object(
+            autonomy, "_atomic_write_json", side_effect=OSError("simulated write failure")
+        ):
+            with self.assertRaises(OSError):
+                workflow.promote_idea(
+                    "idea-1",
+                    project_id=preview["project_id"],
+                    expected_revision=preview["proposal_revision"],
+                    expected_roadmap_item_id=preview["roadmap_item_id"],
+                    expected_goal_id=preview["goal_id"],
+                )
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+
+    def test_idea_plan_and_summary_expose_every_stable_id_before_verbose_details(self):
+        proposals = [
+            idea_record("idea-one", idea="A" * 5000),
+            idea_record("idea-two", idea="Second idea"),
+            idea_record("idea-three", idea="Third idea"),
+        ]
+        report = {
+            "idea_proposals": proposals,
+            "tasks_selected": [],
+            "final_status": "ideas_proposed",
+            "budget": {"daily_budget_usd": 5, "remaining_usd": 5},
+        }
+
+        plan = autonomy.format_telegram_idea_plan(report)
+        summary = autonomy.format_telegram_summary(report)
+
+        self.assertLessEqual(len(plan), autonomy.TELEGRAM_MESSAGE_LIMIT)
+        for idea_id in ("idea-one", "idea-two", "idea-three"):
+            self.assertIn(idea_id, plan)
+            self.assertIn(idea_id, summary)
+        self.assertIn("/autorun promote <idea-id>", plan)
 
     def test_selects_highest_priority_actionable_item_and_skips_blockers(self):
         items = [

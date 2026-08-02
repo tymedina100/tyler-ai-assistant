@@ -284,6 +284,20 @@ Safe Telegram inspection while `group_bot.py` is running:
 ```
 
 Status and dry-run work in the group or a Miles DM. `/autorun live` is group-only.
+Status also lists stable IDs for current proposed ideas. Promotion is deliberately
+group-only and approval-gated:
+
+```text
+/autorun promote <idea-id>
+/confirm
+```
+
+The first command builds a read-only preview containing the target project, generated
+acceptance criteria, `ready` status, and `propose` authorization. It invokes no model and
+changes no roadmap state. `/confirm` revalidates the current persisted proposal and
+atomically marks it promoted while adding exactly one roadmap item; it does not start a
+run. If several projects are active, append the intended project ID to the promote
+command. Use `/autorun dry-run` after confirmation to inspect what would be selected.
 
 Scheduling is disabled by default. `AUTONOMY_ENABLED=true` registers the weekday job;
 `AUTONOMY_DRY_RUN=true` keeps scheduled runs audit-only and sends no Telegram message.
@@ -304,7 +318,8 @@ not an isolated checkout boundary. The ceiling does not bypass the existing PR,
 `/confirm`, send, deploy, publish, delete, or production gates. `external_action`
 remains human-only. A no-roadmap-work run may propose a bounded, deduplicated idea into
 `idea_backlog`; it never starts building the idea and defers before routing if supervised
-work or a confirmation is open.
+work or a confirmation is open. A proposal becomes actionable only through the explicit
+promotion/confirmation flow above, and the queued validation remains proposal-only.
 
 Model selection comes from `config/model-catalog.json` or `MODEL_CATALOG_FILE`. Prices,
 capabilities, availability, and context limits are operator-maintained snapshots used
@@ -319,9 +334,9 @@ does not kill a Python thread. See the full environment variable table in
 [README.md](README.md) and the illustrative report at
 [`docs/sample-autonomous-daily-run-report.json`](docs/sample-autonomous-daily-run-report.json).
 
-Current scope is intentionally narrow: one sequential roadmap item per run, one shared
-filesystem rather than distributed locking, and no claim that live Telegram/OpenAI/
-Railway/Docker integrations are verified until credentialed smoke tests are run.
+Current scope is intentionally narrow: one roadmap item at a time and at most ten per
+session, one shared filesystem rather than distributed locking, and no claim that a new
+credentialed Telegram/OpenAI/Railway path works until its controlled smoke test is run.
 
 Live reports attribute the nested worker/reviewer models and costs by project, task,
 agent, and model. Their task-level `model_reason` values remain in `company_state.json`;

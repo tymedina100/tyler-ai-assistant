@@ -52,6 +52,15 @@ def import_group_bot_with_stub_main():
         set_conversation=Mock(),
         set_reply_context=Mock(),
     )
+    fake_main.get_pending_action = lambda: fake_main.pending_actions.get("group")
+    fake_main.set_pending_action = lambda action: fake_main.pending_actions.__setitem__(
+        "group", action
+    )
+    fake_main.clear_pending_action = lambda: fake_main.pending_actions.pop("group", None)
+    fake_main.describe_pending_action = lambda pending: str(
+        pending.get("type") or "staged action"
+    )
+    fake_main.confirm_pending_action = Mock(return_value="confirmed")
     fake_dotenv = types.SimpleNamespace(load_dotenv=lambda: None)
     sys.modules.pop("group_bot", None)
     with patch.dict(
@@ -71,6 +80,11 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def tearDownClass(cls):
         sys.modules.pop("group_bot", None)
+
+    def setUp(self):
+        self.fake_main.pending_actions.clear()
+        self.group.autonomy_runner_task = None
+        self.group.company_runner_task = None
 
     async def test_live_autorun_requires_enabled_and_non_dry_configuration(self):
         update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
@@ -200,6 +214,265 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             "persistent state could not be updated safely",
             update.message.reply_text.await_args.args[0],
         )
+
+    async def test_autorun_promote_stages_owner_confirmation_without_mutating_state(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        preview = {
+            "idea_id": "idea-1",
+            "idea": "Add a concise run summary",
+            "problem_addressed": "Outcomes are hard to scan.",
+            "expected_value": "Faster owner triage.",
+            "project_id": "assistant",
+            "project_name": "Tyler AI Assistant",
+            "goal_id": "assistant-autonomy",
+            "roadmap_item_id": "AUTO-IDEA-1",
+            "title": "Add a concise run summary",
+            "status": "ready",
+            "authorization_level": "propose",
+            "acceptance_criteria": ["Draft three examples.", "Record a recommendation."],
+            "estimated_ai_cost_usd": 0.01,
+            "proposal_revision": "revision-1",
+        }
+        workflow = types.SimpleNamespace(
+            preview_idea_promotion=Mock(return_value=(True, preview)),
+            promote_idea=Mock(),
+        )
+        with patch.object(self.group, "autonomy_runner_task", None), patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(
+            self.group, "_run_autonomy_session", new=AsyncMock()
+        ) as run, patch.object(
+            self.group, "reply_chunks", new=AsyncMock()
+        ) as reply:
+            await self.group.handle_autorun_command(
+                update, "/autorun promote idea-1", allow_live=True
+            )
+
+        workflow.preview_idea_promotion.assert_called_once_with("idea-1", None)
+        workflow.promote_idea.assert_not_called()
+        run.assert_not_awaited()
+        pending = self.fake_main.pending_actions["group"]
+        self.assertEqual(pending["type"], "autonomy_idea_promotion")
+        self.assertEqual(pending["idea_id"], "idea-1")
+        self.assertEqual(pending["expected_revision"], "revision-1")
+        self.assertEqual(pending["expected_goal_id"], "assistant-autonomy")
+        self.assertEqual(pending["requested_by_user_id"], 42)
+        rendered = reply.await_args.args[1]
+        self.assertIn("AUTO-IDEA-1", rendered)
+        self.assertIn("Acceptance criteria", rendered)
+        self.assertIn("Reply /confirm", rendered)
+        self.assertIn("no model was invoked", rendered.lower())
+
+    async def test_autorun_promote_requires_id_group_and_idle_runner(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        workflow = types.SimpleNamespace(preview_idea_promotion=Mock())
+
+        await self.group.handle_autorun_command(
+            update, "/autorun promote", allow_live=True
+        )
+        self.assertIn("Usage", update.message.reply_text.await_args.args[0])
+
+        update.message.reply_text.reset_mock()
+        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            await self.group.handle_autorun_command(
+                update, "/autorun promote idea-1", allow_live=False
+            )
+        self.assertIn("group operating room", update.message.reply_text.await_args.args[0])
+        workflow.preview_idea_promotion.assert_not_called()
+
+        update.message.reply_text.reset_mock()
+        active = types.SimpleNamespace(done=lambda: False)
+        with patch.object(self.group, "autonomy_runner_task", active), patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ):
+            await self.group.handle_autorun_command(
+                update, "/autorun promote idea-1", allow_live=True
+            )
+        self.assertIn("already active", update.message.reply_text.await_args.args[0])
+        workflow.preview_idea_promotion.assert_not_called()
+
+        update.message.reply_text.reset_mock()
+        with patch.object(self.group, "autonomy_runner_task", None), patch.object(
+            self.group, "company_runner_task", active
+        ), patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            await self.group.handle_autorun_command(
+                update, "/autorun promote idea-1", allow_live=True
+            )
+        self.assertIn("Company Mode is already running", update.message.reply_text.await_args.args[0])
+        workflow.preview_idea_promotion.assert_not_called()
+
+    async def test_autorun_promote_rejects_ambiguous_preview_without_staging(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        workflow = types.SimpleNamespace(
+            preview_idea_promotion=Mock(return_value=(
+                False,
+                "Several active projects could receive this idea.",
+            ))
+        )
+        with patch.object(self.group, "autonomy_runner_task", None), patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ):
+            await self.group.handle_autorun_command(
+                update, "/autorun promote idea-1", allow_live=True
+            )
+
+        self.assertNotIn("group", self.fake_main.pending_actions)
+        self.assertIn("Several active projects", update.message.reply_text.await_args.args[0])
+
+    async def test_confirmed_idea_promotion_queues_once_and_clears_approval(self):
+        pending = {
+            "type": "autonomy_idea_promotion",
+            "idea_id": "idea-1",
+            "project_id": "assistant",
+            "expected_revision": "revision-1",
+            "expected_roadmap_item_id": "AUTO-IDEA-1",
+            "expected_goal_id": "assistant-autonomy",
+            "requested_by_user_id": 42,
+        }
+        self.fake_main.pending_actions["group"] = pending
+        workflow = types.SimpleNamespace(
+            promote_idea=Mock(return_value=(
+                True,
+                "Promoted idea to ready roadmap work. No autonomous run was started.",
+            ))
+        )
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(self.group, "reply_chunks", new=AsyncMock()) as reply:
+            handled = await self.group._handle_pending_confirmation(
+                update, "/confirm@TyManagerBot"
+            )
+
+        self.assertTrue(handled)
+        workflow.promote_idea.assert_called_once_with(
+            "idea-1",
+            project_id="assistant",
+            expected_revision="revision-1",
+            expected_roadmap_item_id="AUTO-IDEA-1",
+            expected_goal_id="assistant-autonomy",
+            approval_source="telegram_owner:42",
+        )
+        self.assertNotIn("group", self.fake_main.pending_actions)
+        self.assertIn("ready roadmap", reply.await_args.args[1])
+
+    async def test_failed_promotion_confirmation_retains_approval_and_cancel_is_safe(self):
+        pending = {
+            "type": "autonomy_idea_promotion",
+            "idea_id": "idea-1",
+            "project_id": "assistant",
+            "expected_revision": "revision-1",
+            "expected_roadmap_item_id": "AUTO-IDEA-1",
+            "requested_by_user_id": 42,
+        }
+        self.fake_main.pending_actions["group"] = pending
+        workflow = types.SimpleNamespace(
+            promote_idea=Mock(return_value=(False, "Another autonomous run holds the lock."))
+        )
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(self.group, "reply_chunks", new=AsyncMock()) as reply:
+            await self.group._handle_pending_confirmation(update, "/confirm")
+        self.assertIn("group", self.fake_main.pending_actions)
+        self.assertIn("approval remains staged", reply.await_args.args[1])
+
+        update.message.reply_text.reset_mock()
+        await self.group._handle_pending_confirmation(update, "/autorun status")
+        self.assertIn("group", self.fake_main.pending_actions)
+        self.assertIn("still staged", update.message.reply_text.await_args.args[0])
+        self.assertEqual(workflow.promote_idea.call_count, 1)
+
+        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            await self.group._handle_pending_confirmation(update, "/cancel")
+        self.assertNotIn("group", self.fake_main.pending_actions)
+        self.assertIn("remains proposed", update.message.reply_text.await_args.args[0])
+        self.assertEqual(workflow.promote_idea.call_count, 1)
+
+    async def test_promotion_persistence_exception_retains_staged_approval(self):
+        self.fake_main.pending_actions["group"] = {
+            "type": "autonomy_idea_promotion",
+            "idea_id": "idea-1",
+            "project_id": "assistant",
+            "expected_revision": "revision-1",
+            "expected_roadmap_item_id": "AUTO-IDEA-1",
+            "requested_by_user_id": 42,
+        }
+        workflow = types.SimpleNamespace(
+            promote_idea=Mock(side_effect=OSError("simulated persistent write failure"))
+        )
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            await self.group._handle_pending_confirmation(update, "/confirm")
+
+        self.assertIn("group", self.fake_main.pending_actions)
+        self.assertIn("not persisted safely", update.message.reply_text.await_args.args[0])
+        self.assertNotIn("simulated", update.message.reply_text.await_args.args[0])
+
+    async def test_wrong_user_cannot_confirm_staged_idea_promotion(self):
+        self.fake_main.pending_actions["group"] = {
+            "type": "autonomy_idea_promotion",
+            "idea_id": "idea-1",
+            "project_id": "assistant",
+            "expected_revision": "revision-1",
+            "expected_roadmap_item_id": "AUTO-IDEA-1",
+            "requested_by_user_id": 42,
+        }
+        workflow = types.SimpleNamespace(promote_idea=Mock())
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=99),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+            await self.group._handle_pending_confirmation(update, "/confirm")
+
+        workflow.promote_idea.assert_not_called()
+        self.assertIn("group", self.fake_main.pending_actions)
+        self.assertIn("Only the owner", update.message.reply_text.await_args.args[0])
+
+    async def test_autonomy_status_lists_stable_proposed_idea_ids(self):
+        workflow = types.SimpleNamespace(
+            load_state=Mock(return_value={
+                "run_control": {"recent_runs": []},
+                "idea_backlog": [
+                    {"id": "idea-1", "idea": "First proposal", "status": "proposed"},
+                    {"id": "idea-2", "idea": "Already queued", "status": "promoted"},
+                ],
+            }),
+            select_actionable_item=Mock(return_value=None),
+        )
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(self.group, "_company_budget_snapshot", return_value={
+            "spent_today_usd": 0.01,
+            "reserved_today_usd": 0.0,
+            "remaining_usd": 4.74,
+            "daily_budget_usd": 5.0,
+        }):
+            status = self.group._autonomy_status_text()
+
+        self.assertIn("Proposed idea backlog: 1", status)
+        self.assertIn("idea-1: First proposal", status)
+        self.assertNotIn("idea-2: Already queued", status)
+        self.assertIn("/autorun promote <idea-id>", status)
 
     async def test_runtime_deferral_protects_supervised_work_and_pending_confirmation(self):
         active_runner = types.SimpleNamespace(done=lambda: False)

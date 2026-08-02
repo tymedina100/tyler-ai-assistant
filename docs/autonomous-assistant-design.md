@@ -39,7 +39,8 @@ Prices are configuration snapshots used for estimates and reconciliation. They m
 
 - project goals and status;
 - roadmap items with priority, status, dependencies, blockers, acceptance criteria, preferred agent, task type, complexity/risk, authorization level, attempt history, previous models, and human decision required;
-- a capped, deduplicated idea backlog;
+- a capped, deduplicated idea backlog with stable IDs, proposal status, source-run
+  provenance, and optional owner-approved roadmap links;
 - scheduled-run idempotency metadata.
 
 The workflow writes one structured JSON report per run under `DATA_DIR/autonomous_runs/`. Reports include the requested run, plan, routing, usage, review, retry, blocker, escalation, artifact, file/test, and final-status fields.
@@ -72,7 +73,7 @@ Only `observe` and `propose` auto-execute in this slice. The existing `run_pytho
 11. Vera evaluates mandatory explicit acceptance criteria. Repeated substantially identical feedback, repeated technical failure, unavailable tools, missing access, budget exhaustion, or the configured attempt limit produces a terminal `needs_human` state for that item.
 12. The coordinator reconciles reservations, updates the roadmap item from the Company Mode result, and persists the worker result separately from reviewer feedback. A task-local blocker is escalated but does not prevent the session from selecting unrelated actionable work.
 13. Before another item starts, the coordinator refreshes the ledger and checks the ten-item, 120-minute, one-attempt-per-item, and ordinary-budget ceilings. It stops when no useful complete worker/reviewer unit remains affordable; it does not create work merely to consume budget.
-14. After roadmap work is exhausted, Lumen may run one controlled batch containing at most the configured number of deduplicated ideas. Ideas remain `proposed` backlog records and are never executed automatically.
+14. After roadmap work is exhausted, Lumen may run one controlled batch containing at most the configured number of deduplicated ideas. Ideas remain `proposed` backlog records and are never executed automatically. The owner may stage `/autorun promote <idea-id>`; the read-only preview deterministically creates explicit acceptance criteria and requires `/confirm`. Confirmation revalidates the full proposal and destination under the run/state locks, then atomically creates one `ready`, `propose` roadmap item and records bidirectional provenance. It never starts execution in the promotion turn.
 15. The coordinator releases the lock, sends completed deliverables through the existing chunked Telegram transport, and sends one aggregate summary covering every selected task, route, attempt, cost, result, blocker, escalation, and proposed idea.
 
 ## Budget design
@@ -119,7 +120,7 @@ Development defaults:
 - at most ten distinct roadmap items and 120 minutes per session;
 - one Lumen batch containing at most three proposed ideas after roadmap exhaustion.
 
-The Telegram command `/autorun dry-run` is always safe: it performs one no-spend planning pass and does not enter the live continuation loop. A local CLI command provides the same selection/report path without importing Telegram or invoking paid APIs. `/autorun live` is group-only and starts one bounded session under the same lock and limits as the scheduler.
+The Telegram command `/autorun dry-run` is always safe: it performs one no-spend planning pass and does not enter the live continuation loop. A local CLI command provides the same selection/report path without importing Telegram or invoking paid APIs. `/autorun live` is group-only and starts one bounded session under the same lock and limits as the scheduler. `/autorun status` exposes bounded, stable proposal IDs. `/autorun promote <idea-id> [project-id]` is also group-only; it stages a per-chat owner confirmation without a model call or state mutation, and `/confirm` queues the validation task without starting a run.
 
 ## Safety boundaries
 
@@ -128,6 +129,7 @@ The Telegram command `/autorun dry-run` is always safe: it performs one no-spend
 - Autonomous/Company persistence and autonomous outbound text apply key/value and embedded-value redaction. Secret references may appear in blockers, but secret values must never be placed in roadmap state.
 - The run lock prevents overlap across threads/processes on one shared volume. Multi-region distributed execution is out of scope.
 - Corrupt state is quarantined and causes a conservative blocked run; it never silently grants a fresh budget.
+- Idea promotion is fail-closed: an unknown/duplicate/changed proposal, ambiguous or inactive project, active run, roadmap-ID collision, or failed atomic write creates no roadmap work. A successful repeat confirmation is an idempotent no-op.
 
 ## Implementation footprint
 
@@ -135,7 +137,7 @@ The Telegram command `/autorun dry-run` is always safe: it performs one no-spend
 - New: `config/model-catalog.json`, `config/autonomous-roadmap.json`.
 - Update: `company_mode.py` for atomic state/budget operations and attempt/usage metadata.
 - Update: `main.py` for catalog-backed pricing, usage records, model overrides, and controlled idea generation.
-- Update: `group_bot.py` for `/autorun`, weekday scheduling, roadmap execution, and summaries.
+- Update: `group_bot.py` for `/autorun`, weekday scheduling, owner-confirmed idea promotion, roadmap execution, and summaries.
 - Update: `projects.py` for consistent persistent-path resolution.
 - Update: Docker copy lists, `.env.example`, `README.md`, and setup/workflow documentation.
 - New/updated tests, including `tests/test_group_autonomy.py`, for scheduling, overlap, selection, routing, budget concurrency/reconciliation, review limits, escalation, Telegram delivery, redaction, reporting, and dry-run safety.
@@ -149,7 +151,9 @@ The Telegram command `/autorun dry-run` is always safe: it performs one no-spend
 - Pending Telegram confirmations are still process-memory state.
 - `/autorun retry <item-id>` deliberately resets one `needs_human` or `blocked` item after
   the owner resolves its stated problem. It preserves attempt history and never starts a
-  model call. Skip, accept-as-is, criteria editing, and automatic rescoping remain deferred.
+  model call. `/autorun promote <idea-id> [project-id]` now provides the explicit
+  proposal-to-roadmap bridge; skip, accept-as-is, criteria editing, and automatic
+  rescoping remain deferred.
 - Recent-run state stores outcome metadata and per-item attempts, not full prior-run narrative content or milestones.
 - The task time ceiling is a monitored stop/no-retry boundary, not a kill signal for Python threads; the runner waits for completion to preserve accounting.
 - Automatic local modification is disabled until work can run in a killable, isolated checkout without remote side effects.

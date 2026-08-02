@@ -524,8 +524,9 @@ The autonomous layer extends the current system rather than replacing it:
    items have been selected, or 120 minutes have elapsed. Available budget is a ceiling,
    not a target to burn.
 7. Only after roadmap work is exhausted may Lumen produce one controlled batch of up to
-   three deduplicated ideas. Each enters the backlog as `proposed`; none is automatically
-   promoted, assigned, or built.
+   three deduplicated ideas. Each enters the backlog with a stable ID and `proposed`
+   status. Nothing is automatically promoted, assigned, or built; the owner may stage one
+   with `/autorun promote <idea-id>` and explicitly approve it with `/confirm`.
 8. The coordinator writes one aggregate JSON report and Telegram summary covering every
    selected task, model decision, attempt, token/cost record, result, blocker, and idea.
 
@@ -562,6 +563,29 @@ trigger a dry-run. Both commands also work in a Miles DM:
 /autorun status
 /autorun dry-run
 ```
+
+`/autorun status` includes the stable IDs of up to five current proposals. Future Lumen
+idea-plan and aggregate messages include the same IDs. To convert one proposal into a
+bounded validation task, stage it from the **group operating room**:
+
+```text
+/autorun promote idea_ab12cd34ef
+```
+
+If several active projects exist, specify the reviewed target explicitly:
+
+```text
+/autorun promote idea_ab12cd34ef assistant
+```
+
+Miles previews the destination, deterministic acceptance criteria, `ready` status,
+proposal-only authorization, and estimated AI cost. This preview changes no state,
+starts no run, and invokes no model. Reply `/confirm` in the same group to atomically
+queue the task, or `/cancel` to leave the idea proposed. Confirmation re-reads the
+persistent proposal under the autonomous run/state locks; a changed proposal, active
+run, ambiguous destination, or persistence failure stops without creating duplicate
+work. After confirmation, use `/autorun dry-run` to inspect selection before starting
+live work.
 
 When a run reaches `needs_human` or `blocked`, resolve the stated access problem or
 owner decision first. Then reset exactly that roadmap item from the **group operating
@@ -677,7 +701,10 @@ references to credentials/access requirements, never the secret values themselve
 
 Use `DATA_DIR` as the common persistent root. Autonomous state is stored in
 `autonomy_state.json`; reports are stored in `autonomous_runs/<run-id>.json`; the idea
-backlog and scheduled-date idempotency records live inside the state file. The persistent
+backlog and scheduled-date idempotency records live inside the state file. Idea records
+retain their stable ID, source run, status, fingerprint, and—after explicit promotion—the
+linked project/goal/roadmap item and approval source. The promoted roadmap item retains
+the source idea ID and proposal revision. The persistent
 run lock prevents overlap for processes sharing that filesystem. A report records plan,
 tasks, agents, model decisions, tokens, estimated/actual-or-reconciled cost, review,
 retries, blockers, escalations, changed files, tests, artifacts, and final status. See
@@ -710,8 +737,8 @@ confirmations remain process-memory state; exact provider billing is unavailable
 response lacks usage and is then conservatively charged at the held estimate; the task
 time ceiling prevents another attempt but cannot preempt a Python thread, so the runner
 waits for it to finish and reconcile; modify-local automation awaits an isolated executor;
-owner resolution currently supports explicit `/autorun retry <item-id>`, but not skip,
-accept-as-is, acceptance-criteria editing, or automatic rescoping;
+owner resolution supports explicit `/autorun retry <item-id>` plus owner-confirmed idea
+promotion, but not skip, accept-as-is, acceptance-criteria editing, or automatic rescoping;
 model prices/availability are configuration snapshots; and live Telegram, OpenAI,
 Railway-volume, Docker, and external-connector behavior still require credentialed smoke
 tests.
