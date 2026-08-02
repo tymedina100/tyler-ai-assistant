@@ -80,5 +80,5 @@
   "stale_recoveries": [],
   "errors": [],
   "report_path": "C:\\example\\ai-assistant-data\\autonomous_runs\\run_20260727T150000_example1.json",
-  "telegram_summary": "Autonomous run: dry_run\nPlanned: Validate the autonomous daily-run configuration\nCompleted: None\nChanged: None\nDeferred: None\nBlocked: None\nBudget: $0.0000 used of $5.00; $4.7500 remaining\nYour action: None"
+  "telegram_summary": "Autonomous run: dry_run\ntrigger=manual | final=dry_run | human_review=no\nPlanned: Validate the autonomous daily-run configuration\nCompleted: None\nChanged: None\nIdeas: None\nDeferred: None\nBlocked: None\nBudget: $0.0000 used of $5.00; $4.7500 remaining\nYour action: None"
 }

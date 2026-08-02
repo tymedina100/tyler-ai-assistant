@@ -750,6 +750,71 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(autonomy.format_telegram_deliverable(report), "")
         self.assertEqual(workflow.load_state()["projects"][0]["roadmap_items"][0]["status"], "ready")
 
+    def test_telegram_summary_includes_at_a_glance_after_heading(self):
+        workflow = self.workflow([item()])
+
+        report = workflow.run(trigger_source="telegram", dry_run=True)
+
+        self.assertEqual(
+            report["telegram_summary"].splitlines()[:2],
+            [
+                "Autonomous run: dry_run",
+                "trigger=telegram | final=dry_run | human_review=no",
+            ],
+        )
+
+    def test_telegram_summary_flags_only_owner_attention_as_human_review(self):
+        base_report = {
+            "trigger_source": "scheduled",
+            "status": "completed",
+            "final_status": "completed",
+            "tasks_selected": [],
+            "human_actions": [],
+            "escalations": [],
+            "blockers": [],
+        }
+        action_summary = autonomy.format_telegram_summary({
+            **base_report,
+            "human_actions": ["Approve the production change."],
+        })
+        escalation_summary = autonomy.format_telegram_summary({
+            **base_report,
+            "escalations": ["OWNER ACTION NEEDED"],
+        })
+        terminal_summary = autonomy.format_telegram_summary({
+            **base_report,
+            "status": "blocked",
+            "final_status": "needs_human",
+        })
+        informational_blocker = autonomy.format_telegram_summary({
+            **base_report,
+            "blockers": ["Creative generation was unavailable."],
+        })
+
+        expected = "trigger=scheduled | final=completed | human_review=yes"
+        self.assertEqual(action_summary.splitlines()[1], expected)
+        self.assertEqual(escalation_summary.splitlines()[1], expected)
+        self.assertEqual(
+            terminal_summary.splitlines()[1],
+            "trigger=scheduled | final=needs_human | human_review=yes",
+        )
+        self.assertEqual(
+            informational_blocker.splitlines()[1],
+            "trigger=scheduled | final=completed | human_review=no",
+        )
+
+    def test_dry_run_at_a_glance_surfaces_discovered_owner_action(self):
+        workflow = self.workflow([item(acceptance_criteria=[])])
+
+        report = workflow.run(trigger_source="manual", dry_run=True)
+
+        self.assertEqual(report["final_status"], "dry_run")
+        self.assertTrue(report["human_actions"])
+        self.assertEqual(
+            report["telegram_summary"].splitlines()[1],
+            "trigger=manual | final=dry_run | human_review=yes",
+        )
+
     def test_execution_receives_bounded_redacted_recent_run_evidence(self):
         captured = {}
 
@@ -1103,6 +1168,10 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertIn("[preview truncated]", report["telegram_summary"])
         self.assertIn("Budget:", report["telegram_summary"])
         self.assertIn("Your action:", report["telegram_summary"])
+        self.assertEqual(
+            report["telegram_summary"].splitlines()[1],
+            "trigger=manual | final=completed | human_review=no",
+        )
         self.assertLessEqual(len(report["telegram_summary"]), autonomy.TELEGRAM_MESSAGE_LIMIT)
         deliverable = autonomy.format_telegram_deliverable(report)
         self.assertIn("Autonomous deliverable", deliverable)
