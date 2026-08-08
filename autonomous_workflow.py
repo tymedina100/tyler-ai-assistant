@@ -34,12 +34,14 @@ DEFAULT_ROADMAP_PACK_DIR = BASE_DIR / "config" / "autonomous-projects"
 STATE_VERSION = 1
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_RESULT_PREVIEW_CHARS = 360
+TELEGRAM_CHAT_RECAP_LIMIT = 1600
+TELEGRAM_CHAT_TRANSITION_LIMIT = 900
 RECENT_RUN_EVIDENCE_LIMIT = 5
 RECENT_RUN_EVIDENCE_TEXT_CHARS = 180
 RECENT_RUN_REPORT_MAX_BYTES = 256 * 1024
 TERMINAL_TASK_STATUSES = {"complete", "completed", "done", "approved", "shipped"}
 ACTIONABLE_TASK_STATUSES = {"planned", "ready", "pending", "todo", "deferred", "retry"}
-RETRYABLE_HUMAN_STATUSES = {"blocked", "needs_human"}
+RETRYABLE_ITEM_STATUSES = {"blocked", "needs_human", "deferred"}
 RETRY_BLOCKED_PROJECT_STATUSES = {
     "paused",
     "archived",
@@ -1702,7 +1704,7 @@ class AutonomyStateStore:
             return deepcopy(roadmap_item), deepcopy(project), False
 
     def _reset_item_for_retry(self, item_id: str, *, reset_at: datetime) -> str:
-        """Atomically reset one unambiguous human-blocked item to ``ready``.
+        """Atomically reset one unambiguous owner-retryable item to ``ready``.
 
         The workflow-level caller also holds the autonomous run lock.  Checking the
         persisted run claim here closes the crash/restart gap without weakening the
@@ -1739,10 +1741,10 @@ class AutonomyStateStore:
 
             project, roadmap_item = matches[0]
             previous_status = str(roadmap_item.get("status") or "planned").strip().lower()
-            if previous_status not in RETRYABLE_HUMAN_STATUSES:
+            if previous_status not in RETRYABLE_ITEM_STATUSES:
                 raise RoadmapItemRetryError(
-                    f"Roadmap item {target_id!r} is {previous_status!r}; only 'needs_human' "
-                    "or 'blocked' items can be reset to 'ready'."
+                    f"Roadmap item {target_id!r} is {previous_status!r}; only 'needs_human', "
+                    "'blocked', or 'deferred' items can be reset to 'ready'."
                 )
             project_status = str(project.get("status") or "active").strip().lower()
             if project_status in RETRY_BLOCKED_PROJECT_STATUSES:
@@ -1961,20 +1963,35 @@ def format_escalation(
     action_required: str,
     other_work_can_continue: bool = True,
 ) -> str:
-    """Build a concise, actionable Telegram escalation."""
+    """Build one conversational, actionable Telegram escalation."""
 
     project_name = project if isinstance(project, str) else project.get("name") or project.get("title") or project.get("id")
-    task_name = task if isinstance(task, str) else task.get("title") or task.get("id")
-    message = (
-        "OWNER ACTION NEEDED\n"
-        f"Project: {project_name or 'Unknown'}\n"
-        f"Task: {task_name or 'Unknown'}\n"
-        f"Attempted: {attempted or 'No execution started.'}\n"
-        f"Blocked by: {category or 'unknown'} - {reason}\n"
-        f"Action: {action_required or 'Review the task and provide direction.'}\n"
-        f"Other work: {'can continue' if other_work_can_continue else 'is also blocked'}"
+    project_name = _chat_excerpt(project_name or "this project", 100)
+    task_name = _task_chat_reference(task)
+    attempted_text = _chat_sentence(_chat_excerpt(attempted or "No execution was started", 360))
+    reason_text = _chat_sentence(
+        _chat_excerpt(reason or str(category or "an unresolved issue").replace("_", " "), 220)
     )
-    return _redact_text(message)
+    category_text = _chat_excerpt(str(category or "").replace("_", " "), 80)
+    action_text = _chat_sentence(
+        _chat_excerpt(action_required or "Review the task and provide direction", 700)
+    )
+    continuation = (
+        "I stopped retries for this item, but unrelated work can continue."
+        if other_work_can_continue
+        else "I stopped here because the rest of this work is blocked too."
+    )
+    reason_section = (
+        (f"This is a {category_text} issue. " if category_text else "")
+        + f"We had to stop. {reason_text}"
+    )
+    return _compose_chat_sections(
+        [f"Tyler, I need your help with {task_name} in {project_name}."],
+        [f"We tried to move it forward. {attempted_text}"],
+        [continuation],
+        TELEGRAM_CHAT_RECAP_LIMIT,
+        suffix=[reason_section, f"Please do this next:\n{action_text}"],
+    )
 
 
 def _money(value: Any) -> float:
@@ -1993,21 +2010,284 @@ def _summary_human_review_needed(report: Mapping[str, Any]) -> bool:
     return bool(report.get("human_actions") or report.get("escalations"))
 
 
-def _summary_token(value: Any, default: str = "unknown") -> str:
-    """Render a bounded single-line token for the Telegram at-a-glance row."""
+def _chat_compact(value: Any) -> str:
+    """Return secret-redacted text suitable for a compact chat sentence."""
 
-    token = re.sub(r"[^a-z0-9_.-]+", "_", str(value or "").strip().lower()).strip("_")
-    return (token or default)[:40]
+    return re.sub(r"\s+", " ", _redact_text(str(value or "")).strip())
+
+
+def _chat_excerpt(value: Any, limit: int) -> str:
+    """Bound chat copy at a word boundary without changing the persisted value."""
+
+    text = _chat_compact(value)
+    if len(text) <= limit:
+        return text
+    marker = "..."
+    cut = text[: max(0, limit - len(marker))].rstrip()
+    boundary = cut.rfind(" ")
+    if boundary >= max(0, len(cut) - 60):
+        cut = cut[:boundary].rstrip()
+    return cut + marker
+
+
+def _bounded_chat_message(value: Any, limit: int) -> str:
+    """Bound display copy while preserving intentional chat paragraphs."""
+
+    text = _redact_text(str(value or "")).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) <= limit:
+        return text
+    marker = "\n\n...more details are saved in the run record."
+    cut = text[: max(0, limit - len(marker))].rstrip()
+    boundary = max(cut.rfind("\n"), cut.rfind(" "))
+    if boundary >= max(0, len(cut) - 80):
+        cut = cut[:boundary].rstrip()
+    return cut + marker
+
+
+def _compose_chat_sections(
+    priority: list[str],
+    optional: list[str],
+    footer: list[str],
+    limit: int,
+    *,
+    suffix: Optional[list[str]] = None,
+) -> str:
+    """Fit optional details without ever dropping the priority text or footer."""
+
+    chosen = list(priority)
+    trailing = list(suffix or [])
+    for section in optional:
+        candidate = "\n\n".join(chosen + [section] + trailing + footer)
+        if len(candidate) <= limit:
+            chosen.append(section)
+            continue
+        note = "More task details are saved in the run record."
+        if len("\n\n".join(chosen + [note] + trailing + footer)) <= limit:
+            chosen.append(note)
+        break
+    return _bounded_chat_message("\n\n".join(chosen + trailing + footer), limit)
+
+
+def _chat_sentence(value: Any) -> str:
+    text = _chat_compact(value).strip()
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
+
+
+def _lower_sentence_start(value: str) -> str:
+    if not value:
+        return value
+    if value.startswith("I ") or (len(value) > 1 and value[:2].isupper()):
+        return value
+    return value[:1].lower() + value[1:]
+
+
+def _upper_sentence_start(value: str) -> str:
+    """Capitalize ordinary prose without changing a leading path or identifier."""
+
+    if not value or not value[:1].islower():
+        return value
+    first_token = value.split(maxsplit=1)[0]
+    if any(marker in first_token for marker in ("/", "\\", "_", "=", ".")):
+        return value
+    return value[:1].upper() + value[1:]
+
+
+def _task_chat_reference(task: Mapping[str, Any] | str) -> str:
+    """Render a stable task reference without form-style field labels."""
+
+    if isinstance(task, str):
+        return f'"{_chat_excerpt(task, 120) or "the task"}"'
+    task_id = _chat_excerpt(task.get("id"), 80)
+    title = _chat_excerpt(task.get("title"), 120)
+    if task_id and title and task_id.lower() not in title.lower():
+        return f'"{task_id} - {title}"'
+    return f'"{title or task_id or "the task"}"'
+
+
+def _list_chat_items(values: list[Any], *, limit: int = 3) -> list[str]:
+    rendered = [_chat_excerpt(value, 180) for value in values if _chat_compact(value)]
+    visible = rendered[:limit]
+    if len(rendered) > limit:
+        visible.append(f"...and {len(rendered) - limit} more in the run record")
+    return visible
+
+
+def _chat_protocol_detail(value: Any, limit: int = 480) -> str:
+    """Remove internal response markers without changing identifiers or commands."""
+
+    text = _redact_text(str(value or "")).strip()
+    text = re.sub(
+        r"^\s*(?:FINAL\s+ANSWER\s*)?(?:APPROVED|REVISIONS\s+REQUIRED|BLOCKED\s*-\s*NEEDS\s+HUMAN\s+REVIEW)\s*(?:[-:\u2014]\s*)?",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"^\s*FINAL\s+ANSWER\s*[:\u2014-]?\s*", "", text, count=1, flags=re.IGNORECASE)
+    text = re.sub(r"\bRESULT\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\bFILES_CHANGED\s*:\s*(?:none|n/?a)\b[.;]?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"^\s*(MISSING_ACCESS|PERMISSION_DENIED|UNAVAILABLE_TOOL|DECISION_REQUIRED)\s*[:\u2014-]?\s*",
+        lambda match: match.group(1).replace("_", " ").capitalize() + ". ",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return _chat_excerpt(text, limit)
+
+
+def _review_chat_detail(value: Any, limit: int = 420) -> str:
+    """Remove reviewer protocol markers from the human-facing chat projection."""
+
+    text = _chat_protocol_detail(value, limit)
+    text = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", text, count=1)
+    return _chat_excerpt(_upper_sentence_start(text), limit)
+
+
+def _result_chat_takeaway(value: Any) -> str:
+    """Show short natural outcomes, never a long report or internal instruction."""
+
+    raw = _redact_text(str(value or "")).strip()
+    compact = _chat_compact(raw)
+    forbidden = (
+        "AUTONOMY_HELP_REQUEST",
+        "Acceptance criteria:",
+        "Allowlisted runtime autonomy configuration",
+        "OWNER ACTION NEEDED",
+    )
+    if (
+        not compact
+        or len(compact) > TELEGRAM_RESULT_PREVIEW_CHARS
+        or raw.count("\n") > 3
+        or any(marker.lower() in compact.lower() for marker in forbidden)
+    ):
+        return ""
+    return _chat_protocol_detail(compact, TELEGRAM_RESULT_PREVIEW_CHARS)
+
+
+def format_team_chat_message(kind: str, **fields: Any) -> str:
+    """Project one real team transition into natural Telegram conversation.
+
+    Model instructions stay internal; results, model reasons, and accounting remain in
+    task/run state.
+    This deterministic formatter never invokes a model.
+    """
+
+    message_kind = str(kind or "").strip().lower()
+    recipient = _chat_excerpt(fields.get("recipient"), 60)
+    task_ref = _task_chat_reference(fields.get("task") or "the task")
+    model = _chat_excerpt(fields.get("model"), 80)
+    failure = _chat_excerpt(fields.get("failure"), 80).replace("_", " ")
+    detail = _chat_protocol_detail(fields.get("detail"), 480)
+    review_detail = _review_chat_detail(fields.get("detail"), 480)
+
+    if message_kind == "assignment":
+        text = f"{recipient or 'Team'}, please take {task_ref}."
+        if model:
+            text += f"\n\nI'm using {model} for this pass."
+        text += " Send Vera the evidence when it's ready."
+    elif message_kind == "review_assignment":
+        text = f"{recipient or 'Vera'}, please review the completed work against its acceptance criteria."
+        if model:
+            text += f"\n\nI'm using {model} for this review pass."
+        text += " Let me know whether it is approved, needs one revision, or needs Tyler."
+    elif message_kind == "retry":
+        text = (
+            f"{recipient or 'Team'}, the last pass hit {failure or 'a technical issue'}. "
+            f"Please try {task_ref} once more"
+        )
+        if model:
+            text += f" with {model}"
+        text += ". This is still inside the bounded retry limit."
+    elif message_kind == "help_request":
+        question = _chat_excerpt(fields.get("question"), 300)
+        reason = _chat_excerpt(fields.get("reason"), 220)
+        text = f"{recipient or 'Team'}, can you help me with one part of {task_ref}? {question}"
+        if reason:
+            text += (
+                f" {reason}"
+                if reason.startswith("I ")
+                else f" I need the check because {_lower_sentence_start(reason)}"
+            )
+    elif message_kind == "help_route":
+        requester = _chat_excerpt(fields.get("requester"), 60)
+        text = f"{recipient or 'Team'}, please take that focused check for {requester or 'the team'}."
+        if model:
+            text += f" I'm using {model} for the assist."
+    elif message_kind == "help_response":
+        text = f"{recipient or 'Team'}, I checked it."
+        if detail:
+            text += f" {detail}"
+        if fields.get("detail_truncated"):
+            text += " I saved the full response with the task."
+    elif message_kind == "ready_for_review":
+        takeaway = _result_chat_takeaway(fields.get("detail"))
+        text = (
+            f"{recipient or 'Vera'}, I finished {task_ref} and saved the full result. "
+        )
+        if takeaway:
+            text += f"{takeaway} "
+        text += "It's ready for your acceptance-criteria review."
+    elif message_kind == "review_approved":
+        text = f"I checked {task_ref} against the acceptance criteria. Approved."
+        if review_detail:
+            text += f" {_chat_sentence(review_detail)}"
+        text += "\n\nMiles, you can mark it complete."
+    elif message_kind == "review_revision":
+        text = f"{recipient or 'Team'}, I need one change before I can approve {task_ref}."
+        if review_detail:
+            text += f" {_chat_sentence(review_detail)}"
+        text += " Send it back when it's ready."
+    elif message_kind == "review_blocked":
+        text = f"Miles, I can't approve {task_ref} yet."
+        if review_detail:
+            text += f" {_chat_sentence(review_detail)}"
+        text += " I've stopped the review loop so Tyler can resolve it."
+    elif message_kind == "worker_blocked":
+        text = f"Miles, I'm blocked on {task_ref}."
+        if detail:
+            text += f" {detail}"
+        text += " I've stopped retrying inside the current limits."
+    elif message_kind == "budget_stopped":
+        text = (
+            f"Miles, I stopped {task_ref} before another request could exceed its budget. "
+            "It can resume after the budget resets, and unrelated work can continue."
+        )
+    else:
+        raise ValueError(f"Unknown team chat message kind: {kind}")
+
+    max_chars = _safe_int(
+        fields.get("max_chars"),
+        TELEGRAM_CHAT_TRANSITION_LIMIT,
+        minimum=160,
+        maximum=TELEGRAM_MESSAGE_LIMIT,
+    )
+    return _bounded_chat_message(text, max_chars)
 
 
 def format_telegram_summary(report: Mapping[str, Any]) -> str:
-    """Format the required end-of-run fields without another model call."""
+    """Format one conversational Miles recap without another model call."""
 
     tasks = report.get("tasks_selected", []) or []
     completed = [task for task in tasks if str(task.get("status", "")).lower() in TERMINAL_TASK_STATUSES]
-    planned = ", ".join(str(task.get("title") or task.get("id")) for task in tasks) or "No roadmap task"
-    completed_text = ", ".join(str(task.get("title") or task.get("id")) for task in completed) or "None"
-    changed = list(report.get("files_changed", []) or []) + list(report.get("artifacts", []) or [])
+    changed = []
+    changed_keys = set()
+    for value in list(report.get("files_changed", []) or []) + list(report.get("artifacts", []) or []):
+        display = _chat_compact(value)
+        key = re.sub(r"^file:\s*", "", display, flags=re.IGNORECASE).lower()
+        if not display or key in changed_keys:
+            continue
+        changed_keys.add(key)
+        changed.append(display)
     idea_proposals = [
         idea for idea in (report.get("idea_proposals", []) or []) if isinstance(idea, Mapping)
     ]
@@ -2028,72 +2308,143 @@ def format_telegram_summary(report: Mapping[str, Any]) -> str:
     limit = _money(budget.get("daily_budget_usd", 0.0))
     remaining = _money(budget.get("remaining_usd", max(0.0, limit - used)))
     estimate_label = " (estimated where exact usage was unavailable)" if report.get("cost_is_estimated") else ""
-    report_label = "session" if report.get("session") else "run"
-    trigger = _summary_token(report.get("trigger_source"))
-    final_status = _summary_token(report.get("final_status") or report.get("status"))
-    human_review = "yes" if _summary_human_review_needed(report) else "no"
-    lines = [
-        f"Autonomous {report_label}: {report.get('final_status') or report.get('status') or 'unknown'}",
-        f"trigger={trigger} | final={final_status} | human_review={human_review}",
-        f"Planned: {planned}",
-        f"Completed: {completed_text}",
-        f"Changed: {', '.join(map(str, changed)) if changed else 'None'}",
-        f"Ideas: {', '.join(idea_titles) if idea_titles else 'None'}",
-        f"Deferred: {', '.join(map(str, deferred)) if deferred else 'None'}",
-        f"Blocked: {', '.join(map(str, blockers)) if blockers else 'None'}",
-        f"Budget: ${used:.4f} used of ${limit:.2f}; ${remaining:.4f} remaining{estimate_label}",
-        f"Your action: {'; '.join(map(str, actions)) if actions else 'None'}",
+    final_status = str(report.get("final_status") or report.get("status") or "unknown").lower()
+    human_review = _summary_human_review_needed(report)
+    dry_run = bool(report.get("dry_run")) or final_status == "dry_run"
+
+    if dry_run:
+        if tasks:
+            opening = f"Dry run complete. If this were live, I'd start with {_task_chat_reference(tasks[0])}."
+        else:
+            opening = "Dry run complete. There isn't a ready roadmap item to start."
+        opening += " Nothing was executed or changed."
+    elif final_status == "ideas_proposed":
+        opening = (
+            f"The roadmap is clear for now, so Lumen added {len(idea_titles)} "
+            f"idea{'s' if len(idea_titles) != 1 else ''} to the backlog. Nothing was started automatically."
+        )
+    elif human_review:
+        attention_count = max(
+            len(list(actions)),
+            len(list(report.get("escalations", []) or [])),
+            1,
+        )
+        item_label = "one item" if attention_count == 1 else f"{attention_count} items"
+        verb = "needs" if attention_count == 1 else "need"
+        loop_note = (
+            "I stopped its retry loop."
+            if attention_count == 1
+            else "I stopped their retry loops."
+        )
+        opening = f"I paused this session because {item_label} {verb} you. {loop_note}"
+    elif final_status in {"budget_deferred", "deferred"}:
+        opening = "I stopped this session before starting work that could not fit safely inside the current limits."
+    elif completed:
+        opening = (
+            f"We're done for this session. The team completed {len(completed)} of "
+            f"{len(tasks)} planned roadmap item{'s' if len(tasks) != 1 else ''}."
+        )
+    else:
+        opening = "We're done for this session. There wasn't any ready roadmap work to start."
+
+    trigger = str(report.get("trigger_source") or "").strip().lower()
+    trigger_text = {
+        "telegram": "You started this run from Telegram.",
+        "scheduled": "This was the scheduled run.",
+        "manual": "This was a manual run.",
+        "session_continuation": "This continued the same autonomous session.",
+    }.get(trigger, "")
+
+    priority_sections = [opening]
+    if trigger_text:
+        priority_sections.append(trigger_text)
+    if actions:
+        action_values = [_chat_compact(value) for value in list(actions) if _chat_compact(value)]
+        if len(action_values) == 1:
+            action_text = _chat_excerpt(action_values[0], 700)
+            priority_sections.append(f"Tyler, here's what I need from you next:\n{action_text}")
+        else:
+            visible_actions = [_chat_excerpt(value, 320) for value in action_values[:2]]
+            if len(action_values) > 2:
+                visible_actions.append(f"...and {len(action_values) - 2} more in the run record")
+            priority_sections.append(
+                "Tyler, here's what I need from you next:\n"
+                + "\n".join(f"- {value}" for value in visible_actions)
+            )
+    optional_sections = []
+    if completed:
+        completed_lines = "\n".join(f"- {_task_chat_reference(task).strip(chr(34))}" for task in completed[:4])
+        if len(completed) > 4:
+            completed_lines += f"\n- ...and {len(completed) - 4} more in the run record"
+        optional_sections.append(f"Completed:\n{completed_lines}")
+    if changed:
+        optional_sections.append("Changed:\n" + "\n".join(f"- {value}" for value in _list_chat_items(changed)))
+    if idea_titles and final_status != "ideas_proposed":
+        optional_sections.append("Ideas waiting in the backlog:\n" + "\n".join(f"- {value}" for value in _list_chat_items(idea_titles)))
+    if deferred:
+        optional_sections.append("Left for later:\n" + "\n".join(f"- {value}" for value in _list_chat_items(list(deferred))))
+    if blockers:
+        optional_sections.append("Still blocked:\n" + "\n".join(f"- {value}" for value in _list_chat_items(list(blockers))))
+    stop_reason = str(report.get("stop_reason") or "").strip().lower()
+    routine_stops = {
+        "",
+        "completed",
+        "dry_run_complete",
+        "ideas_proposed",
+        "needs_human",
+        "no_actionable_work",
+    }
+    if stop_reason not in routine_stops:
+        stop_explanations = {
+            "budget_floor": "the remaining ordinary budget could not cover another complete item",
+            "budget_date_changed": "the budget day changed while the session was running",
+            "max_tasks_reached": "the session reached its task limit",
+            "max_session_time_reached": "the session reached its time limit",
+            "overlap_prevented": "another run already held the execution lock",
+        }
+        optional_sections.append(
+            "I stopped before another item because "
+            + _chat_sentence(stop_explanations.get(stop_reason, stop_reason.replace("_", " ")))
+        )
+    footer_sections = [
+        f"Budget today: ${used:.4f} used of ${limit:.2f}; ${remaining:.4f} available after reserve{estimate_label}."
     ]
-    stop_reason = str(report.get("stop_reason") or "").strip()
-    if stop_reason:
-        lines.insert(-2, f"Stop: {stop_reason.replace('_', ' ')}")
-    result_text = _redact_text(str(report.get("result_text") or "")).strip()
-    if completed and result_text:
-        compact_result = re.sub(r"\s+", " ", result_text)
-        base_text = _redact_text("\n".join(lines))
-        available = max(0, TELEGRAM_MESSAGE_LIMIT - len(base_text) - len("\nResult: "))
-        preview_limit = min(TELEGRAM_RESULT_PREVIEW_CHARS, available)
-        if preview_limit > 0:
-            marker = " [preview truncated]"
-            if len(compact_result) > preview_limit:
-                if preview_limit <= len(marker):
-                    compact_result = marker[:preview_limit]
-                else:
-                    keep = preview_limit - len(marker)
-                    compact_result = compact_result[:keep].rstrip() + marker
-            lines.insert(3, f"Result: {compact_result}")
-    return _redact_text("\n".join(lines))[:TELEGRAM_MESSAGE_LIMIT]
+    if not actions and human_review:
+        footer_sections.append("Tyler, check the preceding blocker message for the exact action I need from you.")
+    elif not human_review:
+        footer_sections.append("Nothing needs your attention right now.")
+
+    return _compose_chat_sections(
+        priority_sections,
+        optional_sections,
+        footer_sections,
+        TELEGRAM_CHAT_RECAP_LIMIT,
+    )
 
 
 def format_telegram_idea_plan(report: Mapping[str, Any]) -> str:
-    """Render controlled Lumen proposals without another model call."""
+    """Render controlled Lumen proposals as a short teammate message."""
 
     proposals = [
         idea for idea in (report.get("idea_proposals", []) or []) if isinstance(idea, Mapping)
     ]
     if not proposals:
         return ""
-    lines = ["Lumen idea plan", "", "Proposed ideas:"]
-    for idea in proposals:
+    lines = [
+        f"I found {len(proposals)} idea{'s' if len(proposals) != 1 else ''} worth considering. "
+        "I only added them to the backlog; nothing was started.",
+        "",
+    ]
+    for index, idea in enumerate(proposals, 1):
         idea_id = str(idea.get("id") or "unknown-id").strip()
         title = re.sub(r"\s+", " ", str(idea.get("idea") or "Untitled idea")).strip()
         if len(title) > 120:
             title = title[:117].rstrip() + "..."
-        lines.append(f"- {idea_id}: {title}")
+        lines.append(f"{index}. {title} ({idea_id})")
     lines.extend([
         "",
-        "To queue one for owner approval: /autorun promote <idea-id>",
+        "If you want one moved onto the roadmap, send /autorun promote <idea-id>.",
     ])
-    for index, idea in enumerate(proposals, 1):
-        idea_id = str(idea.get("id") or "unknown-id").strip()
-        lines.extend([
-            "",
-            f"{index}. [{idea_id}] {idea.get('idea') or 'Untitled idea'}",
-            f"Problem: {idea.get('problem_addressed') or 'Not specified'}",
-            f"Expected value: {idea.get('expected_value') or 'Not specified'}",
-            f"Effort: {idea.get('estimated_effort') or 'unknown'}; estimated AI cost: ${_money(idea.get('estimated_ai_cost_usd')):.4f}",
-            f"Next validation: {idea.get('recommended_next_validation_step') or 'Owner review'}",
-        ])
     rendered = _redact_text("\n".join(lines))
     if len(rendered) <= TELEGRAM_MESSAGE_LIMIT:
         return rendered
@@ -2102,7 +2453,7 @@ def format_telegram_idea_plan(report: Mapping[str, Any]) -> str:
 
 
 def format_telegram_deliverable(report: Mapping[str, Any]) -> str:
-    """Format the substantive completed result for chunked Telegram delivery."""
+    """Format a concise completion update while retaining the full report on disk."""
 
     tasks = report.get("tasks_selected", []) or []
     completed = [task for task in tasks if str(task.get("status", "")).lower() in TERMINAL_TASK_STATUSES]
@@ -2110,16 +2461,34 @@ def format_telegram_deliverable(report: Mapping[str, Any]) -> str:
     if not completed or not result_text:
         return format_telegram_idea_plan(report)
     task = completed[0]
-    lines = [
-        "Autonomous deliverable",
-        f"Task: {task.get('title') or task.get('id') or 'Unknown'}",
-        f"Agent: {report.get('result_agent') or task.get('agent_owner') or 'unrecorded'}",
-        "",
-        result_text,
-    ]
-    if report.get("result_truncated"):
-        lines.extend(["", "Note: the captured agent result reached the configured storage limit."])
-    return _redact_text("\n".join(lines))
+    approved = any(
+        str(value or "").strip().upper().startswith("APPROVED")
+        for value in (report.get("review_outcomes", []) or [])
+    ) or str(report.get("review_outcome") or "").strip().lower() == "approved"
+    lines = [f"I finished {_task_chat_reference(task)}."]
+    if approved:
+        lines.append("Vera approved it against the acceptance criteria.")
+    changed = list(report.get("files_changed", []) or [])
+    if changed:
+        visible = _list_chat_items(changed, limit=2)
+        lines.append("I changed " + ", ".join(visible) + ".")
+    takeaway = _result_chat_takeaway(result_text)
+    if takeaway:
+        lines.append(takeaway)
+    storage_note = (
+        " The saved result reached its configured storage limit."
+        if report.get("result_truncated")
+        else ""
+    )
+    lines.append(
+        (
+            "I saved the captured result in the run record instead of pasting the report into the chat."
+            if report.get("result_truncated")
+            else "I saved the full result in the run record instead of pasting the report into the chat."
+        )
+        + storage_note
+    )
+    return _bounded_chat_message("\n\n".join(lines), TELEGRAM_CHAT_TRANSITION_LIMIT)
 
 
 format_daily_summary = format_telegram_summary
@@ -2507,7 +2876,7 @@ class AutonomousWorkflow:
         )
 
     def retry_item(self, item_id: str) -> tuple[bool, str]:
-        """Safely make one human-blocked item eligible for a future run.
+        """Safely make one owner-retryable item eligible for a future run.
 
         Expected owner-correctable rejections return ``(False, message)`` so a
         Telegram handler can display the message directly. Persistent-state I/O or
@@ -3060,6 +3429,7 @@ class AutonomousWorkflow:
                     - report["budget"]["spent_after_usd"],
                 )
         report["review_outcomes"] = list(result.get("review_outcomes", []) or [])
+        report["team_handoff_failed"] = bool(result.get("team_handoff_failed", False))
         if result.get("review_outcome"):
             report["review_outcomes"].append(result["review_outcome"])
         report["retry_count"] = _safe_int(result.get("retry_count", result.get("retries", 0)), 0)

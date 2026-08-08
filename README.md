@@ -622,6 +622,18 @@ This proves outbound identity/relay delivery only. A real bounded roadmap task i
 needed to observe a model-generated help request, independently routed helper response,
 and resumed worker in the group transcript.
 
+Live autonomous messages are intentionally projected as a short team conversation, not
+as copies of the internal prompts or JSON run report. Miles assigns the work and names the
+selected model once; workers send concise handoffs; Vera posts a plain-language approval,
+revision request, or blocker; and Miles closes with one budget-aware recap. Long worker
+results, complete reviewer protocol text, routing reasons, attempts, token usage, and cost
+attribution remain in the persisted run record instead of being pasted into the group.
+This formatting is deterministic and adds no model call or AI cost. Individual transition
+messages are bounded by `AUTONOMY_TEAM_CHAT_MAX_CHARS`; the final recap is bounded to 1,600
+characters. If team chat is disabled, each completed child falls back to one concise
+deliverable before the Miles recap so the result is not silently hidden. The same fallback
+runs when an essential handoff cannot be delivered or relayed.
+
 To convert one proposal into a bounded validation task, stage it from the **group
 operating room**:
 
@@ -679,8 +691,9 @@ lower and is never manufactured merely to reach $5. The pack produces reviewed a
 an owner runbook; current autonomy still does not modify or deploy code.
 
 When a run reaches `needs_human` or `blocked`, resolve the stated access problem or
-owner decision first. Then reset exactly that roadmap item from the **group operating
-room** without starting work or spending model budget:
+owner decision first. A `deferred` item can also be reset after you increase the available
+budget. Then reset exactly that roadmap item from the **group operating room** without
+starting work or spending model budget:
 
 ```text
 /autorun retry AUTO-RECOVERY-001
@@ -737,8 +750,8 @@ Use these canonical environment variables (the complete copy-ready block is in
 | `AUTONOMY_MIN_TASK_RESERVATION_USD` | `0.05`; minimum live worker/reviewer reservation |
 | `AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL` | `3000`; per-request ceiling, reduced automatically to fit the task's unspent reservation |
 | `AUTONOMY_MAX_TOOL_RESULT_CHARS` | `12000`; per-tool evidence cap applied only to strict autonomous tasks |
-| `AUTONOMY_TEAM_CHAT_ENABLED` | `true`; show deterministic assignment, handoff, review, and retry transitions |
-| `AUTONOMY_TEAM_CHAT_MAX_CHARS` | `900`; maximum text retained in one team-transition message before Telegram chunking |
+| `AUTONOMY_TEAM_CHAT_ENABLED` | `true`; show deterministic, conversational assignment, handoff, review, and retry transitions |
+| `AUTONOMY_TEAM_CHAT_MAX_CHARS` | `900`; maximum text retained in one concise team-transition message before Telegram chunking; full evidence remains in the run record |
 | `AUTONOMY_MAX_TEAM_HELP_REQUESTS` | `1`; one metered, non-recursive specialist-help exchange per autonomous worker task; set `0` to disable |
 | `TELEGRAM_TEAM_SMOKE_SEND_INTERVAL_SECONDS` | `0.75`; pacing between zero-model roster check messages, clamped to `0..2` seconds |
 | `AUTONOMY_MAX_IDEAS_PER_RUN` | `3`; maximum ideas in Lumen's one idle batch; set `0` to disable ideation |
@@ -850,10 +863,10 @@ retries, blockers, escalations, changed files, tests, artifacts, and final statu
 [`docs/sample-autonomous-daily-run-report.json`](docs/sample-autonomous-daily-run-report.json)
 for an illustrative dry-run report with no secrets.
 
-Every Telegram run summary includes a deterministic at-a-glance row immediately below
-its existing heading, such as `trigger=telegram | final=dry_run | human_review=no`. This
-row uses persisted run fields, requires no additional model call, and marks human review
-`yes` only when the run has an owner action or escalation, or ends blocked/needs-human.
+Every Telegram run recap preserves the trigger, outcome, and owner-attention facts in
+natural wording, such as "You started this run from Telegram," "Dry run complete," and
+"Nothing needs your attention right now." The exact machine fields remain persisted, and
+the conversational projection requires no additional model call.
 
 If autonomy state is corrupt, the unreadable file is quarantined and
 `autonomy_state.json.recovery-required` keeps every later run blocked. Inspect the
@@ -863,9 +876,10 @@ reseeds while that marker exists.
 
 Live session reports aggregate all nested worker/reviewer agents, models, and cost splits
 by project, task, agent, and model. The top-level route reasons are in the run report; each nested
-Company Mode task retains its own `model_reason` in `company_state.json`. Scheduled live
-sessions keep intermediate agent chatter quiet and send only actionable escalations plus
-one final aggregate summary.
+Company Mode task retains its own `model_reason` in `company_state.json`. Live sessions post
+only real team transitions—assignment, focused help when needed, ready-for-review, Vera's
+decision, actionable escalations—and one final aggregate Miles recap. They do not paste
+internal prompts or repost a second generic completion after Vera approves.
 
 Authorization levels are ceilings, not grants: `observe` inspects, `propose` drafts,
 `modify_local` conceptually covers an isolated local/branch workspace, and

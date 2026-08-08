@@ -15,6 +15,33 @@ import autonomous_workflow
 import company_mode
 
 
+CHAT_PROMPT_MARKERS = (
+    "OWNER ACTION NEEDED",
+    "Autonomous deliverable",
+    "trigger=",
+    "human_review=",
+    "Model:",
+    "Routing:",
+    "Task:",
+    "Agent:",
+    "Attempted:",
+    "Blocked by:",
+    "Question:",
+    "Why:",
+    "Result:",
+    "AUTONOMY_HELP_REQUEST",
+    "FINAL ANSWER",
+    "FILES_CHANGED:",
+    "REVISIONS REQUIRED",
+    "BLOCKED - NEEDS HUMAN REVIEW",
+)
+
+
+def assert_conversational_chat(test_case, text):
+    for marker in CHAT_PROMPT_MARKERS:
+        test_case.assertNotIn(marker, text)
+
+
 def import_group_bot_with_stub_main():
     specialist_keys = [
         "code", "research", "write", "task", "marketing", "editor", "finance",
@@ -218,6 +245,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
     async def test_autonomous_team_handoff_reports_telegram_delivery_failure(self):
         manager_bot = object()
         suppression = self.group._suppress_company_updates.set(True)
+        failure_token = self.group._autonomy_team_handoff_failed.set(False)
         try:
             with patch.dict(
                 self.group.bots, {"manager": manager_bot}, clear=True
@@ -225,7 +253,9 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
                 self.group, "send_chunks", new=AsyncMock(side_effect=RuntimeError("offline"))
             ):
                 status = await self.group.post_team_handoff("manager", "Handoff")
+            self.assertTrue(self.group._autonomy_team_handoff_failed.get())
         finally:
+            self.group._autonomy_team_handoff_failed.reset(failure_token)
             self.group._suppress_company_updates.reset(suppression)
 
         self.assertEqual(status, "delivery_failed")
@@ -842,7 +872,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         report = {
             "dry_run": True,
             "cycle_reports": [],
-            "telegram_summary": "Autonomous run: dry_run",
+            "telegram_summary": "Dry run complete. Nothing was executed or changed.",
             "report_path": "C:/tmp/run.json",
         }
         with patch.object(
@@ -850,7 +880,11 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         ) as run, patch.object(self.group, "reply_chunks", new=AsyncMock()) as reply:
             await self.group.handle_autorun_command(update, "/autorun dry-run")
         run.assert_awaited_once_with("telegram", dry_run=True)
-        self.assertIn("dry_run", reply.await_args.args[1])
+        message = reply.await_args.args[1]
+        self.assertIn("Dry run complete", message)
+        self.assertIn("saved the full dry-run record", message)
+        self.assertNotIn("C:/tmp/run.json", message)
+        assert_conversational_chat(self, message)
 
     async def test_manual_live_command_starts_one_bounded_session(self):
         update = types.SimpleNamespace(message=types.SimpleNamespace(reply_text=AsyncMock()))
@@ -859,7 +893,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             "dry_run": False,
             "cycle_reports": [],
             "escalations": [],
-            "telegram_summary": "Autonomous session: completed",
+            "telegram_summary": "We're done for this session.",
         }
         with patch.object(self.group, "AUTONOMY_CONFIG", config), patch.object(
             self.group, "autonomy_runner_task", None
@@ -874,9 +908,12 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         run.assert_awaited_once_with("telegram", dry_run=False)
         self.assertEqual(
             [call.args for call in post.await_args_list],
-            [("Autonomous session: completed", "manager")],
+            [("We're done for this session.", "manager")],
         )
-        self.assertIn("bounded autonomous session", update.message.reply_text.await_args.args[0])
+        acknowledgement = update.message.reply_text.await_args.args[0]
+        self.assertTrue(acknowledgement.startswith("Got it"))
+        self.assertIn("highest-priority ready item", acknowledgement)
+        self.assertIn("today's limits", acknowledgement)
         self.assertIsNone(self.group.autonomy_runner_task)
 
     async def test_autorun_retry_resets_one_item_without_starting_work(self):
@@ -1634,7 +1671,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
                 "Project A needs repository access.",
                 "Project B needs an owner decision.",
             ],
-            "telegram_summary": "Autonomous session: needs_human",
+            "telegram_summary": "I paused this session because one item needs you.",
         }
         with patch.object(
             self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
@@ -1652,12 +1689,12 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             [
                 ("Project A needs repository access.", "manager"),
                 ("Project B needs an owner decision.", "manager"),
-                ("Autonomous session: needs_human", "manager"),
+                ("I paused this session because one item needs you.", "manager"),
             ],
         )
         self.assertIsNone(self.group.autonomy_runner_task)
 
-    async def test_live_session_posts_each_child_deliverable_in_order_then_one_summary(self):
+    async def test_live_session_posts_only_lumen_child_then_one_summary(self):
         children = [
             {
                 "id": "cycle-1",
@@ -1671,6 +1708,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             },
             {
                 "id": "cycle-3",
+                "result_agent": "creative",
                 "idea_proposals": [{"idea": "Add a deployment health digest"}],
                 "telegram_summary": "DO NOT POST CHILD 3",
             },
@@ -1679,43 +1717,112 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             "dry_run": False,
             "escalations": [],
             "cycle_reports": children,
-            "telegram_summary": "Autonomous session: completed",
+            "telegram_summary": "We're done for this session.",
         }
         with patch.object(
             self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
         ), patch.object(
             self.group.autonomous_workflow,
             "format_telegram_deliverable",
-            side_effect=[
-                "Autonomous deliverable: first",
-                "Autonomous deliverable: second",
-                "Lumen idea plan: deployment health digest",
-            ],
+            return_value="I found one deployment-health idea worth considering.",
         ) as formatter, patch.object(self.group, "post_to_group", new=AsyncMock()) as post:
             await self.group._run_and_post_autonomy("scheduled", dry_run=False)
 
-        self.assertEqual([call.args[0] for call in formatter.call_args_list], children)
+        self.assertEqual([call.args[0] for call in formatter.call_args_list], [children[2]])
         self.assertEqual(
             [call.args for call in post.await_args_list],
             [
-                ("Autonomous deliverable: first", "code"),
-                ("Autonomous deliverable: second", "general"),
-                ("Lumen idea plan: deployment health digest", "manager"),
-                ("Autonomous session: completed", "manager"),
+                ("I found one deployment-health idea worth considering.", "creative"),
+                ("We're done for this session.", "manager"),
             ],
         )
         self.assertEqual(
-            sum(call.args[0] == "Autonomous session: completed" for call in post.await_args_list),
+            sum(call.args[0] == "We're done for this session." for call in post.await_args_list),
             1,
         )
         self.assertFalse(any("DO NOT POST CHILD" in call.args[0] for call in post.await_args_list))
+
+    async def test_live_session_falls_back_to_completed_deliverable_when_team_chat_is_disabled(self):
+        child = {
+            "id": "cycle-1",
+            "result_agent": "code",
+            "tasks_selected": [
+                {"id": "AUTO-042", "title": "Recover stale locks", "status": "completed"}
+            ],
+            "result_text": "Implemented and verified safe recovery.",
+        }
+        report = {
+            "dry_run": False,
+            "escalations": [],
+            "cycle_reports": [child],
+            "telegram_summary": "We're done for this session.",
+        }
+        with patch.object(
+            self.group, "AUTONOMY_TEAM_CHAT_ENABLED", False
+        ), patch.object(
+            self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
+        ), patch.object(
+            self.group.autonomous_workflow,
+            "format_telegram_deliverable",
+            return_value="I finished AUTO-042 and saved the result.",
+        ) as formatter, patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ) as post:
+            await self.group._run_and_post_autonomy("scheduled", dry_run=False)
+
+        formatter.assert_called_once_with(child)
+        self.assertEqual(
+            [call.args for call in post.await_args_list],
+            [
+                ("I finished AUTO-042 and saved the result.", "code"),
+                ("We're done for this session.", "manager"),
+            ],
+        )
+
+    async def test_live_session_falls_back_when_an_essential_handoff_failed(self):
+        child = {
+            "id": "cycle-1",
+            "result_agent": "code",
+            "team_handoff_failed": True,
+            "tasks_selected": [
+                {"id": "AUTO-042", "title": "Recover stale locks", "status": "completed"}
+            ],
+            "result_text": "Implemented and verified safe recovery.",
+        }
+        report = {
+            "dry_run": False,
+            "escalations": [],
+            "cycle_reports": [child],
+            "telegram_summary": "We're done for this session.",
+        }
+        with patch.object(
+            self.group, "AUTONOMY_TEAM_CHAT_ENABLED", True
+        ), patch.object(
+            self.group, "_run_autonomy_session", new=AsyncMock(return_value=report)
+        ), patch.object(
+            self.group.autonomous_workflow,
+            "format_telegram_deliverable",
+            return_value="I finished AUTO-042 and saved the result.",
+        ) as formatter, patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ) as post:
+            await self.group._run_and_post_autonomy("scheduled", dry_run=False)
+
+        formatter.assert_called_once_with(child)
+        self.assertEqual(
+            [call.args for call in post.await_args_list],
+            [
+                ("I finished AUTO-042 and saved the result.", "code"),
+                ("We're done for this session.", "manager"),
+            ],
+        )
 
     async def test_scheduled_dry_run_session_posts_no_telegram_message(self):
         report = {
             "dry_run": True,
             "escalations": [],
             "cycle_reports": [{"telegram_summary": "Child dry run"}],
-            "telegram_summary": "Autonomous session: dry_run",
+            "telegram_summary": "Dry run complete. Nothing was executed or changed.",
             "report_path": "C:/tmp/run.json",
         }
         with patch.object(
@@ -1736,7 +1843,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "dry_run": bool(dry_run),
                 "cycle_reports": [],
-                "telegram_summary": "Autonomous session: completed",
+                "telegram_summary": "We're done for this session.",
             }
 
         with patch.object(self.group, "_run_autonomy_session", side_effect=session), patch.object(
@@ -1878,10 +1985,16 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome, "done")
         self.assertEqual([call.args[0] for call in handoff.await_args_list], ["manager", "code"])
-        self.assertIn("Model: gpt-5.4-mini", handoff.await_args_list[0].args[1])
-        self.assertIn("Routing: Standard coding task", handoff.await_args_list[0].args[1])
-        self.assertIn("Vera, I finished", handoff.await_args_list[1].args[1])
-        self.assertIn("Implemented and verified", handoff.await_args_list[1].args[1])
+        assignment = handoff.await_args_list[0].args[1]
+        ready_for_review = handoff.await_args_list[1].args[1]
+        self.assertTrue(assignment.startswith("Code, please take"))
+        self.assertIn("gpt-5.4-mini", assignment)
+        self.assertIn("Vera, I finished", ready_for_review)
+        self.assertIn("Implemented and verified", ready_for_review)
+        self.assertIn("saved the full result", ready_for_review)
+        for message in (assignment, ready_for_review):
+            assert_conversational_chat(self, message)
+            self.assertLessEqual(len(message), self.group.AUTONOMY_TEAM_CHAT_MAX_CHARS)
 
     async def test_autonomous_worker_gets_one_independently_routed_teammate_answer(self):
         task = {
@@ -1961,6 +2074,15 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             [call.args[0] for call in handoff.await_args_list],
             ["manager", "code", "manager", "research"],
         )
+        visible = [call.args[1] for call in handoff.await_args_list]
+        helper_name = self.group._agent_display_name("research")
+        self.assertIn(f"{helper_name}, can you help me", visible[1])
+        self.assertIn(f"{helper_name}, please take that focused check", visible[2])
+        self.assertIn("Code, I checked it", visible[3])
+        self.assertIn("The source confirms", visible[3])
+        for message in visible:
+            assert_conversational_chat(self, message)
+            self.assertLessEqual(len(message), self.group.AUTONOMY_TEAM_CHAT_MAX_CHARS)
         terminal = [
             call for call in update.call_args_list
             if len(call.args) > 1 and call.args[1] == "done"
@@ -2346,14 +2468,17 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
 
         for verdict, answer, expected_text in (
-            ("approved", "APPROVED - all criteria have evidence.", "review complete"),
-            ("revise", "REVISIONS REQUIRED\n1. Add the missing test.", "Code, revisions are required"),
+            ("approved", "APPROVED - all criteria have evidence.", "Approved."),
+            ("revise", "REVISIONS REQUIRED\n1. Add the missing test.", "Code, I need one change"),
         ):
             with self.subTest(verdict=verdict):
                 task = {
                     "id": f"review-{verdict}",
                     "owner": "editor",
-                    "title": "Review against acceptance criteria",
+                    "title": (
+                        "Review the completed result and respond APPROVED, "
+                        "REVISIONS REQUIRED, or BLOCKED - NEEDS HUMAN REVIEW"
+                    ),
                     "model": "gpt-5.4-mini",
                     "model_reason": "Standard evidence review.",
                     "execution_attempts": 0,
@@ -2385,9 +2510,16 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
                     )
 
                 self.assertEqual(outcome, "done")
+                assignment = handoff.await_args_list[0].args[1]
+                self.assertEqual(handoff.await_args_list[0].args[0], "manager")
+                self.assertIn("please review the completed work", assignment)
+                assert_conversational_chat(self, assignment)
                 self.assertEqual(handoff.await_args_list[-1].args[0], "editor")
-                self.assertIn(expected_text, handoff.await_args_list[-1].args[1])
-                self.assertIn(answer, handoff.await_args_list[-1].args[1])
+                review_message = handoff.await_args_list[-1].args[1]
+                self.assertIn(expected_text, review_message)
+                self.assertIn("All criteria have evidence" if verdict == "approved" else "Add the missing test", review_message)
+                self.assertNotIn(answer.splitlines()[0], review_message)
+                assert_conversational_chat(self, review_message)
 
     async def test_autonomous_reviewer_posts_structured_block_as_vera(self):
         project = {"id": "project-1", "title": "Project", "goal": "Ship safely"}
@@ -2418,8 +2550,12 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome, "blocked")
         self.assertEqual(handoff.await_args_list[-1].args[0], "editor")
-        self.assertIn("review is blocked", handoff.await_args_list[-1].args[1])
-        self.assertIn("MISSING_ACCESS", handoff.await_args_list[-1].args[1])
+        review_message = handoff.await_args_list[-1].args[1]
+        self.assertIn("I can't approve", review_message)
+        self.assertIn("Missing access", review_message)
+        self.assertIn("Provide repository access", review_message)
+        self.assertNotIn("BLOCKED - NEEDS HUMAN REVIEW", review_message)
+        assert_conversational_chat(self, review_message)
 
     async def test_autonomous_retry_posts_the_stronger_model_decision(self):
         project = {"id": "project-1", "title": "Project", "goal": "Ship safely"}
@@ -2465,10 +2601,11 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(outcome, "done")
-        retry_messages = [call.args[1] for call in handoff.await_args_list if "retry" in call.args[1]]
+        retry_messages = [call.args[1] for call in handoff.await_args_list if "once more" in call.args[1]]
         self.assertEqual(len(retry_messages), 1)
-        self.assertIn("Model: gpt-5.6-sol", retry_messages[0])
-        self.assertIn("stronger untried model", retry_messages[0])
+        self.assertIn("gpt-5.6-sol", retry_messages[0])
+        self.assertNotIn("stronger untried model", retry_messages[0])
+        assert_conversational_chat(self, retry_messages[0])
 
     async def test_company_task_sink_uses_its_persisted_reservation_as_hard_envelope(self):
         project = {"id": "project-1", "title": "Project", "goal": "Inspect"}
@@ -2749,7 +2886,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(terminal), 1)
 
     async def test_successful_worker_result_is_persisted_without_pre_review_truncation(self):
-        result = "complete evidence\n" + ("x" * 7000)
+        result = "complete evidence FULL_REPORT_ONLY_SENTINEL\n" + ("x" * 7000)
         task = {
             "id": "worker-long", "owner": "manager", "title": "Long proposal",
             "model": "worker-model", "model_reason": "test", "estimate_usd": 0.10,
@@ -2775,7 +2912,9 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             self.group, "post_to_group", new=AsyncMock()
         ), patch.object(
             self.group, "post_agent_answer_to_group", new=AsyncMock()
-        ):
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ) as handoff:
             outcome = await self.group._execute_routed_task(
                 project,
                 task,
@@ -2788,6 +2927,10 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "done")
         self.assertEqual(done_call.args[2], result)
         self.assertGreater(len(done_call.args[2]), company_mode.MAX_TASK_RESULT_CHARS)
+        self.assertTrue(handoff.await_args_list)
+        for call in handoff.await_args_list:
+            self.assertNotIn("FULL_REPORT_ONLY_SENTINEL", call.args[1])
+            assert_conversational_chat(self, call.args[1])
 
     async def test_time_limit_waits_for_thread_and_stops_without_retry(self):
         task = {

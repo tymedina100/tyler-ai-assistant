@@ -77,7 +77,7 @@ Only `observe` and `propose` auto-execute in this slice. The existing `run_pytho
 12. The coordinator reconciles reservations, updates the roadmap item from the Company Mode result, and persists the worker result separately from reviewer feedback. A task-local blocker is escalated but does not prevent the session from selecting unrelated actionable work. The aggregate session remains `needs_human` until that blocker is resolved.
 13. Before another item starts, the coordinator refreshes the ledger and checks the ten-item, 120-minute, one-attempt-per-item, and ordinary-budget ceilings. It stops when no useful complete worker/reviewer unit remains affordable; it does not create work merely to consume budget.
 14. After roadmap work is exhausted and the session has no unresolved blocked task, Lumen may run one controlled batch containing at most the configured number of deduplicated ideas. A blocker suppresses ideation so proposals cannot mask an owner action. Ideas remain `proposed` backlog records and are never executed automatically. The owner may stage `/autorun promote <idea-id>`; the read-only preview deterministically creates explicit acceptance criteria and requires `/confirm`. Confirmation revalidates the full proposal and destination under the run/state locks, then atomically creates one `ready`, `propose` roadmap item and records bidirectional provenance. It never starts execution in the promotion turn.
-15. The coordinator releases the lock, sends completed deliverables through the existing chunked Telegram transport, and sends one aggregate summary covering every selected task, route, attempt, cost, result, blocker, escalation, and proposed idea. The summary includes a deterministic `trigger | final | human_review` line derived from persisted run state without another model call.
+15. The coordinator releases the lock after projecting real team transitions into short conversational Telegram messages and sends one aggregate Miles recap summarizing selected work, outcomes, cost, owner actions, and proposed ideas. Complete routes, attempts, results, blockers, and escalation evidence remain in the persisted run record. Trigger, outcome, and owner-attention facts appear in natural wording derived from that state without another model call. A successful worker/reviewer path is assignment, optional focused help, ready-for-review, Vera's decision, and one recap; it does not repost the approved deliverable while team chat is enabled.
 
 ## Budget design
 
@@ -131,6 +131,15 @@ Development defaults:
 
 The Telegram command `/autorun dry-run` is always safe: it performs one no-spend planning pass and does not enter the live continuation loop. A local CLI command provides the same selection/report path without importing Telegram or invoking paid APIs. `/autorun live` is group-only and starts one bounded session under the same lock and limits as the scheduler. `/autorun status` exposes bounded, stable proposal IDs. `/autorun team-smoke` is an owner-only, group-only transport diagnostic that refuses to overlap Company Mode or autonomy, pre-persists a redacted audit record, emits one static check from each startup-ready bot, uses an explicit Miles relay for every missing/unhealthy identity, and records direct/relay/failure outcomes with zero model calls, tokens, tools, cost, or roadmap mutation. Scheduled autonomy, Company Mode, the Telegram diagnostic, and the Railway one-shot all use the same persistent cross-process execution gate. A passing smoke requires the full expected roster and direct delivery from every identity; a partial smoke proves relay transport but not roster completion or model-generated collaboration. `scripts/telegram_team_smoke.py` exercises the same outbound path from Railway without starting a second poller and exits successfully only for `passed`; sends are paced and one short Telegram rate-limit response receives one bounded retry. `/autorun promote <idea-id> [project-id]` and `/autorun queue <manifest-id>` are also group-only; each stages a per-chat, same-owner confirmation without a model call or state mutation. Pack confirmation revalidates the exact reviewed repository manifest revision, appends only `observe`/`propose` goal and item records, writes a pre-import backup, and never starts a run.
 
+The autonomous Telegram transcript is a deterministic presentation layer over that
+structured state. It emits only real state changes: assignment, optional one-hop help,
+completion, review, escalation, and one Miles recap. Model instructions stay internal;
+structured worker/reviewer results, routing reasons, usage, and costs remain persisted,
+and long reports are never copied wholesale into the group. Every transition is capped at
+the configured team chat limit and the final recap is capped at 1,600 characters. Because the projection is a
+pure formatter, the conversational wording adds no paid model call and cannot start a
+bot-to-bot loop.
+
 ## Safety boundaries
 
 - Dry-run may write only local run/audit state; it performs no model call, connector call, code change, deploy, publish, delete, send, or production mutation.
@@ -160,8 +169,9 @@ The Telegram command `/autorun dry-run` is always safe: it performs one no-spend
 - The JSON/file-lock store assumes all replicas share one filesystem volume; it is not a distributed database.
 - Existing helper functions can still be imported directly, outside the centralized tool authorization path.
 - Pending Telegram confirmations are still process-memory state.
-- `/autorun retry <item-id>` deliberately resets one `needs_human` or `blocked` item after
-  the owner resolves its stated problem. It preserves attempt history and never starts a
+- `/autorun retry <item-id>` deliberately resets one `needs_human`, `blocked`, or
+  `deferred` item after the owner resolves its stated problem or increases the available
+  budget. It rejects active/completed work, preserves attempt history, and never starts a
   model call. `/autorun promote <idea-id> [project-id]` provides the explicit
   proposal-to-roadmap bridge, while `/autorun queue <manifest-id>` provides an
   owner-confirmed additive path for reviewed project manifests. Skip, accept-as-is,

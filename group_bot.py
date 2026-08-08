@@ -196,6 +196,10 @@ _autonomy_evidence_context = contextvars.ContextVar(
     "autonomy_evidence_context",
     default="",
 )
+_autonomy_team_handoff_failed = contextvars.ContextVar(
+    "autonomy_team_handoff_failed",
+    default=False,
+)
 
 
 def _env_flag(name, default):
@@ -817,7 +821,11 @@ async def _send_group_message_as(
 
     if max_chars is not None and len(message) > max_chars:
         marker = "..."
-        message = message[:max(0, max_chars - len(marker))].rstrip() + marker
+        cut = message[:max(0, max_chars - len(marker))].rstrip()
+        boundary = max(cut.rfind("\n"), cut.rfind(" "))
+        if boundary >= max(20, len(cut) - 80):
+            cut = cut[:boundary].rstrip()
+        message = cut + marker
     try:
         await send_chunks(bot, destination_chat_id, message)
         return "relayed_by_manager" if relayed else "direct"
@@ -837,11 +845,14 @@ async def post_team_handoff(speaker_key, text):
     """Expose one real autonomous state transition without generating more chatter."""
     if not AUTONOMY_TEAM_CHAT_ENABLED or not _suppress_company_updates.get():
         return "suppressed"
-    return await _send_group_message_as(
+    status = await _send_group_message_as(
         text,
         speaker_key,
         max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
     )
+    if status in {"delivery_failed", "delivery_unavailable"}:
+        _autonomy_team_handoff_failed.set(True)
+    return status
 
 
 def _team_delivery_status(value):
@@ -2594,16 +2605,23 @@ async def _run_team_help_exchange(task, request, sink, requesting_model):
     helper_name = _agent_display_name(helper)
     request_delivery = _team_delivery_status(await post_team_handoff(
         request["requesting_agent"],
-        (
-            f"{helper_name}, I need one focused assist before I finish {task['title']}.\n"
-            f"Question: {request['question']}\nWhy: {request['reason']}"
+        autonomous_workflow.format_team_chat_message(
+            "help_request",
+            recipient=helper_name,
+            task=task,
+            question=request["question"],
+            reason=request["reason"],
+            max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
         ),
     ))
     routing_delivery = _team_delivery_status(await post_team_handoff(
         "manager",
-        (
-            f"{helper_name}, take this one-hop request for {requester_name}.\n"
-            f"Model: {helper_model}\nRouting: {model_reason}"
+        autonomous_workflow.format_team_chat_message(
+            "help_route",
+            recipient=helper_name,
+            requester=requester_name,
+            model=helper_model,
+            max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
         ),
     ))
 
@@ -2676,10 +2694,17 @@ async def _run_team_help_exchange(task, request, sink, requesting_model):
             helper_failure,
         )
 
+    helper_answer_was_truncated = len(helper_answer) > 480
     helper_answer = helper_answer[:AUTONOMY_HELP_RESPONSE_MAX_CHARS]
     response_delivery = _team_delivery_status(await post_team_handoff(
         helper,
-        f"{requester_name}, here's the focused answer:\n{helper_answer}",
+        autonomous_workflow.format_team_chat_message(
+            "help_response",
+            recipient=requester_name,
+            detail=helper_answer,
+            detail_truncated=helper_answer_was_truncated,
+            max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
+        ),
     ))
     usage = list(sink.get("usage_records", []))[usage_start:]
     event = {
@@ -2775,10 +2800,12 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
     worker_name = _agent_display_name(speaker_owner)
     await post_team_handoff(
         "manager",
-        (
-            f"{worker_name}, you're up: {task['title']}\n"
-            f"Model: {model}\n"
-            f"Routing: {model_reason or 'Selected for this bounded task.'}"
+        autonomous_workflow.format_team_chat_message(
+            "review_assignment" if owner == "editor" else "assignment",
+            recipient=worker_name,
+            task=task,
+            model=model,
+            max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
         ),
     )
 
@@ -2916,9 +2943,13 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
                 )
                 await post_team_handoff(
                     "manager",
-                    (
-                        f"{worker_name}, retry the same bounded task after the prior "
-                        f"{failure} failure.\nModel: {model}\nRouting: {model_reason}"
+                    autonomous_workflow.format_team_chat_message(
+                        "retry",
+                        recipient=worker_name,
+                        task=task,
+                        failure=failure,
+                        model=model,
+                        max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
                     ),
                 )
                 continue
@@ -2955,9 +2986,10 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
         if budget_deferred:
             await post_team_handoff(
                 speaker_owner,
-                (
-                    "Miles, I stopped before the next request could exceed the task or "
-                    "daily budget. This work can resume after the budget resets."
+                autonomous_workflow.format_team_chat_message(
+                    "budget_stopped",
+                    task=task,
+                    max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
                 ),
             )
             await post_to_group(
@@ -2981,14 +3013,21 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
         if owner == "editor" and str(answer).strip().upper().startswith("BLOCKED"):
             await post_team_handoff(
                 "editor",
-                f"Miles, review is blocked and needs owner attention:\n{answer}",
+                autonomous_workflow.format_team_chat_message(
+                    "review_blocked",
+                    task=task,
+                    detail=answer,
+                    max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
+                ),
             )
         elif owner != "editor":
             await post_team_handoff(
                 speaker_owner,
-                (
-                    "Miles, I cannot continue this task inside the current limits.\n"
-                    f"Failure: {autonomy_team.workflow_failure(failure)}\n{answer}"
+                autonomous_workflow.format_team_chat_message(
+                    "worker_blocked",
+                    task=task,
+                    detail=answer,
+                    max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
                 ),
             )
         await post_to_group(escalation, "manager")
@@ -3033,38 +3072,55 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
         )
     state = await asyncio.to_thread(company_mode.load_state)
     if owner == "editor":
+        prior_workers = [
+            value
+            for value in company_mode.project_tasks(state, project["id"])
+            if value.get("owner") != "editor"
+        ]
+        reviewed_task = prior_workers[-1] if prior_workers else task
         if verdict == "approved":
             await post_team_handoff(
                 "editor",
-                f"Miles, review complete: {answer}",
+                autonomous_workflow.format_team_chat_message(
+                    "review_approved",
+                    task=reviewed_task,
+                    detail=answer,
+                    max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
+                ),
             )
         elif verdict == "revise":
-            prior_workers = [
-                value
-                for value in company_mode.project_tasks(state, project["id"])
-                if value.get("owner") != "editor"
-            ]
             target_key = str((prior_workers[-1] if prior_workers else {}).get("owner") or "manager")
             await post_team_handoff(
                 "editor",
-                (
-                    f"{_agent_display_name(target_key)}, revisions are required before "
-                    f"approval:\n{answer}"
+                autonomous_workflow.format_team_chat_message(
+                    "review_revision",
+                    recipient=_agent_display_name(target_key),
+                    task=reviewed_task,
+                    detail=answer,
+                    max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
                 ),
             )
         elif verdict == "blocked":
             await post_team_handoff(
                 "editor",
-                f"Miles, review is blocked by the loop guard or missing owner input:\n{answer}",
+                autonomous_workflow.format_team_chat_message(
+                    "review_blocked",
+                    task=reviewed_task,
+                    detail=answer,
+                    max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
+                ),
             )
     else:
         next_task = company_mode.next_planned_task(state, project["id"])
         if next_task and next_task.get("owner") == "editor":
             await post_team_handoff(
                 speaker_owner,
-                (
-                    f"Vera, I finished {task['title']} and persisted the result for your "
-                    f"acceptance-criteria review.\nResult: {answer}"
+                autonomous_workflow.format_team_chat_message(
+                    "ready_for_review",
+                    recipient="Vera",
+                    task=task,
+                    detail=answer,
+                    max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
                 ),
             )
     await post_to_group(company_mode.render_money(state), "manager")
@@ -3416,6 +3472,7 @@ async def _execute_autonomy_item(project, item, decision, run_id):
         }
 
     suppression_token = _suppress_company_updates.set(True)
+    handoff_failure_token = _autonomy_team_handoff_failed.set(False)
     evidence_token = _autonomy_evidence_context.set(
         _autonomy_execution_evidence(item)
     )
@@ -3466,11 +3523,13 @@ async def _execute_autonomy_item(project, item, decision, run_id):
         # this entire session. Re-acquiring it here would deadlock/fail the same run.
         await _run_company_plan_locked(company_project_id)
         final_state = await asyncio.to_thread(company_mode.load_state)
-        return autonomy_team.aggregate_company_result(
+        result = autonomy_team.aggregate_company_result(
             final_state,
             company_project_id,
             fallback_model=_decision_value(decision, "model_id") or _decision_value(decision, "model"),
         )
+        result["team_handoff_failed"] = _autonomy_team_handoff_failed.get()
+        return result
     except asyncio.CancelledError:
         if company_project_id:
             await asyncio.to_thread(
@@ -3493,6 +3552,7 @@ async def _execute_autonomy_item(project, item, decision, run_id):
         raise
     finally:
         _autonomy_evidence_context.reset(evidence_token)
+        _autonomy_team_handoff_failed.reset(handoff_failure_token)
         _suppress_company_updates.reset(suppression_token)
         main.projects.end_scoped_project(project_tokens)
 
@@ -3655,13 +3715,18 @@ async def _run_and_post_autonomy(trigger_source, *, dry_run=None):
                         continue
                     seen_escalations.add(message)
                     await post_to_group(message, "manager")
-                # The formatter handles both approved roadmap deliverables and
-                # controlled Lumen idea-plan proposals. Child summaries are never
-                # posted; the session emits one aggregate summary below.
-                deliverable = autonomous_workflow.format_telegram_deliverable(child)
-                if deliverable:
-                    result_agent = str(child.get("result_agent") or "manager")
-                    await post_to_group(deliverable, result_agent)
+                # Workers already post one concise pre-review handoff and Vera posts
+                # the verdict. Only Lumen needs a separate child message here; the
+                # session emits one aggregate Miles recap below.
+                if (
+                    child.get("idea_proposals")
+                    or child.get("team_handoff_failed")
+                    or not AUTONOMY_TEAM_CHAT_ENABLED
+                ):
+                    deliverable = autonomous_workflow.format_telegram_deliverable(child)
+                    if deliverable:
+                        result_agent = str(child.get("result_agent") or "manager")
+                        await post_to_group(deliverable, result_agent)
             for escalation in report.get("escalations", []) or []:
                 message = str(autonomous_workflow.redact_secrets(str(escalation))).strip()
                 if not message or message in seen_escalations:
@@ -3804,7 +3869,11 @@ async def handle_autorun_command(update, text, *, allow_live=True):
             await update.message.reply_text("An autonomous run is already active; this trigger was not started.")
             return
         report = await _run_and_post_autonomy("telegram", dry_run=True)
-        await reply_chunks(update.message, report["telegram_summary"] + f"\nReport: {report['report_path']}")
+        await reply_chunks(
+            update.message,
+            report["telegram_summary"]
+            + "\n\nI saved the full dry-run record on the persistent volume.",
+        )
         return
     if argument == "status":
         await reply_chunks(update.message, await asyncio.to_thread(_autonomy_status_text))
@@ -4059,8 +4128,8 @@ async def handle_autorun_command(update, text, *, allow_live=True):
             return
         autonomy_runner_task = asyncio.create_task(_run_and_post_autonomy("telegram", dry_run=False))
         await update.message.reply_text(
-            "Started one bounded autonomous session. Miles will continue safe, useful work "
-            "within its configured limits and post one final report or an exact owner action."
+            "Got it - I'm starting with the highest-priority ready item. I'll keep the "
+            "team moving inside today's limits and come back when we're finished or need you."
         )
         return
     await update.message.reply_text(
