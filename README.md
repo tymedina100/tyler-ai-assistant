@@ -581,8 +581,39 @@ trigger a dry-run. Both commands also work in a Miles DM:
 ```
 
 `/autorun status` includes the stable IDs of up to five current proposals. Future Lumen
-idea-plan and aggregate messages include the same IDs. To convert one proposal into a
-bounded validation task, stage it from the **group operating room**:
+idea-plan and aggregate messages include the same IDs.
+
+To verify the complete code-defined Telegram roster without spending AI budget, run this
+from the **group operating room** while no Company Mode or autonomous session is active:
+
+```text
+/autorun team-smoke
+```
+
+The command writes a secret-redacted report under `DATA_DIR/autonomous_runs/`, then sends
+one static transport check from every startup-verified bot. Missing or unhealthy identities
+are shown through an explicit Miles relay and never counted as direct. The final summary
+reports direct, relayed, and failed deliveries; it calls no model or tool, reserves no
+budget, and changes no roadmap/task state. A fully passing result requires every expected
+identity to be startup-ready and directly delivered. Railway operators can exercise the
+same outbound transport without starting another poller:
+
+```powershell
+railway ssh python scripts/telegram_team_smoke.py
+```
+
+The Telegram command and Railway one-shot share the same persistent execution lock as
+scheduled autonomy and Company Mode. The script exits `0` only for a complete `passed`
+roster; `partial`, `failed`, and `overlap_prevented` exit nonzero. Sends are paced by
+`TELEGRAM_TEAM_SMOKE_SEND_INTERVAL_SECONDS` (default `0.75`) and one short Telegram
+`RetryAfter` receives a single bounded retry.
+
+This proves outbound identity/relay delivery only. A real bounded roadmap task is still
+needed to observe a model-generated help request, independently routed helper response,
+and resumed worker in the group transcript.
+
+To convert one proposal into a bounded validation task, stage it from the **group
+operating room**:
 
 ```text
 /autorun promote idea_ab12cd34ef
@@ -699,6 +730,7 @@ Use these canonical environment variables (the complete copy-ready block is in
 | `AUTONOMY_TEAM_CHAT_ENABLED` | `true`; show deterministic assignment, handoff, review, and retry transitions |
 | `AUTONOMY_TEAM_CHAT_MAX_CHARS` | `900`; maximum text retained in one team-transition message before Telegram chunking |
 | `AUTONOMY_MAX_TEAM_HELP_REQUESTS` | `1`; one metered, non-recursive specialist-help exchange per autonomous worker task; set `0` to disable |
+| `TELEGRAM_TEAM_SMOKE_SEND_INTERVAL_SECONDS` | `0.75`; pacing between zero-model roster check messages, clamped to `0..2` seconds |
 | `AUTONOMY_MAX_IDEAS_PER_RUN` | `3`; maximum ideas in Lumen's one idle batch; set `0` to disable ideation |
 | `AUTONOMY_IDEA_BACKLOG_LIMIT` | `50` proposed ideas retained |
 | `AUTONOMY_MAX_EXECUTION_ATTEMPTS` | `2` roadmap-level failed attempts before owner escalation |
@@ -1128,7 +1160,9 @@ name; adding the matching token later gives that worker its own Telegram identit
    env vars. An invalid or reused configured identity always stops before polling. Leave
    `TELEGRAM_REQUIRE_COMPLETE_ROSTER=false` while intentionally operating with relays;
    set it to `true` only after all 14 bots are installed, to make an incomplete roster a
-   fail-closed startup error.
+   fail-closed startup error. `/autorun team-smoke` then verifies one direct outbound
+   message per ready identity and labels every fallback relay; a relay does not satisfy
+   the missing bot requirement.
 
 **Optional: give every bot its own profile picture.**
 

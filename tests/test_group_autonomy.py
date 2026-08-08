@@ -86,6 +86,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.fake_main.pending_actions.clear()
         self.group.autonomy_runner_task = None
         self.group.company_runner_task = None
+        self.group.TEAM_SMOKE_SEND_INTERVAL_SECONDS = 0
 
     async def test_telegram_roster_check_retries_without_logging_exception_text(self):
         self.fake_main.logger.warning.reset_mock()
@@ -246,6 +247,477 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
 
         send.assert_not_awaited()
         self.assertEqual(status, "suppressed")
+
+    def _smoke_roster_agent(self, key, *, ready=True):
+        roster = self.group.telegram_roster_health
+        issues = () if ready else (
+            roster.RosterIssue(
+                roster.MISSING_TOKEN,
+                f"Set {self.group.AGENT_INFO[key]['env_var']}.",
+            ),
+        )
+        return roster.AgentRosterHealth(
+            key=key,
+            label=self.group.AGENT_INFO[key]["label"],
+            env_var=self.group.AGENT_INFO[key]["env_var"],
+            username=f"{key}_bot" if ready else "",
+            issues=issues,
+        )
+
+    async def test_team_smoke_directs_only_ready_bots_and_relays_missing_roles(self):
+        manager_bot = object()
+        code_bot = object()
+        unhealthy_analytics_bot = object()
+        roster = self.group.telegram_roster_health.RosterHealth((
+            self._smoke_roster_agent("manager"),
+            self._smoke_roster_agent("code"),
+            self._smoke_roster_agent("analytics", ready=False),
+            self._smoke_roster_agent("general", ready=False),
+        ))
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            self.group.main.SPECIALISTS,
+            {
+                "code": self.fake_main.SPECIALISTS["code"],
+                "analytics": self.fake_main.SPECIALISTS["analytics"],
+            },
+            clear=True,
+        ), patch.object(
+            self.group, "send_chunks", new=AsyncMock()
+        ) as send:
+            report = await self.group.run_team_transport_smoke(
+                bot_map={
+                    "manager": manager_bot,
+                    "code": code_bot,
+                    "analytics": unhealthy_analytics_bot,
+                },
+                roster_health=roster,
+                trigger_source="test",
+                report_dir=temp,
+                smoke_id="team_smoke_test",
+            )
+
+            persisted = json.loads(
+                (Path(temp) / "team_smoke_test.json").read_text(encoding="utf-8")
+            )
+
+        destination_bots = [call.args[0] for call in send.await_args_list]
+        self.assertEqual(
+            destination_bots,
+            [manager_bot, code_bot, manager_bot, manager_bot, manager_bot],
+        )
+        self.assertNotIn(unhealthy_analytics_bot, destination_bots)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["expected_count"], 4)
+        self.assertEqual(report["direct_count"], 2)
+        self.assertEqual(report["relayed_count"], 2)
+        self.assertEqual(report["failed_count"], 0)
+        self.assertFalse(report["model_invoked"])
+        self.assertEqual(report["model_calls"], 0)
+        self.assertEqual(report["actual_or_reconciled_cost_usd"], 0.0)
+        self.assertFalse(report["roadmap_state_changed"])
+        self.assertEqual(persisted["final_delivery"], "direct")
+        self.assertEqual(persisted["status"], "partial")
+
+    async def test_team_smoke_passes_only_for_full_direct_expected_roster(self):
+        manager_bot = object()
+        code_bot = object()
+        general_bot = object()
+        ghost_bot = object()
+        roster_module = self.group.telegram_roster_health
+        roster = roster_module.RosterHealth((
+            self._smoke_roster_agent("manager"),
+            self._smoke_roster_agent("code"),
+            self._smoke_roster_agent("general"),
+        ))
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            self.group.main.SPECIALISTS,
+            {"code": self.fake_main.SPECIALISTS["code"]},
+            clear=True,
+        ), patch.object(
+            self.group, "send_chunks", new=AsyncMock()
+        ) as send:
+            report = await self.group.run_team_transport_smoke(
+                bot_map={
+                    "manager": manager_bot,
+                    "code": code_bot,
+                    "general": general_bot,
+                    "ghost": ghost_bot,
+                },
+                roster_health=roster,
+                trigger_source="test",
+                report_dir=temp,
+                smoke_id="team_smoke_pass",
+            )
+
+        destinations = [call.args[0] for call in send.await_args_list]
+        self.assertEqual(
+            destinations,
+            [manager_bot, code_bot, general_bot, manager_bot],
+        )
+        self.assertNotIn(ghost_bot, destinations)
+        self.assertEqual(report["expected_count"], 3)
+        self.assertEqual(report["direct_count"], 3)
+        self.assertEqual(report["relayed_count"], 0)
+        self.assertEqual(report["status"], "passed")
+
+    async def test_team_smoke_missing_health_entry_cannot_pass_as_direct(self):
+        manager_bot = object()
+        code_bot = object()
+        research_bot = object()
+        general_bot = object()
+        roster = self.group.telegram_roster_health.RosterHealth((
+            self._smoke_roster_agent("manager"),
+            self._smoke_roster_agent("code"),
+            # Research is deliberately absent despite its bot client being present.
+            self._smoke_roster_agent("general"),
+        ))
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            self.group.main.SPECIALISTS,
+            {
+                "code": self.fake_main.SPECIALISTS["code"],
+                "research": self.fake_main.SPECIALISTS["research"],
+            },
+            clear=True,
+        ), patch.object(
+            self.group, "send_chunks", new=AsyncMock()
+        ) as send:
+            report = await self.group.run_team_transport_smoke(
+                bot_map={
+                    "manager": manager_bot,
+                    "code": code_bot,
+                    "research": research_bot,
+                    "general": general_bot,
+                },
+                roster_health=roster,
+                trigger_source="test",
+                report_dir=temp,
+                smoke_id="team_smoke_missing_health",
+            )
+
+        destinations = [call.args[0] for call in send.await_args_list]
+        self.assertNotIn(research_bot, destinations)
+        self.assertEqual(report["direct_count"], 3)
+        self.assertEqual(report["relayed_count"], 1)
+        self.assertFalse(report["roster_complete"])
+        self.assertEqual(report["status"], "partial")
+
+    async def test_team_smoke_continues_after_delivery_failure(self):
+        manager_bot = object()
+        code_bot = object()
+        research_bot = object()
+        roster = self.group.telegram_roster_health.RosterHealth((
+            self._smoke_roster_agent("manager"),
+            self._smoke_roster_agent("code"),
+            self._smoke_roster_agent("research"),
+            self._smoke_roster_agent("general", ready=False),
+        ))
+        attempted = []
+
+        async def send_with_one_failure(bot, chat_id, text):
+            attempted.append(bot)
+            if bot is code_bot:
+                raise RuntimeError("https://api.telegram.org/botSECRET/sendMessage")
+
+        self.fake_main.logger.error.reset_mock()
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            self.group.main.SPECIALISTS,
+            {
+                "code": self.fake_main.SPECIALISTS["code"],
+                "research": self.fake_main.SPECIALISTS["research"],
+            },
+            clear=True,
+        ), patch.object(
+            self.group, "send_chunks", new=AsyncMock(side_effect=send_with_one_failure)
+        ):
+            report = await self.group.run_team_transport_smoke(
+                bot_map={
+                    "manager": manager_bot,
+                    "code": code_bot,
+                    "research": research_bot,
+                },
+                roster_health=roster,
+                trigger_source="test",
+                report_dir=temp,
+                smoke_id="team_smoke_failure",
+            )
+
+        self.assertEqual(
+            attempted,
+            [manager_bot, code_bot, research_bot, manager_bot, manager_bot],
+        )
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["failed_count"], 1)
+        self.assertEqual(report["deliveries"][1]["delivery"], "delivery_failed")
+        logged = repr(self.fake_main.logger.error.mock_calls)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("botSECRET", logged)
+
+    async def test_team_smoke_retries_one_bounded_telegram_rate_limit(self):
+        bot = object()
+        with patch.object(
+            self.group,
+            "send_chunks",
+            new=AsyncMock(side_effect=[self.group.RetryAfter(0), None]),
+        ) as send:
+            result = await self.group._team_smoke_send(
+                "bounded check",
+                "manager",
+                {"manager": bot},
+            )
+
+        self.assertEqual(
+            result,
+            "direct",
+            repr({
+                "send_calls": send.await_args_list,
+                "errors": self.fake_main.logger.error.mock_calls,
+                "warnings": self.fake_main.logger.warning.mock_calls,
+            }),
+        )
+        self.assertEqual(send.await_count, 2)
+
+    async def test_team_smoke_shared_lock_prevents_cross_process_overlap(self):
+        from filelock import FileLock
+
+        with tempfile.TemporaryDirectory() as temp:
+            lock_path = Path(temp) / "autonomy_run.lock"
+            held = FileLock(str(lock_path))
+            held.acquire()
+            try:
+                with patch.object(
+                    self.group, "send_chunks", new=AsyncMock()
+                ) as send:
+                    with self.assertRaises(self.group.TeamExecutionOverlapError):
+                        await self.group.run_team_transport_smoke(
+                            bot_map={"manager": object()},
+                            trigger_source="test",
+                            report_dir=temp,
+                            smoke_id="team_smoke_overlap",
+                        )
+                send.assert_not_awaited()
+            finally:
+                held.release()
+
+    async def test_company_runner_uses_same_cross_process_execution_gate(self):
+        from filelock import FileLock
+
+        with tempfile.TemporaryDirectory() as temp:
+            lock_path = Path(temp) / "autonomy_run.lock"
+            held = FileLock(str(lock_path))
+            held.acquire()
+            try:
+                with patch.object(
+                    self.group,
+                    "_run_company_plan_locked",
+                    new=AsyncMock(),
+                ) as run, patch.object(
+                    self.group, "post_to_group", new=AsyncMock()
+                ) as post:
+                    await self.group.run_company_plan(
+                        "project-1",
+                        execution_lock_path=lock_path,
+                    )
+                run.assert_not_awaited()
+                self.assertIn("did not start", post.await_args.args[0])
+            finally:
+                held.release()
+
+    async def test_team_smoke_persistence_failure_sends_nothing(self):
+        roster = self.group.telegram_roster_health.RosterHealth((
+            self._smoke_roster_agent("manager"),
+            self._smoke_roster_agent("general", ready=False),
+        ))
+        with patch.dict(
+            self.group.main.SPECIALISTS, {}, clear=True
+        ), patch.object(
+            self.group, "_persist_team_smoke_report", side_effect=OSError("offline")
+        ), patch.object(
+            self.group, "send_chunks", new=AsyncMock()
+        ) as send:
+            with self.assertRaises(RuntimeError):
+                await self.group.run_team_transport_smoke(
+                    bot_map={"manager": object()},
+                    roster_health=roster,
+                    trigger_source="test",
+                    smoke_id="team_smoke_no_store",
+                )
+
+        send.assert_not_awaited()
+
+    async def test_team_smoke_telegram_trigger_requires_allowlisted_owner(self):
+        with self.assertRaises(PermissionError):
+            await self.group.run_team_transport_smoke(
+                bot_map={"manager": object()},
+                trigger_source="telegram",
+                requested_by_user_id=999,
+                smoke_id="team_smoke_unauthorized",
+            )
+
+    async def test_team_smoke_command_rejects_unauthorized_and_bot_authors(self):
+        run_smoke = AsyncMock()
+        for user in (
+            types.SimpleNamespace(id=999, is_bot=False),
+            types.SimpleNamespace(id=42, is_bot=True),
+        ):
+            update = types.SimpleNamespace(
+                effective_user=user,
+                effective_chat=types.SimpleNamespace(
+                    id=self.group.GROUP_CHAT_ID,
+                    type="supergroup",
+                ),
+                message=types.SimpleNamespace(
+                    text="/autorun team-smoke",
+                    reply_text=AsyncMock(),
+                ),
+            )
+            with patch.object(
+                self.group, "run_team_transport_smoke", new=run_smoke
+            ):
+                await self.group.handle_manager_message(update, None)
+
+        run_smoke.assert_not_awaited()
+
+    async def test_autorun_team_smoke_is_group_only_and_refuses_overlap(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        run_smoke = AsyncMock(return_value={"final_delivery": "direct"})
+        with patch.object(
+            self.group, "run_team_transport_smoke", new=run_smoke
+        ):
+            await self.group.handle_autorun_command(
+                update, "/autorun team-smoke", allow_live=False
+            )
+        run_smoke.assert_not_awaited()
+        self.assertIn("group operating room", update.message.reply_text.await_args.args[0])
+
+        update.message.reply_text.reset_mock()
+        active = types.SimpleNamespace(done=lambda: False)
+        with patch.object(
+            self.group, "run_team_transport_smoke", new=run_smoke
+        ), patch.object(self.group, "autonomy_runner_task", active):
+            await self.group.handle_autorun_command(
+                update, "/autorun team-smoke", allow_live=True
+            )
+        run_smoke.assert_not_awaited()
+        self.assertIn("active", update.message.reply_text.await_args.args[0])
+
+    async def test_autorun_team_smoke_calls_no_model_or_budget_path(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        roster = self.group.telegram_roster_health.RosterHealth((
+            self._smoke_roster_agent("manager"),
+            self._smoke_roster_agent("general", ready=False),
+        ))
+        run_smoke = AsyncMock(return_value={"final_delivery": "direct"})
+        with patch.object(
+            self.group, "telegram_roster_status", roster
+        ), patch.object(
+            self.group, "run_team_transport_smoke", new=run_smoke
+        ), patch.object(
+            self.group, "_run_metered", new=AsyncMock()
+        ) as metered, patch.object(
+            self.group, "_get_autonomy_workflow"
+        ) as workflow, patch.object(
+            self.group.company_mode, "reserve_budget"
+        ) as reserve, patch.object(
+            self.group.company_mode, "reconcile_budget"
+        ) as reconcile:
+            await self.group.handle_autorun_command(
+                update, "/autorun team-smoke", allow_live=True
+            )
+
+        run_smoke.assert_awaited_once()
+        self.assertEqual(
+            run_smoke.await_args.kwargs["requested_by_user_id"], 42
+        )
+        metered.assert_not_awaited()
+        workflow.assert_not_called()
+        reserve.assert_not_called()
+        reconcile.assert_not_called()
+
+    async def test_one_shot_team_smoke_never_starts_polling(self):
+        identity_manager = types.SimpleNamespace(
+            id=101,
+            is_bot=True,
+            username="miles_bot",
+            can_read_all_group_messages=True,
+        )
+        identity_code = types.SimpleNamespace(
+            id=102,
+            is_bot=True,
+            username="code_bot",
+            can_read_all_group_messages=True,
+        )
+        member = types.SimpleNamespace(status="member", is_member=True)
+        manager_bot = types.SimpleNamespace(
+            get_me=AsyncMock(return_value=identity_manager),
+            get_chat_member=AsyncMock(return_value=member),
+        )
+        code_bot = types.SimpleNamespace(
+            get_me=AsyncMock(return_value=identity_code),
+            get_chat_member=AsyncMock(return_value=member),
+        )
+        app_manager = types.SimpleNamespace(
+            bot=manager_bot,
+            initialize=AsyncMock(),
+            shutdown=AsyncMock(),
+            updater=types.SimpleNamespace(start_polling=AsyncMock()),
+        )
+        app_code = types.SimpleNamespace(
+            bot=code_bot,
+            initialize=AsyncMock(),
+            shutdown=AsyncMock(),
+            updater=types.SimpleNamespace(start_polling=AsyncMock()),
+        )
+        builder = Mock()
+        builder.token.return_value = builder
+        builder.build.side_effect = [app_manager, app_code]
+        run_smoke = AsyncMock(return_value={"status": "partial"})
+        token_env = {
+            self.group.AGENT_INFO["manager"]["env_var"]: "manager-token",
+            self.group.AGENT_INFO["code"]["env_var"]: "code-token",
+        }
+
+        with patch.dict(
+            os.environ, token_env, clear=True
+        ), patch.object(
+            self.group, "ApplicationBuilder", return_value=builder
+        ), patch.object(
+            self.group, "run_team_transport_smoke", new=run_smoke
+        ):
+            report = await self.group.run_team_transport_smoke_one_shot()
+
+        self.assertEqual(report["status"], "partial")
+        app_manager.initialize.assert_awaited_once()
+        app_code.initialize.assert_awaited_once()
+        app_manager.updater.start_polling.assert_not_awaited()
+        app_code.updater.start_polling.assert_not_awaited()
+        app_manager.shutdown.assert_awaited_once()
+        app_code.shutdown.assert_awaited_once()
+        passed_bots = run_smoke.await_args.kwargs["bot_map"]
+        self.assertEqual(passed_bots, {
+            "manager": manager_bot,
+            "code": code_bot,
+        })
+        passed_roster = run_smoke.await_args.kwargs["roster_health"]
+        states = {agent.key: agent for agent in passed_roster.agents}
+        self.assertTrue(states["manager"].ready)
+        self.assertTrue(states["code"].ready)
+        self.assertFalse(passed_roster.complete)
+
+    def test_one_shot_cli_only_exits_zero_for_a_complete_pass(self):
+        smoke_script = importlib.import_module("scripts.telegram_team_smoke")
+
+        self.assertEqual(smoke_script._exit_code({"status": "passed"}), 0)
+        self.assertEqual(smoke_script._exit_code({"status": "partial"}), 1)
+        self.assertEqual(smoke_script._exit_code({"status": "failed"}), 1)
 
     def test_autonomy_goal_includes_bounded_run_evidence_and_timing_boundary(self):
         item = {
