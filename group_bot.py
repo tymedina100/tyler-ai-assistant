@@ -22,10 +22,11 @@ Architecture:
   specialist's own bot independently watches the group for its own @username
   and responds, bypassing the Manager entirely - this is what makes agents
   directly reachable without the Manager being a mandatory gatekeeper.
-- Every handler starts with the same guard: ignore messages from other bots
-  (prevents reply loops - privacy mode being off means every bot sees every
-  message, including ones other bots post), ignore anything outside the
-  configured group, ignore anyone not on the allowlist.
+- Every handler starts with the same guard: ignore messages authored by bots,
+  ignore anything outside the configured group, and ignore anyone not on the
+  allowlist. Visible team exchanges are coordinated inside this process and sent
+  through each identity; they do not depend on Telegram delivering bot-authored
+  messages back to other bots, so reply loops remain impossible.
 """
 import asyncio
 import contextvars
@@ -33,14 +34,18 @@ import json
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from dotenv import load_dotenv
+from filelock import FileLock, Timeout as FileLockTimeout
 from telegram import Update
+from telegram.error import RetryAfter
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 import main
@@ -182,6 +187,7 @@ main_loop = None
 # One at a time - /approve refuses to start a second while this is running.
 company_runner_task = None
 autonomy_runner_task = None
+team_smoke_lock = asyncio.Lock()
 _autonomy_workflow_instance = None
 AUTONOMY_CONFIG = autonomous_workflow.AutonomyConfig.from_env()
 AUTONOMY_ROUTER = model_router.ModelRouter()
@@ -219,6 +225,17 @@ AUTONOMY_MAX_TEAM_HELP_REQUESTS = min(1, max(0, AUTONOMY_MAX_TEAM_HELP_REQUESTS)
 AUTONOMY_HELP_REQUEST_PREFIX = "AUTONOMY_HELP_REQUEST"
 AUTONOMY_HELP_QUESTION_MAX_CHARS = 1200
 AUTONOMY_HELP_RESPONSE_MAX_CHARS = 2400
+TEAM_SMOKE_SEND_TIMEOUT_SECONDS = 15
+TEAM_SMOKE_MAX_RETRY_AFTER_SECONDS = 5
+try:
+    TEAM_SMOKE_SEND_INTERVAL_SECONDS = float(
+        os.environ.get("TELEGRAM_TEAM_SMOKE_SEND_INTERVAL_SECONDS", "0.75")
+    )
+except (TypeError, ValueError):
+    TEAM_SMOKE_SEND_INTERVAL_SECONDS = 0.75
+TEAM_SMOKE_SEND_INTERVAL_SECONDS = min(
+    2.0, max(0.0, TEAM_SMOKE_SEND_INTERVAL_SECONDS)
+)
 TELEGRAM_ROSTER_CHECK_ATTEMPTS = 3
 TELEGRAM_ROSTER_RETRY_DELAY_SECONDS = 0.5
 office_api_server = None
@@ -230,6 +247,10 @@ class TeamHelpError(RuntimeError):
     def __init__(self, message, failure_classification):
         super().__init__(message)
         self.failure_classification = failure_classification
+
+
+class TeamExecutionOverlapError(RuntimeError):
+    """A shared autonomous, Company Mode, or team-check execution gate is held."""
 
 
 class TaskDeadlineExceededError(TimeoutError):
@@ -556,7 +577,15 @@ async def send_chunks(bot, chat_id, text):
         await bot.send_message(chat_id, chunk)
 
 
-async def _send_group_message_as(text, bot_key="manager", *, max_chars=None):
+async def _send_group_message_as(
+    text,
+    bot_key="manager",
+    *,
+    max_chars=None,
+    bot_map=None,
+    chat_id=None,
+    raise_retry_after=False,
+):
     """Send one message under a real agent identity, with an explicit Miles relay.
 
     Telegram bot messages remain transport-only: handlers still reject bot authors,
@@ -567,10 +596,12 @@ async def _send_group_message_as(text, bot_key="manager", *, max_chars=None):
     if not message:
         return "skipped_empty"
 
-    bot = bots.get(bot_key)
+    available_bots = bots if bot_map is None else bot_map
+    destination_chat_id = GROUP_CHAT_ID if chat_id is None else chat_id
+    bot = available_bots.get(bot_key)
     relayed = False
     if bot is None:
-        bot = bots.get("manager")
+        bot = available_bots.get("manager")
         if bot is None:
             main.logger.error(
                 f"Could not post as {bot_key!r}: neither that bot nor Miles is configured."
@@ -584,10 +615,17 @@ async def _send_group_message_as(text, bot_key="manager", *, max_chars=None):
         marker = "..."
         message = message[:max(0, max_chars - len(marker))].rstrip() + marker
     try:
-        await send_chunks(bot, GROUP_CHAT_ID, message)
+        await send_chunks(bot, destination_chat_id, message)
         return "relayed_by_manager" if relayed else "direct"
-    except Exception as e:
-        main.logger.error(f"Failed to post Telegram team message: {e}")
+    except Exception as exc:
+        if raise_retry_after and isinstance(exc, RetryAfter):
+            raise
+        # Telegram exceptions can contain token-bearing request URLs.  The class
+        # identifies the transport failure without copying credentials to logs.
+        main.logger.error(
+            "Failed to post Telegram team message "
+            f"({type(exc).__name__}; agent={bot_key})."
+        )
         return "delivery_failed"
 
 
@@ -615,6 +653,425 @@ def _team_delivery_status(value):
         "not_attempted",
     }
     return value if value in allowed else "unknown"
+
+
+def _team_smoke_expected_keys():
+    """Return the complete code-defined roster in its stable display order."""
+
+    return telegram_roster_health.expected_roster_keys(main.SPECIALISTS.keys())
+
+
+def _team_smoke_health_by_key(roster_health):
+    if roster_health is None:
+        return {}
+    return {agent.key: agent for agent in roster_health.agents}
+
+
+def _persist_team_smoke_report(report, report_path):
+    """Persist a secret-redacted smoke report using the autonomy atomic writer."""
+
+    autonomous_workflow._atomic_write_json(Path(report_path), report)
+
+
+def _team_smoke_summary(report):
+    missing = [
+        entry["agent_name"]
+        for entry in report.get("deliveries", [])
+        if entry.get("delivery") == "relayed_by_manager"
+    ]
+    lines = [
+        "TEAM CHANNEL CHECK COMPLETE",
+        f"Status: {report.get('status')}",
+        f"Direct bot identities: {report.get('direct_count', 0)}/{report.get('expected_count', 0)}",
+        f"Miles relays: {report.get('relayed_count', 0)}",
+        f"Delivery failures: {report.get('failed_count', 0)}",
+        "AI/model calls: 0",
+        "AI cost: $0.0000",
+        "Roadmap/task state changes: none",
+    ]
+    if missing:
+        lines.append(f"Missing direct identities: {', '.join(missing)}")
+    if report.get("report_path"):
+        lines.append(f"Report: {report['report_path']}")
+    else:
+        lines.append("Report: persistence failed; inspect Railway logs")
+    return "\n".join(lines)
+
+
+async def _team_smoke_send(text, key, eligible_bots, *, max_chars=700):
+    """Bound one smoke delivery even if Telegram transport stalls."""
+
+    async def send_with_one_bounded_retry():
+        try:
+            return await _send_group_message_as(
+                text,
+                key,
+                max_chars=max_chars,
+                bot_map=eligible_bots,
+                raise_retry_after=True,
+            )
+        except RetryAfter as exc:
+            raw_retry_after = getattr(exc, "retry_after", 0)
+            if isinstance(raw_retry_after, timedelta):
+                retry_after = raw_retry_after.total_seconds()
+            else:
+                try:
+                    retry_after = float(raw_retry_after)
+                except (TypeError, ValueError):
+                    retry_after = TEAM_SMOKE_MAX_RETRY_AFTER_SECONDS + 1
+            if retry_after > TEAM_SMOKE_MAX_RETRY_AFTER_SECONDS:
+                main.logger.warning(
+                    "Telegram team smoke rate-limit delay exceeded its bounded "
+                    f"retry window (agent={key})."
+                )
+                return "delivery_failed"
+            await asyncio.sleep(max(0.0, retry_after))
+            return await _send_group_message_as(
+                text,
+                key,
+                max_chars=max_chars,
+                bot_map=eligible_bots,
+                raise_retry_after=False,
+            )
+
+    try:
+        return _team_delivery_status(
+            await asyncio.wait_for(
+                send_with_one_bounded_retry(),
+                timeout=TEAM_SMOKE_SEND_TIMEOUT_SECONDS,
+            )
+        )
+    except asyncio.TimeoutError:
+        main.logger.error(
+            "Telegram team smoke delivery timed out "
+            f"(agent={key}; timeout_seconds={TEAM_SMOKE_SEND_TIMEOUT_SECONDS})."
+        )
+        return "delivery_failed"
+
+
+async def _run_team_transport_smoke_locked(
+    *,
+    bot_map=None,
+    roster_health=None,
+    trigger_source="telegram",
+    requested_by_user_id=None,
+    report_dir=None,
+    smoke_id=None,
+    started_at=None,
+):
+    """Verify every configured Telegram identity without invoking an AI model.
+
+    This is deliberately a transport check, not simulated project work.  Each
+    expected role gets exactly one bounded check-in.  Roles without a configured
+    bot are posted through an explicit Miles relay so the gap remains visible.
+    """
+
+    if (
+        trigger_source == "telegram"
+        and requested_by_user_id not in ALLOWED_USER_IDS
+    ):
+        raise PermissionError("Only an allowlisted owner can run a Telegram team smoke.")
+
+    available_bots = bots if bot_map is None else bot_map
+    started = started_at or datetime.now(ZoneInfo("UTC"))
+    smoke_id = smoke_id or (
+        f"team_smoke_{started.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    )
+    report_root = Path(
+        report_dir
+        if report_dir is not None
+        else Path(AUTONOMY_CONFIG.data_dir) / "autonomous_runs"
+    )
+    report_path = report_root / f"{smoke_id}.json"
+    health_by_key = _team_smoke_health_by_key(roster_health)
+    expected_keys = _team_smoke_expected_keys()
+    health_keys = tuple(
+        agent.key for agent in getattr(roster_health, "agents", ())
+    )
+    roster_evidence_complete = (
+        health_keys == expected_keys
+        and len(set(health_keys)) == len(health_keys)
+        and bool(roster_health and roster_health.complete)
+    )
+    eligible_bots = {
+        key: bot
+        for key, bot in available_bots.items()
+        if key in expected_keys
+        and health_by_key.get(key) is not None
+        and health_by_key[key].ready
+    }
+    report = {
+        "schema_version": 1,
+        "smoke_id": smoke_id,
+        "trigger_source": str(trigger_source or "unknown"),
+        "started_at": started.isoformat(),
+        "finished_at": None,
+        "status": "running",
+        "expected_count": len(expected_keys),
+        "direct_count": 0,
+        "relayed_count": 0,
+        "failed_count": 0,
+        "final_delivery": "not_attempted",
+        "model_invoked": False,
+        "models_selected": [],
+        "model_calls": 0,
+        "tools_invoked": False,
+        "token_usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
+        "estimated_cost_usd": 0.0,
+        "actual_or_reconciled_cost_usd": 0.0,
+        "roadmap_state_changed": False,
+        "team_chat_enabled": AUTONOMY_TEAM_CHAT_ENABLED,
+        "roster_complete": roster_evidence_complete,
+        "roster_evidence_keys": list(health_keys),
+        "deliveries": [],
+        "report_path": str(report_path.resolve()),
+        "persistence_status": "running_record_pending",
+        "evidence_scope": (
+            "Outbound Telegram identity and relay transport only; this is not proof "
+            "of a model-generated collaboration."
+        ),
+    }
+
+    # No Telegram messages are emitted unless the audit record can first be
+    # created on persistent storage.
+    try:
+        _persist_team_smoke_report(report, report_path)
+    except Exception as exc:
+        main.logger.error(
+            "Telegram team smoke running record could not be persisted "
+            f"({type(exc).__name__})."
+        )
+        raise RuntimeError("Team smoke audit persistence is unavailable.") from None
+    report["persistence_status"] = "persisted"
+
+    for index, key in enumerate(expected_keys):
+        if index and TEAM_SMOKE_SEND_INTERVAL_SECONDS:
+            await asyncio.sleep(TEAM_SMOKE_SEND_INTERVAL_SECONDS)
+        name = _agent_display_name(key)
+        configured_direct = key in eligible_bots
+        roster_agent = health_by_key.get(key)
+        roster_status = roster_agent.status if roster_agent is not None else "unchecked"
+        if configured_direct:
+            check_in = (
+                f"TEAM CHECK {smoke_id}\n"
+                f"{name}: direct channel ready. This is a transport check only; "
+                "no AI model was called."
+            )
+        else:
+            env_var = str(AGENT_INFO.get(key, {}).get("env_var") or "")
+            issue_codes = list(
+                roster_agent.issue_codes if roster_agent is not None else ()
+            )
+            reason = ", ".join(issue_codes) or "bot_client_unavailable"
+            check_in = (
+                f"TEAM CHECK {smoke_id}\n"
+                f"Direct bot identity is not ready ({reason}); Miles will relay this "
+                f"role's work safely. Configuration variable: {env_var or 'unknown'}."
+            )
+        delivery = await _team_smoke_send(check_in, key, eligible_bots)
+        report["deliveries"].append({
+            "agent_key": key,
+            "agent_name": name,
+            "bot_client_available": key in available_bots,
+            "direct_ready": configured_direct,
+            "roster_username": (
+                roster_agent.username if roster_agent is not None else ""
+            ),
+            "roster_status": roster_status,
+            "roster_issue_codes": list(
+                roster_agent.issue_codes if roster_agent is not None else ()
+            ),
+            "delivery": delivery,
+        })
+
+    direct_count = sum(
+        entry["delivery"] == "direct" for entry in report["deliveries"]
+    )
+    relayed_count = sum(
+        entry["delivery"] == "relayed_by_manager"
+        for entry in report["deliveries"]
+    )
+    failed_count = len(report["deliveries"]) - direct_count - relayed_count
+    if failed_count:
+        final_status = "failed"
+    elif relayed_count or not report["roster_complete"]:
+        final_status = "partial"
+    else:
+        final_status = "passed"
+
+    report.update({
+        "finished_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "status": final_status,
+        "direct_count": direct_count,
+        "relayed_count": relayed_count,
+        "failed_count": failed_count,
+    })
+    _persist_team_smoke_report(report, report_path)
+
+    if TEAM_SMOKE_SEND_INTERVAL_SECONDS:
+        await asyncio.sleep(TEAM_SMOKE_SEND_INTERVAL_SECONDS)
+    report["final_delivery"] = await _team_smoke_send(
+        _team_smoke_summary(report),
+        "manager",
+        eligible_bots,
+        max_chars=1200,
+    )
+    report["final_summary_failed"] = report["final_delivery"] != "direct"
+    if report["final_summary_failed"]:
+        report["status"] = "failed"
+    try:
+        _persist_team_smoke_report(report, report_path)
+    except Exception as exc:
+        main.logger.error(
+            "Telegram team smoke final delivery could not be reconciled "
+            f"({type(exc).__name__})."
+        )
+        report["persistence_status"] = "reconcile_failed"
+    return report
+
+
+def _team_execution_lock_path(execution_lock_path=None, report_dir=None):
+    """Return the gate shared by autonomy, Company Mode, and team diagnostics."""
+
+    if execution_lock_path is not None:
+        return Path(execution_lock_path)
+    if report_dir is not None:
+        return Path(report_dir) / "autonomy_run.lock"
+    return Path(AUTONOMY_CONFIG.data_dir) / "autonomy_run.lock"
+
+
+async def run_team_transport_smoke(
+    *,
+    bot_map=None,
+    roster_health=None,
+    trigger_source="telegram",
+    requested_by_user_id=None,
+    report_dir=None,
+    smoke_id=None,
+    started_at=None,
+    execution_lock_path=None,
+):
+    """Run one team transport check under the shared persistent execution gate."""
+
+    if (
+        trigger_source == "telegram"
+        and requested_by_user_id not in ALLOWED_USER_IDS
+    ):
+        raise PermissionError("Only an allowlisted owner can run a Telegram team smoke.")
+
+    lock_path = _team_execution_lock_path(execution_lock_path, report_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    execution_lock = FileLock(str(lock_path), timeout=0)
+    try:
+        execution_lock.acquire()
+    except FileLockTimeout:
+        raise TeamExecutionOverlapError(
+            "Another autonomous, Company Mode, or team-check run is active."
+        ) from None
+    try:
+        return await _run_team_transport_smoke_locked(
+            bot_map=bot_map,
+            roster_health=roster_health,
+            trigger_source=trigger_source,
+            requested_by_user_id=requested_by_user_id,
+            report_dir=report_dir,
+            smoke_id=smoke_id,
+            started_at=started_at,
+        )
+    finally:
+        execution_lock.release()
+
+
+async def run_team_transport_smoke_one_shot():
+    """Run the transport smoke from Railway without starting any bot poller."""
+
+    one_shot_apps = {}
+    one_shot_bots = {}
+    roster_tokens = {
+        info["env_var"]: os.environ.get(info["env_var"], "")
+        for info in AGENT_INFO.values()
+    }
+    roster_identities = {}
+    roster_memberships = {}
+    try:
+        for key in _team_smoke_expected_keys():
+            token = os.environ.get(AGENT_INFO[key]["env_var"], "")
+            if not token:
+                continue
+            app = None
+            try:
+                app = ApplicationBuilder().token(token).build()
+                await app.initialize()
+            except Exception as exc:
+                main.logger.error(
+                    "Telegram team smoke could not initialize an agent identity "
+                    f"({type(exc).__name__}; agent={key})."
+                )
+                if app is not None:
+                    try:
+                        await app.shutdown()
+                    except Exception:
+                        pass
+                continue
+            one_shot_apps[key] = app
+            one_shot_bots[key] = app.bot
+
+            identity_ok, identity = await _telegram_roster_call(
+                key,
+                "identity",
+                app.bot.get_me,
+            )
+            if not identity_ok:
+                roster_identities[key] = {"check_unavailable": True}
+                continue
+            roster_identities[key] = {
+                "id": identity.id,
+                "is_bot": identity.is_bot,
+                "username": identity.username,
+                "can_read_all_group_messages": getattr(
+                    identity, "can_read_all_group_messages", None
+                ),
+            }
+            membership_ok, member = await _telegram_roster_call(
+                key,
+                "group membership",
+                lambda: app.bot.get_chat_member(GROUP_CHAT_ID, identity.id),
+            )
+            if membership_ok:
+                roster_memberships[key] = {
+                    "status": getattr(member, "status", ""),
+                    "is_member": getattr(member, "is_member", None),
+                }
+            else:
+                roster_memberships[key] = {"check_unavailable": True}
+
+        one_shot_roster = telegram_roster_health.evaluate_roster(
+            specialist_keys=main.SPECIALISTS.keys(),
+            agent_info=AGENT_INFO,
+            token_values=roster_tokens,
+            identities=roster_identities,
+            group_memberships=roster_memberships,
+        )
+
+        return await run_team_transport_smoke(
+            bot_map=one_shot_bots,
+            roster_health=one_shot_roster,
+            trigger_source="railway_cli",
+        )
+    finally:
+        for key, app in reversed(tuple(one_shot_apps.items())):
+            try:
+                await app.shutdown()
+            except Exception as exc:
+                main.logger.error(
+                    "Telegram team smoke could not close an agent client "
+                    f"({type(exc).__name__}; agent={key})."
+                )
 
 
 def build_specialist_handler(key):
@@ -2255,7 +2712,7 @@ async def _run_one_task(project, task):
     return await _execute_routed_task(project, task, owner, prompt, sink)
 
 
-async def run_company_plan(project_id):
+async def _run_company_plan_locked(project_id):
     """Work a project's tasks one at a time until done, paused, blocked, or the daily
     budget is exhausted. Checks pause + budget between every task (the checkpoints)."""
     try:
@@ -2368,6 +2825,28 @@ async def run_company_plan(project_id):
             failure_classification="technical",
         )
         await post_to_group("The work plan hit an unexpected error and stopped. Check the logs.", "manager")
+
+
+async def run_company_plan(project_id, *, execution_lock_path=None):
+    """Run Company Mode under the persistent gate shared with daily autonomy."""
+
+    lock_path = _team_execution_lock_path(execution_lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    execution_lock = FileLock(str(lock_path), timeout=0)
+    try:
+        execution_lock.acquire()
+    except FileLockTimeout:
+        await post_to_group(
+            "Another autonomous, Company Mode, or team-check run is active; this "
+            "Company plan did not start. Retry /approve after that run posts its "
+            "final report.",
+            "manager",
+        )
+        return
+    try:
+        await _run_company_plan_locked(project_id)
+    finally:
+        execution_lock.release()
 
 
 # --------------------------------------------------------------------------- #
@@ -2579,7 +3058,9 @@ async def _execute_autonomy_item(project, item, decision, run_id):
             raise RuntimeError("Autonomous Company Mode project could not be activated")
         company_project_id = approved_project_id
 
-        await run_company_plan(company_project_id)
+        # AutonomousWorkflow already owns the shared persistent execution gate for
+        # this entire session. Re-acquiring it here would deadlock/fail the same run.
+        await _run_company_plan_locked(company_project_id)
         final_state = await asyncio.to_thread(company_mode.load_state)
         return autonomy_team.aggregate_company_result(
             final_state,
@@ -2828,6 +3309,7 @@ def _autonomy_status_text():
     ]
     if telegram_roster_status is not None:
         lines.append(telegram_roster_health.render_roster_summary(telegram_roster_status))
+        lines.append("Team transport check: /autorun team-smoke (0 model calls; $0.0000)")
     for idea in proposed_ideas[:5]:
         title = re.sub(r"\s+", " ", str(idea.get("idea") or "Untitled idea")).strip()
         if len(title) > 100:
@@ -2922,6 +3404,63 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         return
     if argument == "status":
         await reply_chunks(update.message, await asyncio.to_thread(_autonomy_status_text))
+        return
+    if argument in {"team-smoke", "team-check"}:
+        if not allow_live:
+            await update.message.reply_text(
+                "Run the team channel check from the group operating room, not a DM."
+            )
+            return
+        if autonomy_runner_task and not autonomy_runner_task.done():
+            await update.message.reply_text(
+                "An autonomous run is active; the team channel check was not started. "
+                "Retry after its final report so the Telegram transcript stays unambiguous."
+            )
+            return
+        if company_runner_task and not company_runner_task.done():
+            await update.message.reply_text(
+                "Company Mode is active; the team channel check was not started. "
+                "Retry after the supervised plan finishes."
+            )
+            return
+        if team_smoke_lock.locked():
+            await update.message.reply_text(
+                "A team channel check is already active; no second check was started."
+            )
+            return
+        if telegram_roster_status is None:
+            await update.message.reply_text(
+                "The startup roster check is not available yet; no team messages were sent."
+            )
+            return
+        try:
+            async with team_smoke_lock:
+                report = await run_team_transport_smoke(
+                    roster_health=telegram_roster_status,
+                    trigger_source="telegram",
+                    requested_by_user_id=getattr(
+                        getattr(update, "effective_user", None), "id", None
+                    ),
+                )
+        except TeamExecutionOverlapError:
+            await update.message.reply_text(
+                "Another autonomous, Company Mode, or team-check run holds the "
+                "persistent execution gate; no team-check messages were sent. "
+                "Retry after its final report."
+            )
+            return
+        except Exception as exc:
+            main.logger.error(
+                "Telegram team channel check stopped unexpectedly "
+                f"({type(exc).__name__})."
+            )
+            await update.message.reply_text(
+                "The team channel check stopped safely. No model was called and no "
+                "project state changed; inspect Railway logs for the exception class."
+            )
+            return
+        if report.get("final_delivery") not in {"direct", "relayed_by_manager"}:
+            await reply_chunks(update.message, _team_smoke_summary(report))
         return
     if argument == "queue" or argument.startswith("queue "):
         parts = raw_argument.split()
@@ -3121,7 +3660,7 @@ async def handle_autorun_command(update, text, *, allow_live=True):
         )
         return
     await update.message.reply_text(
-        "Usage: /autorun dry-run | /autorun status | "
+        "Usage: /autorun dry-run | /autorun status | /autorun team-smoke | "
         "/autorun queue <manifest-id> | "
         "/autorun promote <idea-id> [project-id] | "
         "/autorun retry <roadmap-item-id> | /autorun live"
