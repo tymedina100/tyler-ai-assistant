@@ -192,6 +192,12 @@ class ExecutionReservationStateError(RuntimeError):
     """Raised when a strict task hold cannot be updated safely in persistent state."""
 
 
+class ExecutionDeadlineExceededError(TimeoutError):
+    """Raised when a strict autonomous provider request reaches its real deadline."""
+
+    failure_classification = "transient"
+
+
 class IncompleteModelResponseError(RuntimeError):
     """Raised when a model call does not produce one complete visible answer."""
 
@@ -215,6 +221,127 @@ def _configured_autonomy_tool_result_chars():
     except (TypeError, ValueError):
         value = 12000
     return min(100000, max(256, value))
+
+
+def _configured_autonomy_task_timeout_seconds():
+    """Return the shared wall-clock deadline for one strict autonomous task."""
+
+    try:
+        value = float(os.environ.get("AUTONOMY_TASK_TIMEOUT_SECONDS", "900"))
+    except (TypeError, ValueError):
+        value = 900.0
+    return max(0.01, value)
+
+
+def _strict_request_timeout_seconds(sink=None):
+    """Return remaining seconds for a strict request, creating one task deadline.
+
+    The OpenAI Python SDK otherwise defaults to two transport retries and a
+    600-second read timeout. Strict autonomous work instead shares one absolute
+    deadline across every primary, tool-loop, helper, and synthesis request.
+    """
+
+    sink = current_execution_sink() if sink is None else sink
+    if sink is None or sink.get("budget_cap_usd") is None:
+        return None
+    now = time.monotonic()
+    deadline = sink.get("request_deadline_monotonic")
+    if deadline is None:
+        deadline = now + _configured_autonomy_task_timeout_seconds()
+        sink["request_deadline_monotonic"] = deadline
+    try:
+        remaining = float(deadline) - now
+    except (TypeError, ValueError):
+        remaining = 0.0
+    if remaining <= 0:
+        sink["deadline_exceeded"] = True
+        sink["deadline_reason"] = (
+            "The autonomous task deadline elapsed before the next provider request "
+            "could start."
+        )
+        raise ExecutionDeadlineExceededError(sink["deadline_reason"])
+    return max(0.001, remaining)
+
+
+def _strict_openai_client(openai_client):
+    """Disable SDK transport retries and apply the remaining task deadline.
+
+    Production OpenAI clients expose ``with_options``. Lightweight unit-test
+    doubles may omit it; those doubles perform no transport and remain supported.
+    """
+
+    timeout_seconds = _strict_request_timeout_seconds()
+    if timeout_seconds is None:
+        return openai_client
+    with_options = getattr(openai_client, "with_options", None)
+    if callable(with_options):
+        return with_options(max_retries=0, timeout=timeout_seconds)
+    return openai_client
+
+
+def _looks_like_timeout(error):
+    return isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
+
+
+def _mark_unmeasured_model_call(model, *, deadline_exceeded=False):
+    """Pessimistically consume a strict hold when provider usage is unavailable."""
+
+    sink = current_execution_sink()
+    if sink is None or sink.get("budget_cap_usd") is None:
+        return None
+    if sink.get("unmeasured_model_calls"):
+        message = str(
+            sink.get("budget_guard_reason")
+            or sink.get("deadline_reason")
+            or "A prior autonomous model call returned no measurable usage."
+        )
+        return (
+            ExecutionDeadlineExceededError(message)
+            if sink.get("deadline_exceeded")
+            else ExecutionBudgetExceededError(message)
+        )
+
+    cap = max(0.0, float(sink.get("budget_cap_usd", 0.0) or 0.0))
+    measured = max(0.0, float(sink.get("cost_usd", 0.0) or 0.0))
+    pessimistic_cost = round(max(0.0, cap - measured), 6)
+    record = {
+        "model": model,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": pessimistic_cost,
+        "cost_kind": "estimated_unmeasured",
+    }
+    active_agent = str(sink.get("active_agent") or "").strip()
+    if active_agent:
+        record["agent"] = active_agent
+    sink.setdefault("usage_records", []).append(record)
+    sink["cost_usd"] = round(max(measured, cap), 6)
+    sink["unmeasured_model_calls"] = int(
+        sink.get("unmeasured_model_calls", 0) or 0
+    ) + 1
+    sink["usage_is_incomplete"] = True
+    sink["cost_is_estimated"] = True
+    sink["budget_guard_blocked"] = True
+
+    if deadline_exceeded:
+        message = (
+            f"The {model} request reached the autonomous task deadline before usage "
+            "was returned. The remaining task hold was conservatively accounted as "
+            "estimated, and no further model call is allowed."
+        )
+        sink["deadline_exceeded"] = True
+        sink["deadline_reason"] = message
+        sink["budget_guard_reason"] = message
+        return ExecutionDeadlineExceededError(message)
+
+    message = (
+        f"The provider returned no measurable usage for the {model} request. The "
+        "remaining task hold was conservatively accounted as estimated, and no "
+        "further model call is allowed."
+    )
+    sink["budget_guard_reason"] = message
+    return ExecutionBudgetExceededError(message)
 
 
 def _safe_response_metadata_value(value):
@@ -313,14 +440,24 @@ def _budgeted_response_options(openai_client, model, instructions, input_items, 
     if tools is not None:
         count_kwargs["tools"] = tools
     try:
+        strict_client = _strict_openai_client(openai_client)
         counted = call_with_retries(
-            lambda: openai_client.responses.input_tokens.count(**count_kwargs),
+            lambda: strict_client.responses.input_tokens.count(**count_kwargs),
             label="OpenAI input-token count",
         )
         input_tokens = int(getattr(counted, "input_tokens"))
         if input_tokens < 0:
             raise ValueError("provider returned a negative input-token count")
+    except ExecutionDeadlineExceededError:
+        raise
     except Exception as exc:
+        if _looks_like_timeout(exc):
+            sink["deadline_exceeded"] = True
+            sink["deadline_reason"] = (
+                "The autonomous task deadline elapsed while counting request input; "
+                "no model generation was started."
+            )
+            raise ExecutionDeadlineExceededError(sink["deadline_reason"]) from exc
         sink["budget_guard_blocked"] = True
         sink["budget_guard_reason"] = (
             f"Strict budget enforcement could not count the next {model} request: {exc}"
@@ -569,7 +706,17 @@ def _accrue_cost(model, usage):
     if sink is not None:
         record = usage_record(model, usage)
         if record is None:
+            unmeasured = _mark_unmeasured_model_call(model)
+            if unmeasured is not None:
+                raise unmeasured
             return
+        # Autonomous team work reuses one parent-task reservation for a primary
+        # worker, one bounded helper, and the worker's resumed answer.  Preserve
+        # the actual caller on every usage record so cost-by-agent reporting does
+        # not falsely attribute a teammate's help to the primary worker.
+        active_agent = str(sink.get("active_agent") or "").strip()
+        if active_agent:
+            record["agent"] = active_agent
         sink["cost_usd"] = round(sink.get("cost_usd", 0.0) + record["cost_usd"], 6)
         sink.setdefault("usage_records", []).append(record)
         cap = sink.get("budget_cap_usd")
@@ -580,6 +727,65 @@ def _accrue_cost(model, usage):
                 f"${float(cap):.4f} reserved budget envelope; no further calls are allowed."
             )
             raise ExecutionBudgetExceededError(sink["budget_guard_reason"])
+
+
+def _call_responses_create(openai_client, model, request_kwargs, *, label):
+    """Create one response with strict retry/deadline and usage accounting.
+
+    Outside a strict task envelope this preserves the existing client and retry
+    behavior. Inside one, every started generation either returns measured usage
+    or pessimistically consumes the remaining hold and stops the task.
+    """
+
+    sink = current_execution_sink()
+    strict = sink is not None and sink.get("budget_cap_usd") is not None
+    request_kwargs = dict(request_kwargs)
+    if strict:
+        bounded = _budgeted_response_options(
+            openai_client,
+            model,
+            request_kwargs.get("instructions"),
+            request_kwargs.get("input"),
+            request_kwargs.get("tools") if "tools" in request_kwargs else None,
+        )
+        if "max_output_tokens" in request_kwargs:
+            bounded["max_output_tokens"] = min(
+                int(request_kwargs["max_output_tokens"]),
+                int(bounded["max_output_tokens"]),
+            )
+        request_kwargs.update(bounded)
+    client = _strict_openai_client(openai_client) if strict else openai_client
+    if strict:
+        sink["model_requests_started"] = int(
+            sink.get("model_requests_started", 0) or 0
+        ) + 1
+    try:
+        response = call_with_retries(
+            lambda: client.responses.create(**request_kwargs),
+            label=label,
+        )
+    except (
+        ExecutionBudgetExceededError,
+        ExecutionReservationStateError,
+        ExecutionDeadlineExceededError,
+    ):
+        raise
+    except Exception as exc:
+        if strict:
+            unmeasured = _mark_unmeasured_model_call(
+                model,
+                deadline_exceeded=_looks_like_timeout(exc),
+            )
+            raise unmeasured from exc
+        raise
+
+    usage = getattr(response, "usage", None)
+    _accrue_cost(model, usage)
+    if strict:
+        sink["model_responses_with_usage"] = int(
+            sink.get("model_responses_with_usage", 0) or 0
+        ) + 1
+    return response
 
 
 def _record_artifact(note):
@@ -919,18 +1125,20 @@ def _now_local():
 def get_ai_response(input_messages, model=PREMIUM_MODEL, instructions=ASSISTANT_INSTRUCTIONS):
     try:
         openai_client = get_openai_client()
-        response = call_with_retries(
-            lambda: openai_client.responses.create(
-                model=model,
-                instructions=instructions,
-                input=input_messages
-            ),
-            label="OpenAI chat call"
+        response = _call_responses_create(
+            openai_client,
+            model,
+            {
+                "model": model,
+                "instructions": instructions,
+                "input": input_messages,
+            },
+            label="OpenAI chat call",
         )
-
-        _accrue_cost(model, getattr(response, "usage", None))
         return response.output_text
 
+    except (ExecutionBudgetExceededError, ExecutionReservationStateError, ExecutionDeadlineExceededError):
+        raise
     except Exception:
         return "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
 
@@ -989,16 +1197,12 @@ def _final_tool_synthesis(openai_client, model, instructions, input_items):
         "instructions": final_instructions,
         "input": input_items,
     }
-    final_kwargs.update(
-        _budgeted_response_options(
-            openai_client, model, final_instructions, input_items
-        )
-    )
-    final_response = call_with_retries(
-        lambda: openai_client.responses.create(**final_kwargs),
+    final_response = _call_responses_create(
+        openai_client,
+        model,
+        final_kwargs,
         label="OpenAI final synthesis call",
     )
-    _accrue_cost(model, getattr(final_response, "usage", None))
     incomplete, status, reason = _response_needs_synthesis(final_response)
     if incomplete:
         details = ", ".join(
@@ -1034,17 +1238,12 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
                 "input": input_items,
                 "tools": tools,
             }
-            request_kwargs.update(
-                _budgeted_response_options(
-                    openai_client, model, instructions, input_items, tools
-                )
+            response = _call_responses_create(
+                openai_client,
+                model,
+                request_kwargs,
+                label="OpenAI chat call",
             )
-            response = call_with_retries(
-                lambda: openai_client.responses.create(**request_kwargs),
-                label="OpenAI chat call"
-            )
-
-            _accrue_cost(model, getattr(response, "usage", None))
 
             response_status, _response_reason = _response_completion_metadata(response)
             response_output = list(getattr(response, "output", []) or [])
@@ -1093,7 +1292,11 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
                 openai_client, model, instructions, input_items
             )
 
-    except (ExecutionBudgetExceededError, ExecutionReservationStateError):
+    except (
+        ExecutionBudgetExceededError,
+        ExecutionReservationStateError,
+        ExecutionDeadlineExceededError,
+    ):
         raise
     except IncompleteModelResponseError:
         sink = current_execution_sink()
@@ -3360,15 +3563,16 @@ def select_group_responders(text):
     any model or parse error, so a routing glitch never drops the message."""
     try:
         openai_client = get_openai_client()
-        response = call_with_retries(
-            lambda: openai_client.responses.create(
-                model=FAST_MODEL,
-                instructions=_GROUP_ROUTER_INSTRUCTIONS,
-                input=[{"role": "user", "content": text}],
-            ),
+        response = _call_responses_create(
+            openai_client,
+            FAST_MODEL,
+            {
+                "model": FAST_MODEL,
+                "instructions": _GROUP_ROUTER_INSTRUCTIONS,
+                "input": [{"role": "user", "content": text}],
+            },
             label="Group router call",
         )
-        _accrue_cost(FAST_MODEL, getattr(response, "usage", None))
         raw = response.output_text.strip()
 
         # The model may wrap JSON in prose or a ```json fence - grab the object.
@@ -3388,6 +3592,8 @@ def select_group_responders(text):
 
         return responders
 
+    except (ExecutionBudgetExceededError, ExecutionReservationStateError, ExecutionDeadlineExceededError):
+        raise
     except Exception as e:
         logger.error(f"Group router failed, falling back to manager: {e}")
         return ["manager"]
@@ -3432,15 +3638,16 @@ Reply with ONLY a JSON object: {{"tasks": [{{"owner": "<agent key>", "title": "<
 
     try:
         openai_client = get_openai_client()
-        response = call_with_retries(
-            lambda: openai_client.responses.create(
-                model=FAST_MODEL,
-                instructions=instructions,
-                input=[{"role": "user", "content": goal}],
-            ),
+        response = _call_responses_create(
+            openai_client,
+            FAST_MODEL,
+            {
+                "model": FAST_MODEL,
+                "instructions": instructions,
+                "input": [{"role": "user", "content": goal}],
+            },
             label="Company planner call",
         )
-        _accrue_cost(FAST_MODEL, getattr(response, "usage", None))
         raw = response.output_text.strip()
 
         start, end = raw.find("{"), raw.rfind("}")
@@ -3459,6 +3666,8 @@ Reply with ONLY a JSON object: {{"tasks": [{{"owner": "<agent key>", "title": "<
             return plan
         raise ValueError(f"planner produced no valid tasks: {parsed!r}")
 
+    except (ExecutionBudgetExceededError, ExecutionReservationStateError, ExecutionDeadlineExceededError):
+        raise
     except Exception as e:
         logger.error(f"Company planner failed, using default plan: {e}")
         return None
@@ -3496,18 +3705,21 @@ def recommend_next_move(pnl_summary):
     )
     try:
         openai_client = get_openai_client()
-        response = call_with_retries(
-            lambda: openai_client.responses.create(
-                model=FAST_MODEL,
-                instructions=instructions,
-                input=[{"role": "user", "content": pnl_summary}],
-            ),
+        response = _call_responses_create(
+            openai_client,
+            FAST_MODEL,
+            {
+                "model": FAST_MODEL,
+                "instructions": instructions,
+                "input": [{"role": "user", "content": pnl_summary}],
+            },
             label="Next-move recommendation call",
         )
-        _accrue_cost(FAST_MODEL, getattr(response, "usage", None))
         text = (response.output_text or "").strip()
         if text:
             return text
+    except (ExecutionBudgetExceededError, ExecutionReservationStateError, ExecutionDeadlineExceededError):
+        raise
     except Exception as e:
         logger.error(f"recommend_next_move failed: {e}")
     return NEXT_MOVE_FALLBACK
@@ -3549,16 +3761,12 @@ Reply with ONLY a JSON object shaped as {{"ideas": [{{
             "instructions": instructions,
             "input": idea_input,
         }
-        request_kwargs.update(
-            _budgeted_response_options(
-                openai_client, selected_model, instructions, idea_input
-            )
-        )
-        response = call_with_retries(
-            lambda: openai_client.responses.create(**request_kwargs),
+        response = _call_responses_create(
+            openai_client,
+            selected_model,
+            request_kwargs,
             label="Controlled ideation call",
         )
-        _accrue_cost(selected_model, getattr(response, "usage", None))
         raw = (response.output_text or "").strip()
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
@@ -3581,7 +3789,11 @@ Reply with ONLY a JSON object shaped as {{"ideas": [{{
                 idea["estimated_ai_cost_usd"] = 0.0
             ideas.append(idea)
         return ideas
-    except ExecutionBudgetExceededError:
+    except (
+        ExecutionBudgetExceededError,
+        ExecutionReservationStateError,
+        ExecutionDeadlineExceededError,
+    ):
         raise
     except Exception as e:
         logger.error(f"Controlled ideation failed: {e}")

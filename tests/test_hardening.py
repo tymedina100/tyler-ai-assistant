@@ -3,10 +3,11 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,6 +200,19 @@ class HardeningTests(unittest.TestCase):
             self.main.usage_to_usd(self.main.PREMIUM_MODEL, usage), 0.0005, places=6
         )
 
+    def test_metered_usage_records_the_actual_active_team_agent(self):
+        sink = {"cost_usd": 0.0, "usage_records": [], "active_agent": "research"}
+        self.main.set_execution_sink(sink)
+        try:
+            self.main._accrue_cost(
+                self.main.FAST_MODEL,
+                FakeUsage(input_tokens=100, output_tokens=20),
+            )
+        finally:
+            self.main.set_execution_sink(None)
+
+        self.assertEqual(sink["usage_records"][0]["agent"], "research")
+
     def test_plan_company_goal_parses_and_falls_back(self):
         main = self.main
 
@@ -333,11 +347,12 @@ class HardeningTests(unittest.TestCase):
                         incomplete_details=types.SimpleNamespace(
                             reason="max_output_tokens"
                         ),
-                        usage=None,
+                        usage=FakeUsage(input_tokens=100, output_tokens=10),
                     )
                 return types.SimpleNamespace(
                     output=[], output_text="Complete synthesized answer.",
-                    status="completed", incomplete_details=None, usage=None,
+                    status="completed", incomplete_details=None,
+                    usage=FakeUsage(input_tokens=100, output_tokens=10),
                 )
 
         sink = {
@@ -385,11 +400,13 @@ class HardeningTests(unittest.TestCase):
                 if len(calls) == 1:
                     return types.SimpleNamespace(
                         output=[], output_text="", status="completed",
-                        incomplete_details=None, usage=None,
+                        incomplete_details=None,
+                        usage=FakeUsage(input_tokens=100, output_tokens=10),
                     )
                 return types.SimpleNamespace(
                     output=[], output_text="", status="incomplete",
-                    incomplete_details={"reason": "max_output_tokens"}, usage=None,
+                    incomplete_details={"reason": "max_output_tokens"},
+                    usage=FakeUsage(input_tokens=100, output_tokens=10),
                 )
 
         sink = {
@@ -460,11 +477,13 @@ class HardeningTests(unittest.TestCase):
                     )
                     return types.SimpleNamespace(
                         output=[call], output_text="", status="completed",
-                        incomplete_details=None, usage=None,
+                        incomplete_details=None,
+                        usage=FakeUsage(input_tokens=100, output_tokens=10),
                     )
                 return types.SimpleNamespace(
                     output=[], output_text="bounded answer", status="completed",
-                    incomplete_details=None, usage=None,
+                    incomplete_details=None,
+                    usage=FakeUsage(input_tokens=100, output_tokens=10),
                 )
 
         sink = {
@@ -592,6 +611,148 @@ class HardeningTests(unittest.TestCase):
             os.environ, {"AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL": ""}
         ):
             self.assertEqual(main._configured_budget_output_tokens(), 3000)
+
+    def test_strict_responses_disable_sdk_retries_and_share_task_deadline(self):
+        main = self.main
+        option_calls = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=100)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                return types.SimpleNamespace(
+                    output=[], output_text="bounded answer",
+                    usage=FakeUsage(input_tokens=100, output_tokens=10),
+                )
+
+        class Client:
+            responses = Responses()
+
+            def with_options(self, **kwargs):
+                option_calls.append(kwargs)
+                return self
+
+        sink = {
+            "cost_usd": 0.0, "usage_records": [], "artifacts": [],
+            "budget_cap_usd": 0.05,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.dict(
+                os.environ, {"AUTONOMY_TASK_TIMEOUT_SECONDS": "2"}
+            ), patch.object(main, "get_openai_client", return_value=Client()):
+                result = main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[], max_iterations=1, model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(result, "bounded answer")
+        self.assertGreaterEqual(len(option_calls), 2)  # input count + generation
+        self.assertTrue(all(call["max_retries"] == 0 for call in option_calls))
+        self.assertTrue(all(0 < call["timeout"] <= 2 for call in option_calls))
+        self.assertLessEqual(option_calls[-1]["timeout"], option_calls[0]["timeout"])
+
+    def test_run_with_tools_re_raises_an_expired_strict_deadline(self):
+        main = self.main
+        sink = {
+            "cost_usd": 0.0,
+            "usage_records": [],
+            "artifacts": [],
+            "budget_cap_usd": 0.05,
+            "request_deadline_monotonic": time.monotonic() - 1,
+        }
+        client = types.SimpleNamespace(
+            responses=types.SimpleNamespace(
+                input_tokens=types.SimpleNamespace(
+                    count=Mock(side_effect=AssertionError("count must not start"))
+                ),
+                create=Mock(side_effect=AssertionError("generation must not start")),
+            )
+        )
+
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(main, "get_openai_client", return_value=client), self.assertRaises(
+                main.ExecutionDeadlineExceededError
+            ):
+                main.run_with_tools(
+                    "bounded",
+                    [{"role": "user", "content": "inspect"}],
+                    tools=[],
+                    max_iterations=1,
+                    model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertTrue(sink["deadline_exceeded"])
+        client.responses.input_tokens.count.assert_not_called()
+        client.responses.create.assert_not_called()
+
+    def test_one_missing_usage_response_consumes_hold_and_stops_tool_loop(self):
+        main = self.main
+        create_calls = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=100)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                create_calls.append(kwargs)
+                if len(create_calls) == 1:
+                    call = types.SimpleNamespace(
+                        type="function_call", name="safe_read",
+                        arguments="{}", call_id="call-1",
+                    )
+                    return types.SimpleNamespace(
+                        output=[call], output_text="",
+                        usage=FakeUsage(input_tokens=100, output_tokens=10),
+                    )
+                return types.SimpleNamespace(
+                    output=[], output_text="unmeasured answer", usage=None,
+                )
+
+        sink = {
+            "cost_usd": 0.0, "usage_records": [], "artifacts": [],
+            "budget_cap_usd": 0.05, "active_agent": "research",
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ), patch.object(main, "execute_tool", return_value="evidence"), self.assertRaises(
+                main.ExecutionBudgetExceededError
+            ):
+                main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[{"type": "function", "name": "safe_read"}],
+                    max_iterations=3, model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(len(create_calls), 2)
+        self.assertEqual(sink["model_requests_started"], 2)
+        self.assertEqual(sink["model_responses_with_usage"], 1)
+        self.assertEqual(sink["unmeasured_model_calls"], 1)
+        self.assertEqual(sink["cost_usd"], sink["budget_cap_usd"])
+        self.assertEqual(sink["usage_records"][-1]["cost_kind"], "estimated_unmeasured")
+        self.assertEqual(sink["usage_records"][-1]["agent"], "research")
+        self.assertTrue(sink["budget_guard_blocked"])
 
     def test_budgeted_tool_call_fails_before_generation_when_input_does_not_fit(self):
         main = self.main

@@ -164,6 +164,50 @@ class AutonomyTeamTests(unittest.TestCase):
         self.assertEqual(result["failure_classification"], "permission_denied")
         self.assertIn("permission", result["human_action"].lower())
 
+    def test_company_result_attributes_helper_model_agent_cost_and_reason(self):
+        state = {
+            "projects": [{
+                "id": "proj-help", "status": "completed", "editor_verdict": "approved",
+            }],
+            "tasks": [{
+                "id": "worker", "project_id": "proj-help", "owner": "code",
+                "status": "done", "title": "Validate", "result": "Validated.",
+                "spent_usd": 0.03, "model": "worker-model", "execution_attempts": 1,
+                "attempt_history": [{
+                    "model": "worker-model", "model_reason": "Standard coding route."
+                }],
+                "usage_records": [
+                    {"model": "worker-model", "agent": "code", "input_tokens": 100,
+                     "output_tokens": 20, "cost_usd": 0.02},
+                    {"model": "helper-model", "agent": "research", "input_tokens": 50,
+                     "output_tokens": 10, "cost_usd": 0.01},
+                ],
+                "team_help_events": [{
+                    "requesting_agent": "code", "helper_agent": "research",
+                    "question": "Is the claim supported?", "reason": "Need a source check.",
+                    "response": "Yes.", "helper_model": "helper-model",
+                    "model_reason": "Lightweight no-tool research help.",
+                    "task_type": "classification", "complexity": "lightweight",
+                    "risk": "low", "status": "completed", "cost_usd": 0.01,
+                }],
+            }],
+            "cost_entries": [{
+                "project_id": "proj-help", "task_id": "worker", "cost_basis": "actual",
+            }],
+        }
+
+        result = autonomy_team.aggregate_company_result(state, "proj-help")
+
+        self.assertEqual(result["agents"], ["code", "research"])
+        self.assertEqual(result["models"], ["worker-model", "helper-model"])
+        self.assertEqual(result["costs"]["by_agent"], {"code": 0.02, "research": 0.01})
+        self.assertEqual(result["costs"]["by_model"]["helper-model"], 0.01)
+        self.assertEqual(result["collaborations"][0]["helper_agent"], "research")
+        self.assertTrue(any(
+            "help code -> research / helper-model" in reason
+            for reason in result["model_selection_reasons"]
+        ))
+
     def test_budget_only_company_block_is_deferred_without_owner_action(self):
         state = {
             "projects": [{"id": "proj-1", "status": "blocked"}],

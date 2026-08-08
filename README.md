@@ -358,6 +358,14 @@ failures, then selects the lowest-cost enabled model likely to succeed. The chos
 and reason are stored in the run report. Set `MODEL_CATALOG_FILE` to use a different
 catalog snapshot.
 
+During a live autonomous task, a worker may make at most one structured request for a
+focused answer from another specialist. The coordinator validates the target, routes the
+helper independently (it never inherits the worker's model), posts the request, routing
+decision, and answer through the matching Telegram identities, then lets the original
+worker finish once. The helper cannot delegate again, receives no tools, and shares the
+parent task's reservation, timeout, redaction, and persisted cost ledger. This is useful
+team communication, not open-ended bot roleplay.
+
 Catalog capability claims, context limits, model availability, and prices are
 **operator-maintained configuration snapshots**. Cost figures are routing estimates,
 not guaranteed current OpenAI prices or a substitute for provider billing. The enabled
@@ -688,12 +696,13 @@ Use these canonical environment variables (the complete copy-ready block is in
 | `AUTONOMY_MIN_TASK_RESERVATION_USD` | `0.05`; minimum live worker/reviewer reservation |
 | `AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL` | `3000`; per-request ceiling, reduced automatically to fit the task's unspent reservation |
 | `AUTONOMY_MAX_TOOL_RESULT_CHARS` | `12000`; per-tool evidence cap applied only to strict autonomous tasks |
-| `AUTONOMY_TEAM_CHAT_ENABLED` | `true`; show deterministic assignment, handoff, review, and retry transitions without extra model calls |
+| `AUTONOMY_TEAM_CHAT_ENABLED` | `true`; show deterministic assignment, handoff, review, and retry transitions |
 | `AUTONOMY_TEAM_CHAT_MAX_CHARS` | `900`; maximum text retained in one team-transition message before Telegram chunking |
+| `AUTONOMY_MAX_TEAM_HELP_REQUESTS` | `1`; one metered, non-recursive specialist-help exchange per autonomous worker task; set `0` to disable |
 | `AUTONOMY_MAX_IDEAS_PER_RUN` | `3`; maximum ideas in Lumen's one idle batch; set `0` to disable ideation |
 | `AUTONOMY_IDEA_BACKLOG_LIMIT` | `50` proposed ideas retained |
 | `AUTONOMY_MAX_EXECUTION_ATTEMPTS` | `2` roadmap-level failed attempts before owner escalation |
-| `AUTONOMY_TASK_TIMEOUT_SECONDS` | `900`; monitoring ceiling; late threads are awaited, charged, and not retried |
+| `AUTONOMY_TASK_TIMEOUT_SECONDS` | `900`; shared task deadline applied to strict OpenAI requests; late Python threads are joined for accounting and not retried |
 | `AUTONOMY_STALE_RUN_MINUTES` | `180` before conservative stale-run recovery |
 | `AUTONOMY_MAX_AUTHORIZATION` | `propose`; one of `observe`, `propose`, `modify_local`, `external_action` |
 | `AUTONOMY_LOCK_TIMEOUT_SECONDS` | `0`; an overlap is skipped immediately |
@@ -726,8 +735,15 @@ traffic. OpenAI explicitly excludes tool use, and a request that crosses the com
 quota is billed in full. The autonomous budget therefore does **not** count that offer as
 extra free capacity for repository/tool work or weaken the $5 paid ceiling. It can benefit
 an otherwise eligible no-tool planning request automatically after the owner enables data
-sharing for this API project; confirm actual incentive-tier usage in OpenAI's Usage and
-Costs dashboards. See OpenAI's [current complimentary-token rules](https://help.openai.com/en/articles/10306912).
+sharing for this API project; shared inputs and outputs may be used to improve OpenAI's
+models, so do not opt in with sensitive, confidential, private, or proprietary project
+content. Confirm actual incentive-tier usage in OpenAI's Usage and Costs dashboards. See
+OpenAI's [current complimentary-token rules](https://help.openai.com/en/articles/10306912).
+Current provider interfaces do not appear to expose an atomic signal proving that the next
+project request will be complimentary, and the separate model-group allowances cannot be
+combined. Therefore the screenshot/offer may reduce eligible no-tool traffic on OpenAI's
+invoice, but it cannot safely become a second autonomous budget after $5. The runner stops
+at its paid ceiling instead of adding an unverified free-traffic execution lane.
 
 `MAX_REVISION_ROUNDS` and `MAX_EXECUTION_ATTEMPTS` bound Company Mode's review and task
 loops. Company Mode retains a larger bounded non-file worker result for review and marks
@@ -811,8 +827,8 @@ and attempt each item only once per session; the JSON/file-lock design assumes e
 replica shares one mounted filesystem; pending Telegram
 confirmations remain process-memory state; exact provider billing is unavailable when a
 response lacks usage and is then conservatively charged at the held estimate; the task
-time ceiling prevents another attempt but cannot preempt a Python thread, so the runner
-waits for it to finish and reconcile; modify-local automation awaits an isolated executor;
+deadline disables SDK retries and bounds strict provider I/O, but cannot kill an arbitrary
+Python thread, so the runner joins it before reconciliation; modify-local automation awaits an isolated executor;
 owner resolution supports explicit `/autorun retry <item-id>`, owner-confirmed idea
 promotion, and owner-confirmed additive roadmap packs, but not skip, accept-as-is,
 acceptance-criteria editing, or automatic rescoping;
@@ -1102,10 +1118,17 @@ name; adding the matching token later gives that worker its own Telegram identit
    into the matching new var (news → marketing, weather → editor, tasks → finance)
    and delete the old var. On a deployed instance, make the same env-var swap on
    the platform and redeploy.
-5. The core roster is listed in `BOT_KEYS`. Optional Linear, Calendar, Gmail, Robin,
+5. The expected roster is Miles + every `main.SPECIALISTS` worker + Robin (14 identities
+   today). The core roster is listed in `BOT_KEYS`. Optional Linear, Calendar, Gmail, Robin,
    Sales, and Analytics bots are added automatically when their matching token is set;
    they remain available through Miles even without a dedicated bot. Adding an entirely
    new code-defined agent still requires a roster entry plus its token, then a redeploy.
+   Startup checks each configured identity, privacy flag, and group membership with bounded
+   retries, and `/autorun status` reports that startup snapshot's ready count and missing
+   env vars. An invalid or reused configured identity always stops before polling. Leave
+   `TELEGRAM_REQUIRE_COMPLETE_ROSTER=false` while intentionally operating with relays;
+   set it to `true` only after all 14 bots are installed, to make an incomplete roster a
+   fail-closed startup error.
 
 **Optional: give every bot its own profile picture.**
 

@@ -87,6 +87,87 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.group.autonomy_runner_task = None
         self.group.company_runner_task = None
 
+    async def test_telegram_roster_check_retries_without_logging_exception_text(self):
+        self.fake_main.logger.warning.reset_mock()
+        calls = 0
+
+        async def flaky_identity_check():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("https://api.telegram.org/botSECRET/getMe")
+            return "verified"
+
+        with patch.object(
+            self.group, "TELEGRAM_ROSTER_CHECK_ATTEMPTS", 2
+        ), patch.object(
+            self.group, "TELEGRAM_ROSTER_RETRY_DELAY_SECONDS", 0
+        ):
+            ok, value = await self.group._telegram_roster_call(
+                "code", "identity", flaky_identity_check
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(value, "verified")
+        self.assertEqual(calls, 2)
+        logged = repr(self.fake_main.logger.warning.mock_calls)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("botSECRET", logged)
+
+    def test_duplicate_configured_identity_always_fails_startup_policy(self):
+        roster = self.group.telegram_roster_health
+        agent_info = {
+            "manager": {
+                "env_var": "TELEGRAM_MANAGER_BOT_TOKEN",
+                "label": "Miles",
+            },
+            "code": {
+                "env_var": "TELEGRAM_CODE_BOT_TOKEN",
+                "label": "Patch",
+            },
+            "general": {
+                "env_var": "TELEGRAM_GENERAL_BOT_TOKEN",
+                "label": "Robin",
+            },
+        }
+        duplicate = "123456:secret-token"
+        health = roster.evaluate_roster(
+            specialist_keys=("code",),
+            agent_info=agent_info,
+            token_values={
+                "TELEGRAM_MANAGER_BOT_TOKEN": duplicate,
+                "TELEGRAM_CODE_BOT_TOKEN": duplicate,
+                "TELEGRAM_GENERAL_BOT_TOKEN": "",
+            },
+            identities={},
+            group_memberships={},
+        )
+
+        with patch.object(self.group, "BOT_KEYS", ["manager", "code"]):
+            with self.assertRaises(SystemExit) as caught:
+                self.group._enforce_configured_identity_safety(health)
+
+        self.assertIn("manager, code", str(caught.exception))
+        self.assertNotIn(duplicate, str(caught.exception))
+
+    def test_non_identity_roster_issues_remain_allowed_in_relay_mode(self):
+        roster = self.group.telegram_roster_health
+        health = roster.RosterHealth((
+            roster.AgentRosterHealth(
+                key="code",
+                label="Patch",
+                env_var="TELEGRAM_CODE_BOT_TOKEN",
+                username="patch_bot",
+                issues=(
+                    roster.RosterIssue(roster.PRIVACY_ENABLED, "privacy"),
+                    roster.RosterIssue(roster.CHECK_UNAVAILABLE, "membership"),
+                ),
+            ),
+        ))
+
+        with patch.object(self.group, "BOT_KEYS", ["code"]):
+            self.group._enforce_configured_identity_safety(health)
+
     async def test_autonomous_team_handoff_bypasses_suppression_as_configured_bot(self):
         manager_bot = object()
         code_bot = object()
@@ -99,7 +180,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             ), patch.object(
                 self.group, "send_chunks", new=AsyncMock()
             ) as send:
-                await self.group.post_team_handoff(
+                status = await self.group.post_team_handoff(
                     "code", "Vera, the bounded implementation is ready for review."
                 )
         finally:
@@ -110,6 +191,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             self.group.GROUP_CHAT_ID,
             "Vera, the bounded implementation is ready for review.",
         )
+        self.assertEqual(status, "direct")
 
     async def test_autonomous_team_handoff_uses_explicit_miles_relay_and_char_cap(self):
         manager_bot = object()
@@ -122,7 +204,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             ), patch.object(
                 self.group, "send_chunks", new=AsyncMock()
             ) as send:
-                await self.group.post_team_handoff("code", "x" * 100)
+                status = await self.group.post_team_handoff("code", "x" * 100)
         finally:
             self.group._suppress_company_updates.reset(suppression)
 
@@ -130,6 +212,22 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(relayed.startswith("Code: "))
         self.assertTrue(relayed.endswith("..."))
         self.assertLessEqual(len(relayed), 40)
+        self.assertEqual(status, "relayed_by_manager")
+
+    async def test_autonomous_team_handoff_reports_telegram_delivery_failure(self):
+        manager_bot = object()
+        suppression = self.group._suppress_company_updates.set(True)
+        try:
+            with patch.dict(
+                self.group.bots, {"manager": manager_bot}, clear=True
+            ), patch.object(
+                self.group, "send_chunks", new=AsyncMock(side_effect=RuntimeError("offline"))
+            ):
+                status = await self.group.post_team_handoff("manager", "Handoff")
+        finally:
+            self.group._suppress_company_updates.reset(suppression)
+
+        self.assertEqual(status, "delivery_failed")
 
     async def test_autonomous_team_handoff_can_be_disabled(self):
         manager_bot = object()
@@ -142,11 +240,12 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             ), patch.object(
                 self.group, "send_chunks", new=AsyncMock()
             ) as send:
-                await self.group.post_team_handoff("manager", "No broadcast")
+                status = await self.group.post_team_handoff("manager", "No broadcast")
         finally:
             self.group._suppress_company_updates.reset(suppression)
 
         send.assert_not_awaited()
+        self.assertEqual(status, "suppressed")
 
     def test_autonomy_goal_includes_bounded_run_evidence_and_timing_boundary(self):
         item = {
@@ -1312,6 +1411,454 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Vera, I finished", handoff.await_args_list[1].args[1])
         self.assertIn("Implemented and verified", handoff.await_args_list[1].args[1])
 
+    async def test_autonomous_worker_gets_one_independently_routed_teammate_answer(self):
+        task = {
+            "id": "worker-help", "owner": "code", "title": "Validate a claim",
+            "model": "worker-model", "model_reason": "Coding route",
+            "execution_attempts": 0, "attempt_history": [],
+            "authorization_level": "observe", "enforce_authorization": True,
+        }
+        project = {"id": "project-1", "title": "Project", "goal": "Validate"}
+        state = {"projects": [project], "tasks": [{**task, "status": "done"}], "company": {}}
+        sink = {
+            "cost_usd": 0.0, "artifacts": [], "usage_records": [],
+            "context": "test", "budget_cap_usd": 1.0,
+        }
+        calls = []
+
+        def ask_specialist(key, prompt, **kwargs):
+            calls.append((key, kwargs.get("model"), kwargs.get("allowed_tool_names")))
+            if key == "research":
+                return "The source confirms the narrow factual claim."
+            if len([row for row in calls if row[0] == "code"]) == 1:
+                return (
+                    'AUTONOMY_HELP_REQUEST {"helper":"research","question":'
+                    '"Is this claim supported?","reason":"The final answer needs an '
+                    'independent source check.","task_type":"classification",'
+                    '"complexity":"lightweight","risk":"low"}'
+                )
+            return "Completed with the teammate's evidence and explicit criteria."
+
+        self.fake_main.ask_specialist = Mock(side_effect=ask_specialist)
+        helper_route = types.SimpleNamespace(
+            model_id="gpt-5.4-nano", model="gpt-5.4-nano", deferred=False,
+            reason="Lightweight no-tool help fits the lowest-cost capable model.",
+            deferral_reason=None,
+        )
+        with patch.object(
+            self.group, "_company_task_route", return_value=helper_route
+        ) as route, patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ) as update, patch.object(
+            self.group.company_mode, "load_state", return_value=state
+        ), patch.object(
+            self.group.company_mode, "next_planned_task", return_value=None
+        ), patch.object(
+            self.group.company_mode, "render_money", return_value="Budget ok"
+        ), patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group,
+            "post_team_handoff",
+            new=AsyncMock(side_effect=[
+                "direct",
+                "delivery_failed",
+                "direct",
+                "relayed_by_manager",
+            ]),
+        ) as handoff:
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "done")
+        self.assertEqual([row[0] for row in calls], ["code", "research", "code"])
+        self.assertEqual(calls[1], ("research", "gpt-5.4-nano", set()))
+        self.assertEqual(route.call_args.kwargs["has_tools"], False)
+        self.assertEqual(len(sink["team_help_events"]), 1)
+        event = sink["team_help_events"][0]
+        self.assertEqual(event["helper_agent"], "research")
+        self.assertEqual(event["helper_model"], "gpt-5.4-nano")
+        self.assertIn("lowest-cost", event["model_reason"])
+        self.assertEqual(event["request_delivery"], "delivery_failed")
+        self.assertEqual(event["routing_delivery"], "direct")
+        self.assertEqual(event["response_delivery"], "relayed_by_manager")
+        self.assertEqual(
+            [call.args[0] for call in handoff.await_args_list],
+            ["manager", "code", "manager", "research"],
+        )
+        terminal = [
+            call for call in update.call_args_list
+            if len(call.args) > 1 and call.args[1] == "done"
+        ][0]
+        self.assertEqual(len(terminal.kwargs["team_help_events"]), 1)
+
+    def test_teammate_help_parser_rejects_malformed_self_and_editor_requests(self):
+        cases = (
+            (
+                "malformed",
+                "AUTONOMY_HELP_REQUEST {not-json}",
+                "not valid JSON",
+            ),
+            (
+                "self",
+                (
+                    'AUTONOMY_HELP_REQUEST {"helper":"code","question":"Check it",'
+                    '"reason":"Need a second opinion"}'
+                ),
+                "cannot request help from itself",
+            ),
+            (
+                "reviewer",
+                (
+                    'AUTONOMY_HELP_REQUEST {"helper":"editor","question":"Check it",'
+                    '"reason":"Need a second opinion"}'
+                ),
+                "independent final reviewer",
+            ),
+        )
+
+        for label, payload, expected in cases:
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, expected):
+                self.group._parse_team_help_request(payload, "code")
+
+    async def test_helper_returning_its_own_help_request_stops_without_resuming_worker(self):
+        task = {
+            "id": "helper-recursion", "owner": "code", "title": "Validate",
+            "model": "worker-model", "model_reason": "Coding route",
+            "execution_attempts": 0, "attempt_history": [],
+        }
+        project = {"id": "project-1", "title": "Project", "goal": "Validate"}
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        worker_request = (
+            'AUTONOMY_HELP_REQUEST {"helper":"research","question":"Check it",'
+            '"reason":"Need evidence","task_type":"research",'
+            '"complexity":"standard","risk":"low"}'
+        )
+        helper_request = (
+            'AUTONOMY_HELP_REQUEST {"helper":"write","question":"Draft it",'
+            '"reason":"Need wording","task_type":"documentation",'
+            '"complexity":"standard","risk":"low"}'
+        )
+        self.fake_main.ask_specialist = Mock(
+            side_effect=[worker_request, helper_request]
+        )
+        route = types.SimpleNamespace(
+            model_id="helper-model", model="helper-model", deferred=False,
+            reason="Independent helper route.", deferral_reason=None,
+        )
+        with patch.object(
+            self.group, "_company_task_route", return_value=route
+        ), patch.object(
+            self.group, "_remaining_task_headroom", return_value=1.0
+        ), patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ) as update, patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ):
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(self.fake_main.ask_specialist.call_count, 2)
+        self.assertEqual(sink["team_help_events"][0]["status"], "failed")
+        terminal = [
+            call for call in update.call_args_list
+            if len(call.args) > 1 and call.args[1] == "needs_human"
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].kwargs["failure_classification"], "no_progress")
+
+    async def test_second_teammate_request_stops_at_one_hop(self):
+        task = {
+            "id": "worker-help-cap", "owner": "code", "title": "Validate",
+            "model": "worker-model", "model_reason": "Coding route",
+            "execution_attempts": 0, "attempt_history": [],
+        }
+        project = {"id": "project-1", "title": "Project", "goal": "Validate"}
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        request = (
+            'AUTONOMY_HELP_REQUEST {"helper":"research","question":"Check it",'
+            '"reason":"Need evidence","task_type":"research",'
+            '"complexity":"standard","risk":"low"}'
+        )
+        responses = iter([request, "One focused answer.", request])
+        self.fake_main.ask_specialist = Mock(side_effect=lambda *args, **kwargs: next(responses))
+        route = types.SimpleNamespace(
+            model_id="helper-model", model="helper-model", deferred=False,
+            reason="Independent helper route.", deferral_reason=None,
+        )
+        with patch.object(
+            self.group, "_company_task_route", return_value=route
+        ), patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ) as update, patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ):
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(self.fake_main.ask_specialist.call_count, 3)
+        terminal = [
+            call for call in update.call_args_list
+            if len(call.args) > 1 and call.args[1] == "needs_human"
+        ][0]
+        self.assertEqual(terminal.kwargs["failure_classification"], "no_progress")
+
+    async def test_teammate_help_budget_deferral_starts_no_helper_and_needs_no_owner(self):
+        task = {
+            "id": "worker-help-budget", "owner": "code", "title": "Validate",
+            "model": "worker-model", "model_reason": "Coding route",
+            "execution_attempts": 0, "attempt_history": [],
+        }
+        project = {"id": "project-1", "title": "Project", "goal": "Validate"}
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        request = (
+            'AUTONOMY_HELP_REQUEST {"helper":"research","question":"Check it",'
+            '"reason":"Need evidence","task_type":"research",'
+            '"complexity":"advanced","risk":"high"}'
+        )
+        self.fake_main.ask_specialist = Mock(return_value=request)
+        route = types.SimpleNamespace(
+            model_id=None, model=None, deferred=True,
+            reason="Cheapest capable helper exceeds remaining budget.",
+            deferral_reason="insufficient_budget",
+        )
+        with patch.object(
+            self.group, "_company_task_route", return_value=route
+        ), patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ) as update, patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ) as post, patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ):
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(self.fake_main.ask_specialist.call_count, 1)
+        terminal = [
+            call for call in update.call_args_list
+            if len(call.args) > 1 and call.args[1] == "blocked"
+        ][0]
+        self.assertEqual(terminal.kwargs["failure_classification"], "budget")
+        self.assertEqual(sink["team_help_events"][0]["status"], "deferred")
+        self.assertTrue(any("No owner action" in call.args[0] for call in post.await_args_list))
+
+    async def test_teammate_missing_access_escalates_once_without_resuming_worker(self):
+        task = {
+            "id": "worker-help-access", "owner": "code", "title": "Validate",
+            "model": "worker-model", "model_reason": "Coding route",
+            "execution_attempts": 0, "attempt_history": [],
+        }
+        project = {"id": "project-1", "title": "Project", "goal": "Validate"}
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        request = (
+            'AUTONOMY_HELP_REQUEST {"helper":"research","question":"Read the source",'
+            '"reason":"The source is required","task_type":"research",'
+            '"complexity":"standard","risk":"medium"}'
+        )
+        responses = iter([
+            request,
+            "BLOCKED - NEEDS HUMAN REVIEW: MISSING_ACCESS\nThe required source is private.",
+        ])
+        self.fake_main.ask_specialist = Mock(side_effect=lambda *args, **kwargs: next(responses))
+        route = types.SimpleNamespace(
+            model_id="helper-model", model="helper-model", deferred=False,
+            reason="Independent research route.", deferral_reason=None,
+        )
+        with patch.object(
+            self.group, "_company_task_route", return_value=route
+        ), patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ) as update, patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ) as post, patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ):
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(self.fake_main.ask_specialist.call_count, 2)
+        terminal = [
+            call for call in update.call_args_list
+            if len(call.args) > 1 and call.args[1] == "needs_human"
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].kwargs["failure_classification"], "missing_access")
+        self.assertEqual(sink["team_help_events"][0]["status"], "failed")
+        self.assertEqual(len(post.await_args_list), 2)  # starting note + one escalation
+
+    async def test_helper_budget_guard_exception_stops_before_worker_resume(self):
+        task = {
+            "id": "helper-budget-guard", "owner": "code", "title": "Validate",
+            "model": "worker-model", "model_reason": "Coding route",
+            "execution_attempts": 0, "attempt_history": [],
+        }
+        project = {"id": "project-1", "title": "Project", "goal": "Validate"}
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        request = (
+            'AUTONOMY_HELP_REQUEST {"helper":"research","question":"Check it",'
+            '"reason":"Need evidence","task_type":"research",'
+            '"complexity":"standard","risk":"low"}'
+        )
+
+        def ask_specialist(key, _prompt, **_kwargs):
+            if key == "code":
+                return request
+            sink["budget_guard_blocked"] = True
+            raise self.fake_main.ExecutionBudgetExceededError(
+                "The next helper request exceeds the reserved budget envelope."
+            )
+
+        self.fake_main.ask_specialist = Mock(side_effect=ask_specialist)
+        route = types.SimpleNamespace(
+            model_id="helper-model", model="helper-model", deferred=False,
+            reason="Independent helper route.", deferral_reason=None,
+        )
+        with patch.object(
+            self.group, "_company_task_route", return_value=route
+        ), patch.object(
+            self.group, "_remaining_task_headroom", return_value=1.0
+        ), patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ) as update, patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ):
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(self.fake_main.ask_specialist.call_count, 2)
+        self.assertEqual(sink["team_help_events"][0]["status"], "failed")
+        terminal = [
+            call for call in update.call_args_list
+            if len(call.args) > 1 and call.args[1] == "blocked"
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].kwargs["failure_classification"], "budget")
+        self.assertEqual(terminal[0].args[4], 0.0)
+
+    async def test_worker_resume_budget_guard_stops_without_retrying(self):
+        task = {
+            "id": "resume-budget-guard", "owner": "code", "title": "Validate",
+            "model": "worker-model", "model_reason": "Coding route",
+            "execution_attempts": 0, "attempt_history": [],
+        }
+        project = {"id": "project-1", "title": "Project", "goal": "Validate"}
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        request = (
+            'AUTONOMY_HELP_REQUEST {"helper":"research","question":"Check it",'
+            '"reason":"Need evidence","task_type":"research",'
+            '"complexity":"standard","risk":"low"}'
+        )
+        calls = []
+
+        def ask_specialist(key, _prompt, **_kwargs):
+            calls.append(key)
+            if calls == ["code"]:
+                return request
+            if calls == ["code", "research"]:
+                return "The evidence supports the claim."
+            sink["budget_guard_blocked"] = True
+            raise self.fake_main.ExecutionBudgetExceededError(
+                "The resumed worker request exceeds the reserved budget envelope."
+            )
+
+        self.fake_main.ask_specialist = Mock(side_effect=ask_specialist)
+        route = types.SimpleNamespace(
+            model_id="helper-model", model="helper-model", deferred=False,
+            reason="Independent helper route.", deferral_reason=None,
+        )
+        with patch.object(
+            self.group, "_company_task_route", return_value=route
+        ), patch.object(
+            self.group, "_remaining_task_headroom", return_value=1.0
+        ), patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ) as update, patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ):
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(calls, ["code", "research", "code"])
+        self.assertEqual(sink["team_help_events"][0]["status"], "completed")
+        terminal = [
+            call for call in update.call_args_list
+            if len(call.args) > 1 and call.args[1] == "blocked"
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].kwargs["failure_classification"], "budget")
+
+    def test_tool_backed_lightweight_runtime_route_requires_tool_capable_model(self):
+        task = {
+            "owner": "manager", "task_type": "classification",
+            "complexity": "lightweight", "risk": "low",
+            "required_capabilities": ["text"],
+            "estimated_input_tokens": 1000, "estimated_output_tokens": 200,
+        }
+        no_tools = self.group._company_task_route(
+            task, remaining_usd=1.0, has_tools=False
+        )
+        with_tools = self.group._company_task_route(
+            task, remaining_usd=1.0, has_tools=True
+        )
+        self.assertEqual(no_tools.model_id, "gpt-5.4-nano")
+        self.assertEqual(with_tools.model_id, "gpt-5.4-mini")
+        self.assertIn("tool_use", with_tools.reason)
+
+    def test_advanced_no_tool_helper_route_selects_stronger_model(self):
+        decision = self.group._company_task_route(
+            {
+                "owner": "research",
+                "task_type": "architecture_decision",
+                "complexity": "advanced",
+                "risk": "high",
+                "required_capabilities": ["text"],
+                "estimated_input_tokens": 5000,
+                "estimated_output_tokens": 600,
+            },
+            remaining_usd=5.0,
+            has_tools=False,
+        )
+
+        self.assertFalse(decision.deferred)
+        self.assertEqual(decision.model_id, "gpt-5.6-sol")
+        self.assertIn("risk=high", decision.reason)
+
     def test_blank_agent_answer_is_a_technical_failure(self):
         self.assertEqual(self.group._answer_failure_classification(""), "technical")
         self.assertEqual(self.group._answer_failure_classification("   "), "technical")
@@ -1796,7 +2343,52 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "blocked")
         self.assertGreaterEqual(elapsed, 0.025)
         self.assertEqual(self.group.main.ask_ai.call_count, 1)
+        self.assertTrue(sink["deadline_exceeded"])
         self.assertTrue(any(len(call.args) > 1 and call.args[1] == "needs_human" for call in update.call_args_list))
+
+    async def test_invoke_preserves_cancellation_when_joined_worker_errors(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def fail_after_cancel(*args, **kwargs):
+            started.set()
+            release.wait(timeout=2)
+            raise RuntimeError("worker failed after cancellation")
+
+        self.group.main.ask_ai = Mock(side_effect=fail_after_cancel)
+        sink = {
+            "cost_usd": 0.0, "artifacts": [], "usage_records": [],
+            "context": "test",
+        }
+        invocation = asyncio.create_task(self.group._invoke_company_agent(
+            None,
+            "prompt",
+            "test-model",
+            set(),
+            sink,
+            enforce_authorization=True,
+        ))
+        self.assertTrue(await asyncio.to_thread(started.wait, 1))
+        invocation.cancel()
+        release.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await invocation
+        self.assertTrue(any(
+            "RuntimeError" in str(call)
+            for call in self.group.main.logger.error.call_args_list
+        ))
+
+    def test_unmeasured_call_never_releases_partial_measured_spend(self):
+        sink = {
+            "cost_usd": 0.10,
+            "budget_cap_usd": 0.50,
+            "usage_records": [{"model": "small", "cost_usd": 0.10}],
+            "unmeasured_model_calls": 1,
+            "budget_guard_blocked": True,
+        }
+
+        self.assertIsNone(self.group._sink_spend_for_reconciliation(sink))
 
     async def test_blocked_worker_closes_project_and_releases_later_reservations(self):
         with tempfile.TemporaryDirectory() as temp:

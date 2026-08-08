@@ -1502,6 +1502,17 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "model": "worker-model",
             "models": ["worker-model", "review-model"],
             "agents": ["manager", "editor"],
+            "model_selection_reasons": [
+                "manager / worker-model: standard planning route.",
+                "help manager -> research / review-model: focused evidence route.",
+            ],
+            "collaborations": [{
+                "requesting_agent": "manager",
+                "helper_agent": "research",
+                "helper_model": "review-model",
+                "model_reason": "focused evidence route.",
+                "status": "completed",
+            }],
             "costs": {
                 "by_project": {"company-project": 0.10},
                 "by_task": {"worker": 0.04, "review": 0.06},
@@ -1522,6 +1533,11 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(report["budget"]["remaining_usd"], 1.15)
         self.assertEqual(report["models_selected"], ["worker-model", "review-model"])
         self.assertEqual(report["agents_involved"], ["manager", "editor"])
+        self.assertEqual(report["collaborations"][0]["helper_agent"], "research")
+        self.assertIn(
+            "help manager -> research / review-model: focused evidence route.",
+            report["model_selection_reasons"],
+        )
         self.assertEqual(report["costs"]["by_model"]["review-model"], 0.06)
         self.assertEqual(provider.call_count, 2)
 
@@ -1834,6 +1850,13 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 "model": "worker-model",
                 "token_usage": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100},
                 "result_text": f"Completed {selected['id']}",
+                "collaborations": [{
+                    "requesting_agent": "code",
+                    "helper_agent": f"helper-{selected['id']}",
+                    "helper_model": "helper-model",
+                    "model_reason": f"Focused help for {selected['id']}.",
+                    "status": "completed",
+                }],
             }
 
         decision = SimpleNamespace(
@@ -1857,9 +1880,14 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(report["costs"]["by_task"], {
             "high": 0.10, "middle": 0.10, "low": 0.10,
         })
+        self.assertEqual(
+            [entry["helper_agent"] for entry in report["collaborations"]],
+            ["helper-high", "helper-middle", "helper-low"],
+        )
         self.assertIn("Task high, Task middle, Task low", report["telegram_summary"])
         persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
         self.assertEqual(len(persisted["cycle_reports"]), 4)
+        self.assertEqual(persisted["collaborations"], report["collaborations"])
 
     def test_session_holds_lock_and_scheduled_date_is_claimed_once(self):
         observed_lock = []

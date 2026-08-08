@@ -53,6 +53,7 @@ import linear_helpers
 import model_router
 import office_api
 import office_state
+import telegram_roster_health
 
 
 load_dotenv()
@@ -173,6 +174,7 @@ for _key, _info in AGENT_INFO.items():
 applications = {}
 bots = {}
 bot_usernames = {}
+telegram_roster_status = None
 locks = {key: asyncio.Lock() for key in BOT_KEYS}
 main_loop = None
 
@@ -205,7 +207,81 @@ try:
 except (TypeError, ValueError):
     AUTONOMY_TEAM_CHAT_MAX_CHARS = 900
 AUTONOMY_TEAM_CHAT_MAX_CHARS = min(2000, max(160, AUTONOMY_TEAM_CHAT_MAX_CHARS))
+try:
+    AUTONOMY_MAX_TEAM_HELP_REQUESTS = int(
+        os.environ.get("AUTONOMY_MAX_TEAM_HELP_REQUESTS", "1")
+    )
+except (TypeError, ValueError):
+    AUTONOMY_MAX_TEAM_HELP_REQUESTS = 1
+# One hop is a deliberate hard ceiling.  A configurable zero disables the lane;
+# larger values do not turn it into an unbounded agent-to-agent conversation.
+AUTONOMY_MAX_TEAM_HELP_REQUESTS = min(1, max(0, AUTONOMY_MAX_TEAM_HELP_REQUESTS))
+AUTONOMY_HELP_REQUEST_PREFIX = "AUTONOMY_HELP_REQUEST"
+AUTONOMY_HELP_QUESTION_MAX_CHARS = 1200
+AUTONOMY_HELP_RESPONSE_MAX_CHARS = 2400
+TELEGRAM_ROSTER_CHECK_ATTEMPTS = 3
+TELEGRAM_ROSTER_RETRY_DELAY_SECONDS = 0.5
 office_api_server = None
+
+
+class TeamHelpError(RuntimeError):
+    """A bounded teammate exchange stopped with an explicit workflow category."""
+
+    def __init__(self, message, failure_classification):
+        super().__init__(message)
+        self.failure_classification = failure_classification
+
+
+class TaskDeadlineExceededError(TimeoutError):
+    """A task crossed its deadline after its unkillable worker thread was joined."""
+
+    failure_classification = "transient"
+
+
+async def _telegram_roster_call(key, operation, call):
+    """Run one secret-free, bounded Telegram startup check.
+
+    Telegram/httpx exceptions can include request context.  Startup logs therefore
+    retain only the agent key, operation, attempt count, and exception class -- never
+    the exception text or token-bearing request URL.
+    """
+
+    for attempt in range(1, TELEGRAM_ROSTER_CHECK_ATTEMPTS + 1):
+        try:
+            return True, await call()
+        except Exception as exc:
+            main.logger.warning(
+                f"Telegram roster {operation} check failed for {key} "
+                f"(attempt {attempt}/{TELEGRAM_ROSTER_CHECK_ATTEMPTS}; "
+                f"{type(exc).__name__})."
+            )
+            if attempt < TELEGRAM_ROSTER_CHECK_ATTEMPTS:
+                await asyncio.sleep(TELEGRAM_ROSTER_RETRY_DELAY_SECONDS)
+    return False, None
+
+
+def _configured_identity_failure_keys(health):
+    """Return configured bots that cannot safely be started as distinct pollers."""
+
+    configured = set(BOT_KEYS)
+    return tuple(
+        agent.key
+        for agent in health.agents
+        if agent.key in configured
+        and telegram_roster_health.INVALID_IDENTITY in agent.issue_codes
+    )
+
+
+def _enforce_configured_identity_safety(health):
+    """Never start duplicate or invalid configured Telegram pollers."""
+
+    invalid_configured_keys = _configured_identity_failure_keys(health)
+    if invalid_configured_keys:
+        raise SystemExit(
+            "Configured Telegram bot identities are invalid or reused for: "
+            f"{', '.join(invalid_configured_keys)}. Each configured bot must use "
+            "one distinct, valid BotFather token. No pollers were started."
+        )
 
 # Transient office states remain visible long enough for the browser's 1.5-second
 # polling loop to show them, then office_state renders them as idle automatically.
@@ -489,17 +565,19 @@ async def _send_group_message_as(text, bot_key="manager", *, max_chars=None):
     """
     message = str(autonomous_workflow.redact_secrets(str(text or ""))).strip()
     if not message:
-        return
+        return "skipped_empty"
 
     bot = bots.get(bot_key)
+    relayed = False
     if bot is None:
         bot = bots.get("manager")
         if bot is None:
             main.logger.error(
                 f"Could not post as {bot_key!r}: neither that bot nor Miles is configured."
             )
-            return
+            return "delivery_unavailable"
         if bot_key != "manager":
+            relayed = True
             message = f"{_agent_display_name(bot_key)}: {message}"
 
     if max_chars is not None and len(message) > max_chars:
@@ -507,19 +585,36 @@ async def _send_group_message_as(text, bot_key="manager", *, max_chars=None):
         message = message[:max(0, max_chars - len(marker))].rstrip() + marker
     try:
         await send_chunks(bot, GROUP_CHAT_ID, message)
+        return "relayed_by_manager" if relayed else "direct"
     except Exception as e:
         main.logger.error(f"Failed to post Telegram team message: {e}")
+        return "delivery_failed"
 
 
 async def post_team_handoff(speaker_key, text):
     """Expose one real autonomous state transition without generating more chatter."""
     if not AUTONOMY_TEAM_CHAT_ENABLED or not _suppress_company_updates.get():
-        return
-    await _send_group_message_as(
+        return "suppressed"
+    return await _send_group_message_as(
         text,
         speaker_key,
         max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
     )
+
+
+def _team_delivery_status(value):
+    """Reduce Telegram transport outcomes to a bounded persisted vocabulary."""
+
+    allowed = {
+        "direct",
+        "relayed_by_manager",
+        "delivery_failed",
+        "delivery_unavailable",
+        "suppressed",
+        "skipped_empty",
+        "not_attempted",
+    }
+    return value if value in allowed else "unknown"
 
 
 def build_specialist_handler(key):
@@ -955,10 +1050,18 @@ async def _run_metered(
         raise
     finally:
         try:
-            known_zero = bool(sink.get("budget_guard_blocked")) and not sink["usage_records"]
+            unmeasured = bool(sink.get("unmeasured_model_calls"))
+            known_zero = (
+                bool(sink.get("budget_guard_blocked"))
+                and not sink["usage_records"]
+                and not unmeasured
+                and not sink.get("model_requests_started")
+            )
             reconciled_actual = (
                 0.0
                 if known_zero
+                else None
+                if unmeasured
                 else sink["cost_usd"]
                 if sink["usage_records"]
                 else None
@@ -969,7 +1072,10 @@ async def _run_metered(
                 reconciled_actual,
                 company_mode.COMPANY_STATE_FILE,
                 usage_records=sink["usage_records"],
-                estimated=not bool(sink["usage_records"]) and not known_zero,
+                estimated=(
+                    unmeasured
+                    or (not bool(sink["usage_records"]) and not known_zero)
+                ),
                 context=context,
                 project_id=project_id,
                 task_id=task_id,
@@ -1258,7 +1364,118 @@ def _company_budget_snapshot():
     }
 
 
-def _company_task_route(task, *, previous_failures=0, previous_models=(), remaining_usd=None):
+def _team_help_contract(requesting_agent):
+    """Return the one-hop help contract appended only to autonomous workers."""
+
+    if AUTONOMY_MAX_TEAM_HELP_REQUESTS <= 0 or requesting_agent == "editor":
+        return ""
+    choices = [
+        f"{key} ({profile['name']})"
+        for key, profile in main.SPECIALISTS.items()
+        if key not in {requesting_agent, "editor"}
+    ]
+    if not choices:
+        return ""
+    return (
+        "\n\nBounded teammate-help contract:\n"
+        "If—and only if—you cannot complete this task reliably without one targeted "
+        "piece of expertise from another worker, return exactly the prefix "
+        f"{AUTONOMY_HELP_REQUEST_PREFIX} followed by one JSON object and no other text. "
+        "Use keys helper, question, reason, task_type, complexity, and risk. Do not "
+        "choose a model. The coordinator will route and meter the helper, then give "
+        "you one chance to finish. Otherwise complete the task normally.\n"
+        f"Available helpers: {', '.join(choices)}."
+    )
+
+
+def _resolve_helper_key(value):
+    requested = str(value or "").strip().lower()
+    for key, profile in main.SPECIALISTS.items():
+        aliases = {
+            key.lower(),
+            str(profile.get("name") or "").strip().lower(),
+            str(profile.get("label") or "").split("(", 1)[0].strip().lower(),
+        }
+        if requested and requested in aliases:
+            return key
+    return None
+
+
+def _parse_team_help_request(answer, requesting_agent):
+    """Parse one strict worker-generated help request; ordinary answers return None."""
+
+    text = str(answer or "").strip()
+    if not text.startswith(AUTONOMY_HELP_REQUEST_PREFIX):
+        return None
+    raw = text[len(AUTONOMY_HELP_REQUEST_PREFIX):].strip()
+    if raw.startswith("```") and raw.endswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The teammate-help request was not valid JSON.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("The teammate-help request must be one JSON object.")
+
+    helper = _resolve_helper_key(payload.get("helper"))
+    if not helper:
+        raise ValueError("The teammate-help request named an unknown helper.")
+    if helper == requesting_agent:
+        raise ValueError("A worker cannot request help from itself.")
+    if helper == "editor":
+        raise ValueError("Vera must remain the independent final reviewer, not a helper.")
+
+    question = autonomous_workflow.redact_secrets(
+        str(payload.get("question") or "").strip()
+    )[:AUTONOMY_HELP_QUESTION_MAX_CHARS]
+    reason = autonomous_workflow.redact_secrets(
+        str(payload.get("reason") or "").strip()
+    )[:AUTONOMY_HELP_QUESTION_MAX_CHARS]
+    if not question or not reason:
+        raise ValueError("The teammate-help request needs a focused question and reason.")
+
+    complexity = str(payload.get("complexity") or "standard").strip().lower()
+    if complexity not in {"lightweight", "standard", "advanced"}:
+        complexity = "standard"
+    risk = str(payload.get("risk") or "low").strip().lower()
+    if risk not in {"low", "medium", "high", "critical"}:
+        risk = "medium"
+    task_type = re.sub(
+        r"[^a-z0-9_]+", "_", str(payload.get("task_type") or "planning").strip().lower()
+    ).strip("_")[:80] or "planning"
+    return {
+        "requesting_agent": requesting_agent,
+        "helper_agent": helper,
+        "question": question,
+        "reason": reason,
+        "task_type": task_type,
+        "complexity": complexity,
+        "risk": risk,
+    }
+
+
+def _remaining_task_headroom(sink):
+    cap = max(0.0, float(sink.get("budget_cap_usd", 0.0) or 0.0))
+    spent = max(0.0, float(sink.get("cost_usd", 0.0) or 0.0))
+    headroom = max(0.0, cap - spent)
+    try:
+        headroom += max(0.0, float(company_mode.remaining_budget(company_mode.load_state())))
+    except Exception:
+        # The provider-side guard still fails closed against the existing hold. A
+        # state-read problem must never be interpreted as extra available money.
+        pass
+    return headroom
+
+
+def _company_task_route(
+    task,
+    *,
+    previous_failures=0,
+    previous_models=(),
+    remaining_usd=None,
+    has_tools=None,
+):
     owner = str(task.get("owner") or "manager")
     task_types = {
         "code": "coding",
@@ -1274,6 +1491,8 @@ def _company_task_route(task, *, previous_failures=0, previous_models=(), remain
     required = list(task.get("required_capabilities", []) or [])
     if owner == "editor" and "review" not in required:
         required.append("review")
+    if has_tools and "tool_use" not in required:
+        required.append("tool_use")
     state = company_mode.load_state()
     envelope = (
         float(task.get("reserved_usd", task.get("estimate_usd", 0.0)) or 0.0)
@@ -1347,31 +1566,309 @@ def _sink_spend_for_reconciliation(sink):
     reconcile the conservative held estimate and label it estimated instead of
     incorrectly reopening the budget as a zero-cost call.
     """
-    if sink.get("budget_guard_blocked") and not sink.get("usage_records"):
+    if sink.get("unmeasured_model_calls"):
+        # Other calls may have measured usage, but any unknown provider charge makes
+        # the combined total inexact. Reconcile the complete persisted hold as an
+        # estimate instead of releasing its unknown portion.
+        return None
+    if (
+        sink.get("budget_guard_blocked")
+        and not sink.get("usage_records")
+        and not sink.get("model_requests_started")
+    ):
         return 0.0
     return sink["cost_usd"] if sink.get("usage_records") else None
 
 
+async def _invoke_company_agent(
+    agent_key,
+    prompt,
+    model,
+    allowed_tools,
+    sink,
+    *,
+    enforce_authorization,
+):
+    """Run one metered agent call and return its redacted answer plus elapsed time."""
+
+    def work():
+        previous_agent = sink.get("active_agent")
+        sink["active_agent"] = agent_key or "general"
+        main.set_conversation("group")
+        main.set_reply_context({"kind": "group"})
+        main.set_execution_sink(sink)
+        main.set_company_execution(not bool(enforce_authorization))
+        try:
+            if agent_key and agent_key in main.SPECIALISTS:
+                return main.ask_specialist(
+                    agent_key,
+                    prompt,
+                    record_history=False,
+                    model=model,
+                    allowed_tool_names=allowed_tools,
+                    include_memories=not bool(enforce_authorization),
+                )
+            return main.ask_ai(
+                prompt,
+                record_history=False,
+                model=model,
+                allowed_tool_names=allowed_tools,
+                include_memories=not bool(enforce_authorization),
+            )
+        finally:
+            main.set_company_execution(False)
+            main.set_execution_sink(None)
+            if previous_agent is None:
+                sink.pop("active_agent", None)
+            else:
+                sink["active_agent"] = previous_agent
+
+    async with locks["manager"]:
+        started = time.monotonic()
+        future = asyncio.create_task(asyncio.to_thread(work))
+        deadline = sink.get("request_deadline_monotonic")
+        try:
+            remaining = (
+                max(0.0, float(deadline) - time.monotonic())
+                if deadline is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            remaining = 0.0
+        try:
+            if remaining is None:
+                answer = await asyncio.shield(future)
+            else:
+                answer = await asyncio.wait_for(
+                    asyncio.shield(future), timeout=max(0.001, remaining)
+                )
+        except asyncio.CancelledError:
+            # Python cannot safely kill the provider thread. Account for its final
+            # usage before allowing cancellation to unwind the coordinator. A worker
+            # failure must not replace the caller's original cancellation.
+            try:
+                await future
+            except BaseException as exc:
+                main.logger.error(
+                    "Company worker stopped while cancellation was pending: "
+                    f"{type(exc).__name__}"
+                )
+            raise
+        except TimeoutError as exc:
+            # wait_for cannot kill a Python thread. Real provider I/O receives this
+            # same absolute deadline; arbitrary local work is still joined before
+            # budget reconciliation so its spend cannot escape the task hold.
+            sink["deadline_exceeded"] = True
+            sink["deadline_reason"] = (
+                "The autonomous task reached its configured wall-clock deadline; "
+                "no retry was started."
+            )
+            try:
+                await future
+            except BaseException as worker_exc:
+                main.logger.error(
+                    "Company worker stopped after its deadline: "
+                    f"{type(worker_exc).__name__}"
+                )
+            raise TaskDeadlineExceededError(sink["deadline_reason"]) from exc
+        elapsed = time.monotonic() - started
+    redacted = autonomous_workflow.redact_secrets(str(answer or "")).strip()
+    return redacted, elapsed
+
+
+async def _run_team_help_exchange(task, request, sink, requesting_model):
+    """Route and execute exactly one non-recursive, same-budget teammate exchange."""
+
+    helper = request["helper_agent"]
+    created_at = datetime.now(ZoneInfo("UTC")).isoformat()
+    route_task = {
+        "owner": helper,
+        "task_type": request["task_type"],
+        "complexity": request["complexity"],
+        "risk": request["risk"],
+        "required_capabilities": ["text"],
+        "estimated_input_tokens": min(
+            5000, max(800, len(request["question"]) * 2)
+        ),
+        "estimated_output_tokens": 600,
+    }
+    decision = await asyncio.to_thread(
+        _company_task_route,
+        route_task,
+        remaining_usd=_remaining_task_headroom(sink),
+        has_tools=False,
+    )
+    if _decision_value(decision, "deferred", False):
+        reason = str(
+            _decision_value(decision, "deferral_reason")
+            or _decision_value(decision, "reason")
+        )
+        sink.setdefault("team_help_events", []).append({
+            **request,
+            "status": "deferred",
+            "helper_model": "",
+            "model_reason": reason,
+            "response": "No helper model call was started.",
+            "created_at": created_at,
+            "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+            "request_delivery": "not_attempted",
+            "routing_delivery": "not_attempted",
+            "response_delivery": "not_attempted",
+        })
+        raise TeamHelpError(
+            f"The teammate-help request was deferred before execution: {reason}",
+            "budget",
+        )
+
+    helper_model = str(
+        _decision_value(decision, "model_id") or _decision_value(decision, "model")
+    )
+    model_reason = str(
+        _decision_value(decision, "reason", "Independently routed teammate help.")
+    )
+    requester_name = _agent_display_name(request["requesting_agent"])
+    helper_name = _agent_display_name(helper)
+    request_delivery = _team_delivery_status(await post_team_handoff(
+        request["requesting_agent"],
+        (
+            f"{helper_name}, I need one focused assist before I finish {task['title']}.\n"
+            f"Question: {request['question']}\nWhy: {request['reason']}"
+        ),
+    ))
+    routing_delivery = _team_delivery_status(await post_team_handoff(
+        "manager",
+        (
+            f"{helper_name}, take this one-hop request for {requester_name}.\n"
+            f"Model: {helper_model}\nRouting: {model_reason}"
+        ),
+    ))
+
+    usage_start = len(sink.get("usage_records", []))
+    cost_start = float(sink.get("cost_usd", 0.0) or 0.0)
+    helper_prompt = (
+        f"{requester_name} is completing a bounded autonomous task and needs one "
+        "targeted answer from your specialty. Answer only the question below. Do not "
+        "delegate, ask another teammate, or perform an external action. Clearly state "
+        "if required information is unavailable.\n\n"
+        f"Parent task: {task['title']}\nQuestion: {request['question']}\n"
+        f"Reason this is needed: {request['reason']}"
+    )
+    try:
+        helper_answer, elapsed = await _invoke_company_agent(
+            helper,
+            helper_prompt,
+            helper_model,
+            set(),
+            sink,
+            enforce_authorization=True,
+        )
+    except Exception as exc:
+        usage = list(sink.get("usage_records", []))[usage_start:]
+        sink.setdefault("team_help_events", []).append({
+            **request,
+            "status": "failed",
+            "helper_model": helper_model,
+            "model_reason": model_reason,
+            "response": autonomous_workflow.redact_secrets(str(exc))[
+                :AUTONOMY_HELP_RESPONSE_MAX_CHARS
+            ],
+            "created_at": created_at,
+            "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+            "input_tokens": sum(int(row.get("input_tokens", 0) or 0) for row in usage),
+            "output_tokens": sum(int(row.get("output_tokens", 0) or 0) for row in usage),
+            "cost_usd": round(
+                max(0.0, float(sink.get("cost_usd", 0.0) or 0.0) - cost_start), 6
+            ),
+            "request_delivery": request_delivery,
+            "routing_delivery": routing_delivery,
+            "response_delivery": "not_attempted",
+        })
+        raise
+    helper_failure = _answer_failure_classification(helper_answer)
+    if helper_answer.startswith(AUTONOMY_HELP_REQUEST_PREFIX):
+        helper_failure = "no_progress"
+    if helper_failure:
+        usage = list(sink.get("usage_records", []))[usage_start:]
+        sink.setdefault("team_help_events", []).append({
+            **request,
+            "status": "failed",
+            "helper_model": helper_model,
+            "model_reason": model_reason,
+            "response": helper_answer[:AUTONOMY_HELP_RESPONSE_MAX_CHARS],
+            "created_at": created_at,
+            "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+            "input_tokens": sum(int(row.get("input_tokens", 0) or 0) for row in usage),
+            "output_tokens": sum(int(row.get("output_tokens", 0) or 0) for row in usage),
+            "cost_usd": round(
+                max(0.0, float(sink.get("cost_usd", 0.0) or 0.0) - cost_start), 6
+            ),
+            "request_delivery": request_delivery,
+            "routing_delivery": routing_delivery,
+            "response_delivery": "not_attempted",
+        })
+        raise TeamHelpError(
+            f"Teammate {helper_name} could not complete the bounded help request: "
+            f"{helper_answer or helper_failure}",
+            helper_failure,
+        )
+
+    helper_answer = helper_answer[:AUTONOMY_HELP_RESPONSE_MAX_CHARS]
+    response_delivery = _team_delivery_status(await post_team_handoff(
+        helper,
+        f"{requester_name}, here's the focused answer:\n{helper_answer}",
+    ))
+    usage = list(sink.get("usage_records", []))[usage_start:]
+    event = {
+        **request,
+        "status": "completed",
+        "helper_model": helper_model,
+        "model_reason": model_reason,
+        "response": helper_answer,
+        "created_at": created_at,
+        "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "input_tokens": sum(int(row.get("input_tokens", 0) or 0) for row in usage),
+        "output_tokens": sum(int(row.get("output_tokens", 0) or 0) for row in usage),
+        "cost_usd": round(
+            max(0.0, float(sink.get("cost_usd", 0.0) or 0.0) - cost_start), 6
+        ),
+        "elapsed_seconds": round(elapsed, 3),
+        "requesting_model": requesting_model,
+        "request_delivery": request_delivery,
+        "routing_delivery": routing_delivery,
+        "response_delivery": response_delivery,
+    }
+    sink.setdefault("team_help_events", []).append(event)
+    return event
+
+
 async def _execute_routed_task(project, task, owner, prompt, sink):
     allowed_tools = _task_allowed_tools(task, owner)
+    has_tools = allowed_tools is None or bool(allowed_tools)
     speaker_owner = owner or ("general" if task.get("owner") == "general" else "manager")
     model = str(task.get("model") or "").strip()
     model_reason = str(task.get("model_reason") or "").strip()
     if not model:
-        decision = await asyncio.to_thread(_company_task_route, task)
+        decision = await asyncio.to_thread(
+            _company_task_route, task, has_tools=has_tools
+        )
         if _decision_value(decision, "deferred", False):
             reason = str(
                 _decision_value(decision, "deferral_reason")
                 or _decision_value(decision, "reason")
             )
             classification = "budget" if "budget" in reason else "no_progress"
+            terminal_status = "blocked" if classification == "budget" else "needs_human"
             await asyncio.to_thread(
                 company_mode.update_task_status,
-                task["id"], "needs_human", reason, [], 0.0,
+                task["id"], terminal_status, reason, [], 0.0,
                 company_mode.COMPANY_STATE_FILE,
                 failure_classification=classification,
             )
-            await post_to_group(f"Task {task['id']} deferred: {reason}", "manager")
+            suffix = " No owner action is required; it can retry after budget reset." if classification == "budget" else ""
+            await post_to_group(f"Task {task['id']} deferred: {reason}{suffix}", "manager")
             return "blocked"
         model = str(
             _decision_value(decision, "model_id") or _decision_value(decision, "model")
@@ -1406,6 +1903,8 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
         )
     except (TypeError, ValueError):
         timeout_seconds = 900.0
+    sink["request_timeout_seconds"] = timeout_seconds
+    sink["request_deadline_monotonic"] = time.monotonic() + timeout_seconds
     answer = ""
     failure = None
     _office_call("set_agent_status", "manager", "delegated", f"Assigned {task['owner']} a company task.")
@@ -1424,6 +1923,7 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
 
     for attempt_index in range(attempts_remaining):
         time_limit_exceeded = False
+        failure = None
         await asyncio.to_thread(
             company_mode.update_task_status,
             task["id"], "in_progress",
@@ -1432,41 +1932,68 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
             model_reason=model_reason,
         )
 
-        def work():
-            main.set_conversation("group")
-            main.set_reply_context({"kind": "group"})
-            main.set_execution_sink(sink)
-            main.set_company_execution(not bool(task.get("enforce_authorization")))
-            try:
-                if owner:
-                    return main.ask_specialist(
-                        owner, prompt, record_history=False, model=model,
-                        allowed_tool_names=allowed_tools,
-                        include_memories=not bool(task.get("enforce_authorization")),
-                    )
-                return main.ask_ai(
-                    prompt, record_history=False, model=model,
-                    allowed_tool_names=allowed_tools,
-                    include_memories=not bool(task.get("enforce_authorization")),
-                )
-            finally:
-                main.set_company_execution(False)
-                main.set_execution_sink(None)
-
         try:
-            async with locks["manager"]:
-                started = time.monotonic()
-                worker_future = asyncio.create_task(asyncio.to_thread(work))
-                try:
-                    answer = await asyncio.shield(worker_future)
-                except asyncio.CancelledError:
-                    # A Python thread cannot be killed safely. Wait for it to finish so
-                    # no model/tool work escapes the run ledger, then propagate cancel.
-                    await worker_future
-                    raise
-                elapsed = time.monotonic() - started
-            answer = str(autonomous_workflow.redact_secrets(str(answer or ""))).strip()
-            failure = _answer_failure_classification(answer)
+            answer, elapsed = await _invoke_company_agent(
+                owner,
+                prompt,
+                model,
+                allowed_tools,
+                sink,
+                enforce_authorization=bool(task.get("enforce_authorization")),
+            )
+            try:
+                help_request = _parse_team_help_request(answer, speaker_owner)
+            except ValueError as exc:
+                help_request = None
+                failure = "no_progress"
+                answer = f"Invalid bounded teammate-help request: {exc}"
+
+            if help_request and not failure:
+                prior_help = len(sink.get("team_help_events", []))
+                if prior_help >= AUTONOMY_MAX_TEAM_HELP_REQUESTS:
+                    failure = "no_progress"
+                    answer = (
+                        "The task requested another teammate exchange after the one-hop "
+                        "limit was reached."
+                    )
+                else:
+                    help_event = await _run_team_help_exchange(
+                        task, help_request, sink, model
+                    )
+                    resume_prompt = (
+                        f"{prompt}\n\nOne bounded teammate response is now available. "
+                        "Use it as supporting evidence and complete the original task now. "
+                        "Do not request more help.\n"
+                        f"Helper: {_agent_display_name(help_event['helper_agent'])}\n"
+                        f"Question: {help_event['question']}\n"
+                        f"Response:\n---\n{help_event['response']}\n---"
+                    )
+                    resumed, resume_elapsed = await _invoke_company_agent(
+                        owner,
+                        resume_prompt,
+                        model,
+                        allowed_tools,
+                        sink,
+                        enforce_authorization=bool(task.get("enforce_authorization")),
+                    )
+                    elapsed += resume_elapsed
+                    try:
+                        repeated_help = _parse_team_help_request(
+                            resumed, speaker_owner
+                        )
+                    except ValueError:
+                        repeated_help = True
+                    if repeated_help:
+                        failure = "no_progress"
+                        answer = (
+                            "The worker requested a second teammate exchange after the "
+                            "one-hop limit was reached."
+                        )
+                    else:
+                        answer = resumed
+
+            if not failure:
+                failure = _answer_failure_classification(answer)
             if failure and not answer:
                 answer = "The model returned no complete visible result."
             if elapsed > timeout_seconds and not failure:
@@ -1476,9 +2003,15 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
                     f"Task finished after {elapsed:.1f}s, beyond its {timeout_seconds:.1f}s "
                     "execution limit; no retry was started."
                 )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             main.logger.error(f"Company task {task['id']} errored: {exc}")
-            failure = company_mode.classify_failure(exc)
+            failure = getattr(
+                exc, "failure_classification", company_mode.classify_failure(exc)
+            )
+            if sink.get("deadline_exceeded"):
+                time_limit_exceeded = True
             answer = str(autonomous_workflow.redact_secrets(str(exc))) or "Unexpected execution error."
 
         if not failure:
@@ -1508,6 +2041,7 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
                 previous_failures=len(previous_models),
                 previous_models=tuple(previous_models),
                 remaining_usd=remaining_reservation,
+                has_tools=has_tools,
             )
             if not _decision_value(next_decision, "deferred", False):
                 model = str(
@@ -1536,19 +2070,44 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
         break
 
     if failure:
+        budget_deferred = failure == "budget"
         _office_call(
             "set_agent_status", speaker_owner, "error",
-            "Company task stopped and needs owner attention.", OFFICE_ERROR_SECONDS,
+            (
+                "Company task stopped at the budget boundary."
+                if budget_deferred
+                else "Company task stopped and needs owner attention."
+            ),
+            OFFICE_ERROR_SECONDS,
         )
         await asyncio.to_thread(
             company_mode.update_task_status,
-            task["id"], "needs_human", str(answer)[:1500], sink["artifacts"],
+            task["id"], "blocked" if budget_deferred else "needs_human",
+            str(answer)[:1500], sink["artifacts"],
             _sink_spend_for_reconciliation(sink), company_mode.COMPANY_STATE_FILE,
             usage_records=sink["usage_records"],
             failure_classification=failure,
             model=model,
             model_reason=model_reason,
+            team_help_events=sink.get("team_help_events", []),
         )
+        if budget_deferred:
+            await post_team_handoff(
+                speaker_owner,
+                (
+                    "Miles, I stopped before the next request could exceed the task or "
+                    "daily budget. This work can resume after the budget resets."
+                ),
+            )
+            await post_to_group(
+                (
+                    f"Deferred {task['id']} at the budget boundary. No owner action is "
+                    "required; unrelated work may continue and this item can retry on "
+                    "the next budget day."
+                ),
+                "manager",
+            )
+            return "blocked"
         escalation = autonomous_workflow.format_escalation(
             project,
             task,
@@ -1590,6 +2149,7 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
             failure_classification="decision",
             model=model,
             model_reason=model_reason,
+            team_help_events=sink.get("team_help_events", []),
         )
         await post_to_group(reason, "manager")
         return "blocked"
@@ -1603,6 +2163,7 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
         model=model,
         model_reason=model_reason,
         feedback=answer if owner == "editor" else None,
+        team_help_events=sink.get("team_help_events", []),
     )
     verdict = None
     if owner == "editor":
@@ -1686,6 +2247,8 @@ async def _run_one_task(project, task):
     prompt = company_mode.build_task_prompt(
         project, task, prior_work, deliverable_name, deliverable_content
     )
+    if task.get("enforce_authorization") and owner != "editor":
+        prompt += _team_help_contract(owner or "general")
     execution_evidence = _autonomy_evidence_context.get()
     if execution_evidence:
         prompt += "\n\n" + execution_evidence
@@ -2263,6 +2826,8 @@ def _autonomy_status_text():
             if last else "Last run: none"
         ),
     ]
+    if telegram_roster_status is not None:
+        lines.append(telegram_roster_health.render_roster_summary(telegram_roster_status))
     for idea in proposed_ideas[:5]:
         title = re.sub(r"\s+", " ", str(idea.get("idea") or "Untitled idea")).strip()
         if len(title) > 100:
@@ -2985,7 +3550,7 @@ async def start_scheduler():
 
 
 async def run_all():
-    global main_loop, office_api_server
+    global main_loop, office_api_server, telegram_roster_status
     main_loop = asyncio.get_running_loop()
 
     # Build every Application and resolve every bot's own username FIRST,
@@ -2993,16 +3558,76 @@ async def run_all():
     # a message, every handler can safely look up any other bot's username
     # (e.g. the Manager checking for @mentions of specialists that haven't
     # started polling yet would otherwise KeyError).
+    roster_tokens = {
+        info["env_var"]: os.environ.get(info["env_var"], "")
+        for info in AGENT_INFO.values()
+    }
+    roster_identities = {}
+    roster_memberships = {}
     for key in BOT_KEYS:
         token = _require_env(
             AGENT_INFO[key]["env_var"],
             f"It's the BotFather token for the '{key}' bot listed in BOT_KEYS.",
         )
-        app = ApplicationBuilder().token(token).build()
+        try:
+            app = ApplicationBuilder().token(token).build()
+        except Exception as exc:
+            # Token parsers may retain the raw value in exception context.  The
+            # class is enough to diagnose a deterministic configuration failure.
+            main.logger.error(
+                f"Telegram roster application setup failed for {key} "
+                f"({type(exc).__name__})."
+            )
+            roster_identities[key] = {"check_unavailable": True}
+            continue
         applications[key] = app
         bots[key] = app.bot
-        bot_usernames[key] = (await app.bot.get_me()).username
+        identity_ok, identity = await _telegram_roster_call(
+            key,
+            "identity",
+            app.bot.get_me,
+        )
+        if not identity_ok:
+            roster_identities[key] = {"check_unavailable": True}
+            continue
+        bot_usernames[key] = identity.username
+        roster_identities[key] = {
+            "id": identity.id,
+            "is_bot": identity.is_bot,
+            "username": identity.username,
+            "can_read_all_group_messages": getattr(
+                identity, "can_read_all_group_messages", None
+            ),
+        }
+        membership_ok, member = await _telegram_roster_call(
+            key,
+            "group membership",
+            lambda: app.bot.get_chat_member(GROUP_CHAT_ID, identity.id),
+        )
+        if membership_ok:
+            roster_memberships[key] = {
+                "status": getattr(member, "status", ""),
+                "is_member": getattr(member, "is_member", None),
+            }
+        else:
+            roster_memberships[key] = {"check_unavailable": True}
         print(f"{AGENT_INFO[key]['label']}: @{bot_usernames[key]}")
+
+    telegram_roster_status = telegram_roster_health.evaluate_roster(
+        specialist_keys=main.SPECIALISTS.keys(),
+        agent_info=AGENT_INFO,
+        token_values=roster_tokens,
+        identities=roster_identities,
+        group_memberships=roster_memberships,
+    )
+    print(telegram_roster_health.render_roster_summary(telegram_roster_status))
+    _enforce_configured_identity_safety(telegram_roster_status)
+    if _env_flag("TELEGRAM_REQUIRE_COMPLETE_ROSTER", False) and not telegram_roster_status.complete:
+        raise SystemExit(
+            "TELEGRAM_REQUIRE_COMPLETE_ROSTER=true, but one or more expected Telegram "
+            "bots are missing, privacy-enabled, outside the group, or could not be "
+            "verified after bounded retries."
+        )
 
     _office_call("configure_agents", _office_roster())
     main.on_delegation = on_delegation

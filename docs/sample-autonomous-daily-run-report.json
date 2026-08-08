@@ -38,6 +38,7 @@
   "model_selection_reasons": [
     "task type 'status_update' maps to lightweight; complexity=lightweight; requires status_updates, text; selected gpt-5.4-nano (lightweight) as the lowest estimated-cost capable model among 3 candidate(s); estimated $0.000615 from the configured pricing snapshot; within remaining $4.75."
   ],
+  "collaborations": [],
   "token_usage": {
     "input_tokens": 0,
     "cached_input_tokens": 0,

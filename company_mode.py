@@ -221,6 +221,67 @@ def _normalize_usage_records(records):
     return normalized
 
 
+def _normalize_team_help_events(records):
+    """Normalize the bounded audit trail for one task's specialist help calls.
+
+    Help messages are provider output and later become run-report evidence.  Keep
+    only a small, explicit schema so an unexpected tool payload cannot grow the
+    shared state file without bound.  The normal save-path redactor still runs on
+    the returned values before they reach disk.
+    """
+    normalized = []
+    for raw in _list(records):
+        if not isinstance(raw, dict):
+            continue
+
+        def text_field(name, limit, *, strip=True):
+            value, truncated = _bounded_text(raw.get(name), limit, strip=strip)
+            return value, bool(raw.get(f"{name}_truncated")) or truncated
+
+        question, question_truncated = text_field("question", MAX_TEAM_HELP_QUESTION_CHARS)
+        reason, reason_truncated = text_field("reason", MAX_TEAM_HELP_REASON_CHARS)
+        response, response_truncated = text_field("response", MAX_TEAM_HELP_RESPONSE_CHARS)
+        model_reason, model_reason_truncated = text_field(
+            "model_reason", MAX_TEAM_HELP_MODEL_REASON_CHARS
+        )
+
+        def metadata(name, limit=MAX_TEAM_HELP_METADATA_CHARS):
+            return _bounded_text(raw.get(name), limit, strip=True)[0]
+
+        def token_count(name):
+            try:
+                return max(0, int(raw.get(name, 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        normalized.append({
+            "requesting_agent": metadata("requesting_agent"),
+            "helper_agent": metadata("helper_agent"),
+            "question": question,
+            "question_truncated": question_truncated,
+            "reason": reason,
+            "reason_truncated": reason_truncated,
+            "response": response,
+            "response_truncated": response_truncated,
+            "helper_model": metadata("helper_model"),
+            "model_reason": model_reason,
+            "model_reason_truncated": model_reason_truncated,
+            "task_type": metadata("task_type"),
+            "complexity": metadata("complexity"),
+            "risk": metadata("risk"),
+            "status": metadata("status", MAX_TEAM_HELP_STATUS_CHARS),
+            "request_delivery": metadata("request_delivery", MAX_TEAM_HELP_STATUS_CHARS),
+            "routing_delivery": metadata("routing_delivery", MAX_TEAM_HELP_STATUS_CHARS),
+            "response_delivery": metadata("response_delivery", MAX_TEAM_HELP_STATUS_CHARS),
+            "created_at": metadata("created_at", MAX_TEAM_HELP_TIMESTAMP_CHARS),
+            "completed_at": metadata("completed_at", MAX_TEAM_HELP_TIMESTAMP_CHARS),
+            "input_tokens": token_count("input_tokens"),
+            "output_tokens": token_count("output_tokens"),
+            "cost_usd": _amount(raw.get("cost_usd", 0.0)),
+        })
+    return normalized[-MAX_TEAM_HELP_EVENTS:], len(normalized) > MAX_TEAM_HELP_EVENTS
+
+
 def _bounded_text(value, limit, *, strip=False):
     """Return text constrained to a configured state/prompt boundary.
 
@@ -307,6 +368,13 @@ def _normalize_task(task):
     item["feedback_fingerprints"] = [str(value) for value in _list(feedback) if value]
     item["attempt_history"] = _list(item.get("attempt_history"))
     item["usage_records"] = _normalize_usage_records(item.get("usage_records"))
+    help_events, help_events_truncated = _normalize_team_help_events(
+        item.get("team_help_events")
+    )
+    item["team_help_events"] = help_events
+    item["team_help_events_truncated"] = bool(
+        item.get("team_help_events_truncated")
+    ) or help_events_truncated
     item["input_tokens"] = int(item.get("input_tokens", 0) or 0)
     item["output_tokens"] = int(item.get("output_tokens", 0) or 0)
     item["total_tokens"] = int(item.get("total_tokens", 0) or 0)
@@ -991,6 +1059,8 @@ def _new_task(project_id, owner, delivery, title, estimate=DEFAULT_TASK_ESTIMATE
         "feedback_fingerprints": [],
         "attempt_history": [],
         "usage_records": [],
+        "team_help_events": [],
+        "team_help_events_truncated": False,
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
@@ -1135,6 +1205,7 @@ def update_task_status(
     model=None,
     model_reason=None,
     feedback=None,
+    team_help_events=None,
 ):
     hook_args = None
     with _state_transaction(path) as state:
@@ -1145,7 +1216,10 @@ def update_task_status(
         if status == "in_progress":
             task["execution_attempts"] = int(task.get("execution_attempts", 0)) + 1
             task.setdefault("attempt_history", []).append({
-                "attempt": task["execution_attempts"], "started_at": _now().isoformat(), "model": model or task.get("model", "")
+                "attempt": task["execution_attempts"],
+                "started_at": _now().isoformat(),
+                "model": model or task.get("model", ""),
+                "model_reason": model_reason or task.get("model_reason", ""),
             })
             if task["execution_attempts"] > MAX_EXECUTION_ATTEMPTS:
                 status = "blocked"
@@ -1169,6 +1243,19 @@ def update_task_status(
             task["model"] = model
         if model_reason is not None:
             task["model_reason"] = model_reason
+        if team_help_events is not None:
+            incoming, incoming_truncated = _normalize_team_help_events(team_help_events)
+            combined = list(task.get("team_help_events", []))
+            for event in incoming:
+                # Replaying a completion update must not duplicate the exact same
+                # help record. Distinct retries retain their different timestamps.
+                if event not in combined:
+                    combined.append(event)
+            normalized_help, combined_truncated = _normalize_team_help_events(combined)
+            task["team_help_events"] = normalized_help
+            task["team_help_events_truncated"] = bool(
+                task.get("team_help_events_truncated")
+            ) or incoming_truncated or combined_truncated
         classification = failure_classification or failure
         if classification:
             task["failure_classification"] = classification if classification in FAILURE_CLASSIFICATIONS else classify_failure(classification)
@@ -1407,6 +1494,17 @@ MAX_REVIEW_FEEDBACK_CHARS = _configured_positive_int(
 MAX_EDITOR_FEEDBACK_HISTORY = _configured_positive_int(
     "MAX_EDITOR_FEEDBACK_HISTORY", 10, maximum=50
 )
+# A task may ask for one teammate per execution by default, and execution itself is
+# capped.  Persist at most three exchanges even if runtime configuration is looser,
+# so repeated attempts cannot turn the company state into an unbounded transcript.
+MAX_TEAM_HELP_EVENTS = 3
+MAX_TEAM_HELP_QUESTION_CHARS = 1000
+MAX_TEAM_HELP_REASON_CHARS = 500
+MAX_TEAM_HELP_RESPONSE_CHARS = 3000
+MAX_TEAM_HELP_MODEL_REASON_CHARS = 500
+MAX_TEAM_HELP_METADATA_CHARS = 120
+MAX_TEAM_HELP_STATUS_CHARS = 40
+MAX_TEAM_HELP_TIMESTAMP_CHARS = 64
 FAILURE_CLASSIFICATIONS = {
     "missing_access",
     "missing_information",
@@ -1768,8 +1866,6 @@ def start_revision_round(project_id, configured_agent_keys, path=COMPANY_STATE_F
                     "required_capabilities",
                     "estimated_input_tokens",
                     "estimated_output_tokens",
-                    "model",
-                    "model_reason",
                 )
                 if template.get(key) is not None
             }
