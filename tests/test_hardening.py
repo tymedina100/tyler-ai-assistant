@@ -310,6 +310,194 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)          # 2 tool iterations + 1 synthesis
         self.assertNotIn("tools", calls[-1])     # synthesis call carried no tools
 
+    def test_incomplete_no_function_response_gets_one_bounded_synthesis(self):
+        main = self.main
+        calls = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=100)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return types.SimpleNamespace(
+                        output=[],
+                        output_text="Partial answer that must not be accepted.",
+                        status="incomplete",
+                        incomplete_details=types.SimpleNamespace(
+                            reason="max_output_tokens"
+                        ),
+                        usage=None,
+                    )
+                return types.SimpleNamespace(
+                    output=[], output_text="Complete synthesized answer.",
+                    status="completed", incomplete_details=None, usage=None,
+                )
+
+        sink = {
+            "cost_usd": 0.0, "usage_records": [], "artifacts": [],
+            "budget_cap_usd": 1.0,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ):
+                result = main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[], max_iterations=1, model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(result, "Complete synthesized answer.")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("tools", calls[-1])
+        self.assertIn("max_output_tokens", calls[-1])
+        self.assertEqual(
+            sink["response_completion_history"][0],
+            {"status": "incomplete", "reason": "max_output_tokens"},
+        )
+        self.assertEqual(sink["last_response_status"], "completed")
+
+    def test_blank_then_incomplete_synthesis_raises_for_strict_autonomy(self):
+        main = self.main
+        calls = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=100)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return types.SimpleNamespace(
+                        output=[], output_text="", status="completed",
+                        incomplete_details=None, usage=None,
+                    )
+                return types.SimpleNamespace(
+                    output=[], output_text="", status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"}, usage=None,
+                )
+
+        sink = {
+            "cost_usd": 0.0, "usage_records": [], "artifacts": [],
+            "budget_cap_usd": 1.0,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ), self.assertRaises(main.IncompleteModelResponseError) as raised:
+                main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[], max_iterations=1, model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("one bounded final synthesis attempt", str(raised.exception))
+        self.assertEqual(sink["last_response_status"], "incomplete")
+        self.assertEqual(sink["last_response_reason"], "max_output_tokens")
+        self.assertEqual(company_mode.classify_failure(raised.exception), "technical")
+
+    def test_incomplete_response_keeps_ordinary_api_failure_fallback(self):
+        main = self.main
+
+        class Responses:
+            @staticmethod
+            def create(**kwargs):
+                return types.SimpleNamespace(
+                    output=[], output_text="", status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"}, usage=None,
+                )
+
+        with patch.object(
+            main, "get_openai_client",
+            return_value=types.SimpleNamespace(responses=Responses()),
+        ):
+            result = main.run_with_tools(
+                "ordinary", [{"role": "user", "content": "inspect"}],
+                tools=[], max_iterations=1, model=main.FAST_MODEL,
+            )
+
+        self.assertTrue(result.startswith("Sorry, something went wrong"))
+
+    def test_strict_autonomy_truncates_each_tool_result_only_in_its_sink(self):
+        main = self.main
+        calls = []
+        long_result = "evidence-" + ("x" * 1000)
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=100)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    call = types.SimpleNamespace(
+                        type="function_call", name="safe_read",
+                        arguments="{}", call_id="call-1",
+                    )
+                    return types.SimpleNamespace(
+                        output=[call], output_text="", status="completed",
+                        incomplete_details=None, usage=None,
+                    )
+                return types.SimpleNamespace(
+                    output=[], output_text="bounded answer", status="completed",
+                    incomplete_details=None, usage=None,
+                )
+
+        sink = {
+            "cost_usd": 0.0, "usage_records": [], "artifacts": [],
+            "budget_cap_usd": 1.0,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.dict(
+                os.environ, {"AUTONOMY_MAX_TOOL_RESULT_CHARS": "256"}
+            ), patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ), patch.object(main, "execute_tool", return_value=long_result):
+                result = main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[{"type": "function", "name": "safe_read"}],
+                    max_iterations=2, model=main.FAST_MODEL,
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        tool_output = next(
+            item["output"] for item in calls[-1]["input"]
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+        )
+        self.assertEqual(result, "bounded answer")
+        self.assertEqual(len(tool_output), 256)
+        self.assertIn("tool result truncated", tool_output)
+        self.assertEqual(sink["tool_result_truncation_count"], 1)
+        with patch.dict(os.environ, {"AUTONOMY_MAX_TOOL_RESULT_CHARS": "256"}):
+            self.assertEqual(main._bounded_autonomy_tool_result(long_result), long_result)
+
     def test_run_with_tools_rejects_unadvertised_function_call(self):
         main = self.main
 
@@ -397,8 +585,13 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(len(count_calls), 1)
         self.assertEqual(len(create_calls), 1)
         self.assertGreaterEqual(create_calls[0]["max_output_tokens"], 16)
-        self.assertLessEqual(create_calls[0]["max_output_tokens"], 1200)
+        self.assertLessEqual(create_calls[0]["max_output_tokens"], 3000)
         self.assertEqual(count_calls[0]["tools"], [])
+
+        with patch.dict(
+            os.environ, {"AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL": ""}
+        ):
+            self.assertEqual(main._configured_budget_output_tokens(), 3000)
 
     def test_budgeted_tool_call_fails_before_generation_when_input_does_not_fit(self):
         main = self.main

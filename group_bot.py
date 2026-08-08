@@ -188,6 +188,23 @@ _autonomy_evidence_context = contextvars.ContextVar(
     "autonomy_evidence_context",
     default="",
 )
+
+
+def _env_flag(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+AUTONOMY_TEAM_CHAT_ENABLED = _env_flag("AUTONOMY_TEAM_CHAT_ENABLED", True)
+try:
+    AUTONOMY_TEAM_CHAT_MAX_CHARS = int(
+        os.environ.get("AUTONOMY_TEAM_CHAT_MAX_CHARS", "900")
+    )
+except (TypeError, ValueError):
+    AUTONOMY_TEAM_CHAT_MAX_CHARS = 900
+AUTONOMY_TEAM_CHAT_MAX_CHARS = min(2000, max(160, AUTONOMY_TEAM_CHAT_MAX_CHARS))
 office_api_server = None
 
 # Transient office states remain visible long enough for the browser's 1.5-second
@@ -208,6 +225,15 @@ def _office_call(method, *args, **kwargs):
 def _office_role(label):
     """Extract the existing human-readable role from a roster label."""
     return label.split("(", 1)[1].rstrip(")") if "(" in label else label
+
+
+def _agent_display_name(key):
+    if key == "manager":
+        return "Miles"
+    if key == "general":
+        return "Robin"
+    profile = main.SPECIALISTS.get(key, {})
+    return str(profile.get("name") or key.replace("_", " ").title())
 
 
 def _office_roster():
@@ -452,6 +478,48 @@ async def reply_chunks(message, text):
 async def send_chunks(bot, chat_id, text):
     for chunk in _chunks(text):
         await bot.send_message(chat_id, chunk)
+
+
+async def _send_group_message_as(text, bot_key="manager", *, max_chars=None):
+    """Send one message under a real agent identity, with an explicit Miles relay.
+
+    Telegram bot messages remain transport-only: handlers still reject bot authors,
+    so this cannot start a bot-to-bot reply loop.  The relay prefix makes it honest
+    when a code-defined worker does not yet have a configured Telegram bot.
+    """
+    message = str(autonomous_workflow.redact_secrets(str(text or ""))).strip()
+    if not message:
+        return
+
+    bot = bots.get(bot_key)
+    if bot is None:
+        bot = bots.get("manager")
+        if bot is None:
+            main.logger.error(
+                f"Could not post as {bot_key!r}: neither that bot nor Miles is configured."
+            )
+            return
+        if bot_key != "manager":
+            message = f"{_agent_display_name(bot_key)}: {message}"
+
+    if max_chars is not None and len(message) > max_chars:
+        marker = "..."
+        message = message[:max(0, max_chars - len(marker))].rstrip() + marker
+    try:
+        await send_chunks(bot, GROUP_CHAT_ID, message)
+    except Exception as e:
+        main.logger.error(f"Failed to post Telegram team message: {e}")
+
+
+async def post_team_handoff(speaker_key, text):
+    """Expose one real autonomous state transition without generating more chatter."""
+    if not AUTONOMY_TEAM_CHAT_ENABLED or not _suppress_company_updates.get():
+        return
+    await _send_group_message_as(
+        text,
+        speaker_key,
+        max_chars=AUTONOMY_TEAM_CHAT_MAX_CHARS,
+    )
 
 
 def build_specialist_handler(key):
@@ -1239,6 +1307,8 @@ def _task_allowed_tools(task, owner):
 def _answer_failure_classification(answer):
     """Recognize only explicit provider/tool failures, not ordinary critical prose."""
     text = str(answer or "").strip()
+    if not text:
+        return "technical"
     lowered = text.lower()
     if lowered.startswith("blocked - needs human"):
         classification = company_mode.classify_failure(lowered)
@@ -1342,6 +1412,15 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
     _office_call("set_agent_status", speaker_owner, "thinking", task["title"])
     _office_call("add_event", "delegated", "manager", f"Started company task: {task['owner']} - {task['title']}")
     await post_to_group(f"Starting: {task['owner']} - {task['title']} [{model}]", "manager")
+    worker_name = _agent_display_name(speaker_owner)
+    await post_team_handoff(
+        "manager",
+        (
+            f"{worker_name}, you're up: {task['title']}\n"
+            f"Model: {model}\n"
+            f"Routing: {model_reason or 'Selected for this bounded task.'}"
+        ),
+    )
 
     for attempt_index in range(attempts_remaining):
         time_limit_exceeded = False
@@ -1388,6 +1467,8 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
                 elapsed = time.monotonic() - started
             answer = str(autonomous_workflow.redact_secrets(str(answer or ""))).strip()
             failure = _answer_failure_classification(answer)
+            if failure and not answer:
+                answer = "The model returned no complete visible result."
             if elapsed > timeout_seconds and not failure:
                 time_limit_exceeded = True
                 failure = "transient"
@@ -1438,6 +1519,13 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
                     f"Retrying {task['id']} with {model}: the prior {failure} attempt failed.",
                     "manager",
                 )
+                await post_team_handoff(
+                    "manager",
+                    (
+                        f"{worker_name}, retry the same bounded task after the prior "
+                        f"{failure} failure.\nModel: {model}\nRouting: {model_reason}"
+                    ),
+                )
                 continue
             route_reason = str(
                 _decision_value(next_decision, "deferral_reason")
@@ -1470,6 +1558,19 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
             _failure_action(failure),
             True,
         )
+        if owner == "editor" and str(answer).strip().upper().startswith("BLOCKED"):
+            await post_team_handoff(
+                "editor",
+                f"Miles, review is blocked and needs owner attention:\n{answer}",
+            )
+        elif owner != "editor":
+            await post_team_handoff(
+                speaker_owner,
+                (
+                    "Miles, I cannot continue this task inside the current limits.\n"
+                    f"Failure: {autonomy_team.workflow_failure(failure)}\n{answer}"
+                ),
+            )
         await post_to_group(escalation, "manager")
         return "blocked"
 
@@ -1503,9 +1604,47 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
         model_reason=model_reason,
         feedback=answer if owner == "editor" else None,
     )
+    verdict = None
     if owner == "editor":
-        await asyncio.to_thread(company_mode.set_project_revision_flag, project["id"], answer)
+        verdict = await asyncio.to_thread(
+            company_mode.set_project_revision_flag, project["id"], answer
+        )
     state = await asyncio.to_thread(company_mode.load_state)
+    if owner == "editor":
+        if verdict == "approved":
+            await post_team_handoff(
+                "editor",
+                f"Miles, review complete: {answer}",
+            )
+        elif verdict == "revise":
+            prior_workers = [
+                value
+                for value in company_mode.project_tasks(state, project["id"])
+                if value.get("owner") != "editor"
+            ]
+            target_key = str((prior_workers[-1] if prior_workers else {}).get("owner") or "manager")
+            await post_team_handoff(
+                "editor",
+                (
+                    f"{_agent_display_name(target_key)}, revisions are required before "
+                    f"approval:\n{answer}"
+                ),
+            )
+        elif verdict == "blocked":
+            await post_team_handoff(
+                "editor",
+                f"Miles, review is blocked by the loop guard or missing owner input:\n{answer}",
+            )
+    else:
+        next_task = company_mode.next_planned_task(state, project["id"])
+        if next_task and next_task.get("owner") == "editor":
+            await post_team_handoff(
+                speaker_owner,
+                (
+                    f"Vera, I finished {task['title']} and persisted the result for your "
+                    f"acceptance-criteria review.\nResult: {answer}"
+                ),
+            )
     await post_to_group(company_mode.render_money(state), "manager")
     return "done"
 
@@ -1809,7 +1948,7 @@ async def _execute_autonomy_item(project, item, decision, run_id):
             "failure_classification": "budget_exhausted" if budget_only else "unavailable_tool",
             "reason": plan["reason"],
             "human_action": (
-                "Increase today's budget or wait for the next budget day."
+                ""
                 if budget_only
                 else "Review the model catalog and required review capabilities, then retry."
             ),
@@ -2073,7 +2212,8 @@ async def _run_and_post_autonomy(trigger_source, *, dry_run=None):
                 # posted; the session emits one aggregate summary below.
                 deliverable = autonomous_workflow.format_telegram_deliverable(child)
                 if deliverable:
-                    await post_to_group(deliverable, "manager")
+                    result_agent = str(child.get("result_agent") or "manager")
+                    await post_to_group(deliverable, result_agent)
             for escalation in report.get("escalations", []) or []:
                 message = str(autonomous_workflow.redact_secrets(str(escalation))).strip()
                 if not message or message in seen_escalations:
@@ -2682,11 +2822,7 @@ async def post_to_group(text, bot_key="manager"):
     if that agent doesn't have its own bot yet (e.g. Cadence before you create it)."""
     if _suppress_company_updates.get():
         return
-    bot = bots.get(bot_key, bots["manager"])
-    try:
-        await send_chunks(bot, GROUP_CHAT_ID, text)
-    except Exception as e:
-        main.logger.error(f"Failed to post scheduled message: {e}")
+    await _send_group_message_as(text, bot_key)
 
 
 async def post_morning_briefing():
