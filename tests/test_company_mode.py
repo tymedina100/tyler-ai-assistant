@@ -725,6 +725,79 @@ class CompanyModeTests(unittest.TestCase):
         self.assertTrue(any(value["id"] == held["id"] for value in state["budget_reservations"]))
         self.assertGreaterEqual(state["company"]["reserved_today_usd"], 0.10)
 
+    def test_task_reservation_expands_atomically_without_using_emergency_budget(self):
+        company_mode.set_daily_budget(1.0, self.state_path)
+        company_mode.assign_goal(
+            "Inspect safely",
+            ["manager", "editor"],
+            specialist_keys=["editor"],
+            path=self.state_path,
+            tasks=[
+                {"owner": "manager", "title": "Inspect", "estimate_usd": 0.10},
+                {"owner": "editor", "title": "Review", "estimate_usd": 0.10},
+            ],
+        )
+        state = company_mode.load_state(self.state_path)
+        first, second = state["tasks"]
+
+        expanded = company_mode.expand_task_budget_reservation(
+            first["id"], 0.40, 0.50, self.state_path
+        )
+        repeated = company_mode.expand_task_budget_reservation(
+            first["id"], 0.40, 0.50, self.state_path
+        )
+        denied = company_mode.expand_task_budget_reservation(
+            second["id"], 0.30, 0.50, self.state_path
+        )
+        final = company_mode.load_state(self.state_path)
+        saved_first, saved_second = final["tasks"]
+
+        self.assertTrue(expanded["expanded"])
+        self.assertEqual(expanded["amount_usd"], 0.50)
+        self.assertFalse(repeated["expanded"])
+        self.assertEqual(repeated["reason"], "already_sufficient")
+        self.assertEqual(saved_first["reserved_usd"], 0.50)
+        self.assertFalse(denied["expanded"])
+        self.assertEqual(denied["reason"], "insufficient_ordinary_budget")
+        self.assertEqual(saved_second["reserved_usd"], 0.10)
+        self.assertEqual(final["company"]["reserved_today_usd"], 0.60)
+        self.assertEqual(company_mode.remaining_budget(final), 0.15)
+
+        company_mode.update_task_status(
+            first["id"], "done", spent_usd=0.42, path=self.state_path
+        )
+        reconciled = company_mode.load_state(self.state_path)
+        self.assertEqual(reconciled["company"]["spent_today_usd"], 0.42)
+        self.assertEqual(reconciled["company"]["reserved_today_usd"], 0.10)
+        self.assertEqual(company_mode.remaining_budget(reconciled), 0.23)
+
+    def test_concurrent_task_expansions_cannot_claim_the_same_budget(self):
+        company_mode.set_daily_budget(1.0, self.state_path)
+        company_mode.assign_goal(
+            "Inspect concurrently",
+            ["manager", "editor"],
+            specialist_keys=["editor"],
+            path=self.state_path,
+            tasks=[
+                {"owner": "manager", "title": "Inspect", "estimate_usd": 0.10},
+                {"owner": "editor", "title": "Review", "estimate_usd": 0.10},
+            ],
+        )
+        task_ids = [task["id"] for task in company_mode.load_state(self.state_path)["tasks"]]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda task_id: company_mode.expand_task_budget_reservation(
+                    task_id, 0.50, 0.50, self.state_path
+                ),
+                task_ids,
+            ))
+
+        final = company_mode.load_state(self.state_path)
+        self.assertEqual(sum(result["expanded"] for result in results), 1)
+        self.assertEqual(final["company"]["reserved_today_usd"], 0.60)
+        self.assertEqual(company_mode.remaining_budget(final), 0.15)
+
     def test_persisted_company_output_redacts_common_github_credentials(self):
         self._assign()
         state = company_mode.load_state(self.state_path)

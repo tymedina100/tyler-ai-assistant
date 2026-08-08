@@ -1412,7 +1412,14 @@ async def _execute_routed_task(project, task, owner, prompt, sink):
         if can_retry:
             remaining_reservation = max(
                 0.0,
-                float(task.get("estimate_usd", 0.0) or 0.0) - float(sink["cost_usd"]),
+                float(
+                    sink.get(
+                        "budget_cap_usd",
+                        task.get("reserved_usd", task.get("estimate_usd", 0.0)),
+                    )
+                    or 0.0
+                )
+                - float(sink["cost_usd"]),
             )
             next_decision = await asyncio.to_thread(
                 _company_task_route,
@@ -1516,6 +1523,18 @@ async def _run_one_task(project, task):
     task_budget_cap = float(task.get("reserved_usd", 0.0) or 0.0)
     if task_budget_cap > 0:
         sink["budget_cap_usd"] = task_budget_cap
+        if task.get("budget_reservation_id"):
+            def top_up_budget(minimum_total, preferred_total):
+                expansion = company_mode.expand_task_budget_reservation(
+                    task["id"],
+                    minimum_total,
+                    preferred_total,
+                    path=company_mode.COMPANY_STATE_FILE,
+                )
+                sink["budget_top_up_reason"] = expansion["reason"]
+                return expansion["amount_usd"]
+
+            sink["budget_top_up"] = top_up_budget
 
     # Feed earlier tasks' summaries AND the current deliverable's real content into this
     # task's prompt so the agent builds on the actual file (even one a teammate saved to
@@ -1612,8 +1631,19 @@ async def run_company_plan(project_id):
             if outcome == "blocked":
                 # Close the project and release every later task reservation. Leaving
                 # an active project here would block unrelated roadmap work forever.
+                blocked_state = await asyncio.to_thread(company_mode.load_state)
+                blocked_task = next(
+                    (value for value in blocked_state.get("tasks", []) if value.get("id") == task["id"]),
+                    {},
+                )
                 await asyncio.to_thread(
-                    company_mode.block_project, project_id, company_mode.COMPANY_STATE_FILE
+                    company_mode.block_project,
+                    project_id,
+                    company_mode.COMPANY_STATE_FILE,
+                    reason=str(blocked_task.get("result") or ""),
+                    failure_classification=str(
+                        blocked_task.get("failure_classification") or "decision"
+                    ),
                 )
                 return
 

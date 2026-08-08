@@ -709,9 +709,12 @@ when the complete estimate fits within ordinary remaining budget, and preserves 
 emergency reserve for control-plane recovery and escalation. Each metered autonomous
 Responses call also receives a provider-side output-token ceiling calculated from the
 task's unspent reservation, conservatively priced fresh input, and a safety margin. It
-fails closed before another request when that envelope cannot fit. Network ambiguity and
-stale provider pricing still require an OpenAI project spending limit for an absolute
-invoice-level guarantee.
+fails closed before another request when that envelope cannot fit. If a later tool-loop
+request grows beyond the initial estimate, the runner may atomically enlarge only that
+task's reservation from otherwise-uncommitted ordinary budget, then recompute the output
+limit. Other task holds and the emergency reserve remain protected; insufficient ordinary
+headroom still stops before generation. Network ambiguity and stale provider pricing still
+require an OpenAI project spending limit for an absolute invoice-level guarantee.
 
 `MAX_REVISION_ROUNDS` and `MAX_EXECUTION_ATTEMPTS` bound Company Mode's review and task
 loops. Company Mode retains a larger bounded non-file worker result for review and marks
@@ -864,9 +867,12 @@ before v2, run `/setbudget 5` once to adopt the budget.
 The engine atomically reserves estimated cost before work, so concurrent workers sharing
 the same `DATA_DIR` cannot independently spend the same available balance. Completion
 releases the hold and records actual cost when usage exists, or a labeled estimate when
-it does not. Work that cannot reserve its estimate is deferred. A provider call can
-still cost more than its estimate, so this is an application guardrail rather than a
-guaranteed provider-side billing cap; keep limits modest and monitor real billing.
+it does not. Work that cannot reserve its estimate is deferred. A persisted task whose
+tool-loop context outgrows that estimate can request an atomic top-up from uncommitted
+ordinary budget; the top-up is denied before generation if it would consume another hold
+or the emergency reserve. A provider call can still cost more than its estimate, so this
+is an application guardrail rather than a guaranteed provider-side billing cap; keep
+limits modest and monitor real billing.
 
 ### Publishing a product (`/publish`, assisted)
 

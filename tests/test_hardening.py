@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import company_mode
+
 
 class FakeCollection:
     def count(self):
@@ -436,6 +438,160 @@ class HardeningTests(unittest.TestCase):
 
         self.assertEqual(generations, [])
         self.assertTrue(sink["budget_guard_blocked"])
+
+    def test_later_tool_call_can_atomically_expand_its_strict_budget_envelope(self):
+        main = self.main
+        create_calls = []
+        # Mirrors the production budget-audit failure: $0.504 initial cap,
+        # $0.308994 already spent, then a 55,697-token gpt-5.6-sol request.
+        counted_inputs = iter((100, 55697))
+        top_ups = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=next(counted_inputs))
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                create_calls.append(kwargs)
+                if len(create_calls) == 1:
+                    call = types.SimpleNamespace(
+                        type="function_call", name="safe_read", arguments="{}", call_id="call-1"
+                    )
+                    return types.SimpleNamespace(
+                        output=[call], output_text="",
+                        usage=FakeUsage(input_tokens=100, output_tokens=10),
+                    )
+                return types.SimpleNamespace(
+                    output=[], output_text="bounded answer",
+                    usage=FakeUsage(input_tokens=55697, output_tokens=20),
+                )
+
+        sink = {
+            "cost_usd": 0.308994,
+            "usage_records": [
+                {"model": "gpt-5.6-sol", "cost_usd": 0.308994}
+            ],
+            "artifacts": [],
+            "budget_cap_usd": 0.504,
+        }
+
+        def top_up(minimum_total, preferred_total):
+            top_ups.append((minimum_total, preferred_total))
+            return preferred_total
+
+        sink["budget_top_up"] = top_up
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ), patch.object(main, "execute_tool", return_value="evidence"):
+                result = main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[{"type": "function", "name": "safe_read"}],
+                    max_iterations=2, model="gpt-5.6-sol",
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(result, "bounded answer")
+        self.assertEqual(len(create_calls), 2)
+        self.assertEqual(len(top_ups), 1)
+        self.assertGreater(top_ups[0][1], top_ups[0][0])
+        self.assertEqual(sink["budget_top_up_count"], 1)
+        self.assertGreater(sink["budget_cap_usd"], 0.504)
+        self.assertLess(sink["cost_usd"], sink["budget_cap_usd"])
+
+    def test_denied_task_top_up_still_blocks_before_generation(self):
+        main = self.main
+        generations = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=55697)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                generations.append(kwargs)
+                raise AssertionError("generation must not start")
+
+        sink = {
+            "cost_usd": 0.308994,
+            "usage_records": [],
+            "artifacts": [],
+            "budget_cap_usd": 0.504,
+            "budget_top_up": lambda minimum, preferred: 0.504,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ), self.assertRaises(main.ExecutionBudgetExceededError):
+                main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[], max_iterations=1, model="gpt-5.6-sol",
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(generations, [])
+        self.assertTrue(sink["budget_guard_blocked"])
+        self.assertIn("No safe ordinary-budget expansion", sink["budget_guard_reason"])
+
+    def test_task_top_up_state_error_fails_closed_as_technical(self):
+        main = self.main
+        generations = []
+
+        class InputTokens:
+            @staticmethod
+            def count(**kwargs):
+                return types.SimpleNamespace(input_tokens=55697)
+
+        class Responses:
+            input_tokens = InputTokens()
+
+            @staticmethod
+            def create(**kwargs):
+                generations.append(kwargs)
+                raise AssertionError("generation must not start")
+
+        def broken_top_up(minimum, preferred):
+            raise OSError("state write failed")
+
+        sink = {
+            "cost_usd": 0.308994,
+            "usage_records": [],
+            "artifacts": [],
+            "budget_cap_usd": 0.504,
+            "budget_top_up": broken_top_up,
+        }
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(
+                main, "get_openai_client",
+                return_value=types.SimpleNamespace(responses=Responses()),
+            ), self.assertRaises(main.ExecutionReservationStateError) as raised:
+                main.run_with_tools(
+                    "bounded", [{"role": "user", "content": "inspect"}],
+                    tools=[], max_iterations=1, model="gpt-5.6-sol",
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(generations, [])
+        self.assertTrue(sink["budget_guard_blocked"])
+        self.assertEqual(sink["budget_top_up_error"], "OSError")
+        self.assertEqual(company_mode.classify_failure(raised.exception), "technical")
 
     def test_controlled_ideation_uses_same_strict_output_envelope(self):
         main = self.main

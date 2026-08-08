@@ -188,6 +188,10 @@ class ExecutionBudgetExceededError(RuntimeError):
     """Raised before another autonomous model call can exceed its reserved envelope."""
 
 
+class ExecutionReservationStateError(RuntimeError):
+    """Raised when a strict task hold cannot be updated safely in persistent state."""
+
+
 _BUDGET_INPUT_SAFETY_MULTIPLIER = 1.25
 _BUDGET_USABLE_FRACTION = 0.90
 _MIN_BUDGETED_OUTPUT_TOKENS = 16
@@ -263,10 +267,76 @@ def _budgeted_response_options(openai_client, model, instructions, input_items, 
         affordable_output_tokens,
     )
     if max_output_tokens < _MIN_BUDGETED_OUTPUT_TOKENS:
+        top_up = sink.get("budget_top_up")
+        if callable(top_up):
+            minimum_request_cost = input_cost + (
+                _MIN_BUDGETED_OUTPUT_TOKENS * output_per_million / 1_000_000.0
+            )
+            preferred_request_cost = input_cost + (
+                _configured_budget_output_tokens() * output_per_million / 1_000_000.0
+            )
+            # A two-microdollar cushion avoids six-decimal ledger rounding making a
+            # just-granted envelope immediately fail the same conservative preflight.
+            minimum_total = (
+                already_spent + minimum_request_cost
+            ) / _BUDGET_USABLE_FRACTION + 0.000002
+            preferred_total = (
+                already_spent + preferred_request_cost
+            ) / _BUDGET_USABLE_FRACTION + 0.000002
+            try:
+                expanded_cap = float(top_up(minimum_total, preferred_total))
+            except Exception as exc:
+                sink["budget_guard_blocked"] = True
+                sink["budget_top_up_error"] = type(exc).__name__
+                sink["budget_guard_reason"] = (
+                    "The persisted task reservation could not be expanded safely because "
+                    "its state update failed."
+                )
+                logger.warning(
+                    "Task budget reservation expansion failed closed: %s",
+                    type(exc).__name__,
+                )
+                raise ExecutionReservationStateError(
+                    sink["budget_guard_reason"]
+                ) from exc
+            else:
+                if not math.isfinite(expanded_cap):
+                    sink["budget_top_up_error"] = "non_finite_cap"
+                    expanded_cap = cap
+                if expanded_cap > cap:
+                    sink["budget_top_up_count"] = int(
+                        sink.get("budget_top_up_count", 0) or 0
+                    ) + 1
+                    sink["budget_top_up_usd"] = round(
+                        float(sink.get("budget_top_up_usd", 0.0) or 0.0)
+                        + expanded_cap - cap,
+                        6,
+                    )
+                    cap = expanded_cap
+                    sink["budget_cap_usd"] = cap
+                    usable_remaining = max(
+                        0.0, cap * _BUDGET_USABLE_FRACTION - already_spent
+                    )
+                    output_budget = usable_remaining - input_cost
+                    affordable_output_tokens = (
+                        math.floor(output_budget * 1_000_000.0 / output_per_million)
+                        if output_per_million > 0
+                        else _configured_budget_output_tokens()
+                    )
+                    max_output_tokens = min(
+                        _configured_budget_output_tokens(),
+                        affordable_output_tokens,
+                    )
+    if max_output_tokens < _MIN_BUDGETED_OUTPUT_TOKENS:
         sink["budget_guard_blocked"] = True
+        expansion_note = (
+            " No safe ordinary-budget expansion was available."
+            if callable(sink.get("budget_top_up"))
+            else ""
+        )
         sink["budget_guard_reason"] = (
             f"The next {model} request cannot fit safely inside the task's "
-            f"${cap:.4f} reserved budget envelope."
+            f"${cap:.4f} reserved budget envelope.{expansion_note}"
         )
         raise ExecutionBudgetExceededError(sink["budget_guard_reason"])
     return {"max_output_tokens": int(max_output_tokens)}
@@ -915,7 +985,7 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
             if final_response.output_text:
                 assistant_response = final_response.output_text
 
-    except ExecutionBudgetExceededError:
+    except (ExecutionBudgetExceededError, ExecutionReservationStateError):
         raise
     except Exception:
         assistant_response = "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."

@@ -629,6 +629,88 @@ def reserve_budget(
     return result
 
 
+def expand_task_budget_reservation(
+    task_id,
+    minimum_total_usd,
+    preferred_total_usd=None,
+    path=COMPANY_STATE_FILE,
+):
+    """Atomically enlarge one active task's hold using ordinary budget only.
+
+    Tool-loop input grows as repository evidence is appended.  The initial task
+    estimate remains the admission-control hold, while this function lets the
+    request guard claim otherwise-uncommitted budget before a later model call.
+    Existing task/reviewer holds and the emergency reserve remain unavailable.
+    """
+
+    minimum = _amount(minimum_total_usd)
+    preferred = _amount(
+        minimum_total_usd if preferred_total_usd is None else preferred_total_usd
+    )
+    if minimum <= 0:
+        raise ValueError("The minimum task budget must be greater than zero.")
+    preferred = max(minimum, preferred)
+
+    with _state_transaction(path) as state:
+        task = next((item for item in state["tasks"] if item["id"] == task_id), None)
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        if task.get("status") not in {"planned", "in_progress"}:
+            raise ValueError(
+                f"Task {task_id} is {task.get('status')} and cannot expand its budget hold."
+            )
+
+        reservation_id = task.get("budget_reservation_id")
+        reservation = _find_reservation(state, reservation_id) if reservation_id else None
+        if reservation is None or reservation.get("status") != "reserved":
+            raise ValueError(f"Task {task_id} has no active budget reservation to expand.")
+
+        current = _amount(reservation.get("amount_usd", 0.0))
+        minimum = max(current, minimum)
+        preferred = max(minimum, preferred)
+        available = remaining_budget(state)
+        maximum = _amount(current + available)
+        if maximum < minimum:
+            result = {
+                "expanded": False,
+                "reason": "insufficient_ordinary_budget",
+                "task_id": task_id,
+                "amount_usd": current,
+                "added_usd": 0.0,
+                "ordinary_remaining_usd": available,
+            }
+        else:
+            target = _amount(min(preferred, maximum))
+            added = _amount(target - current)
+            if added > 0:
+                reservation["amount_usd"] = target
+                reservation["remaining_usd"] = target
+                reservation["updated_at"] = _now().isoformat()
+                task["reserved_usd"] = target
+                task["updated_at"] = _now().isoformat()
+                state["company"]["reserved_today_usd"] = _amount(
+                    state["company"].get("reserved_today_usd", 0.0) + added
+                )
+                add_event(
+                    state,
+                    "budget_reservation_expanded",
+                    "Expanded an active task reservation for a bounded model request.",
+                    project_id=task.get("project_id"),
+                    task_id=task_id,
+                    amount_usd=added,
+                )
+            result = {
+                "expanded": added > 0,
+                "reason": "expanded" if added > 0 else "already_sufficient",
+                "task_id": task_id,
+                "amount_usd": target,
+                "added_usd": added,
+                "ordinary_remaining_usd": remaining_budget(state),
+            }
+        response = deepcopy(result)
+    return response
+
+
 def _record_cost_entry_in_state(
     state,
     amount_usd,
