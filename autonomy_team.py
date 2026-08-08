@@ -257,8 +257,20 @@ def aggregate_company_result(
     review_outcomes = [str(task.get("result") or "") for task in editor_tasks if task.get("result")]
     approved = project.get("editor_verdict") == "approved" or (not editor_tasks and project.get("status") == "completed")
 
+    blocked_failures = {
+        workflow_failure(task.get("failure_classification"))
+        for task in blocked
+        if task.get("failure_classification")
+    }
+    budget_only_block = bool(blocked) and blocked_failures == {"budget_exhausted"}
+
     if project.get("status") == "completed" and approved:
         status = "completed"
+    elif budget_only_block:
+        # A fresh ordinary budget is available on the next ledger day. Treat this as
+        # automatic deferral, not an owner decision, so one expensive item does not
+        # produce a misleading needs-human escalation or stop unrelated work.
+        status = "deferred"
     elif blocked or project.get("status") == "blocked":
         status = "needs_human"
     elif any(task.get("status") == "planned" for task in tasks):
@@ -387,7 +399,10 @@ def aggregate_company_result(
         "result_truncated": result_truncated,
         "reason": reason[:1500],
         "failure_classification": failure,
-        "human_action": human_actions.get(failure, "Inspect the run report, correct the failure, then retry in dry-run mode."),
+        "human_action": "" if budget_only_block else human_actions.get(
+            failure,
+            "Inspect the run report, correct the failure, then retry in dry-run mode.",
+        ),
         "attempted": "; ".join(str(task.get("title") or task.get("id")) for task in tasks),
         "actual_cost_usd": spent,
         "estimated_cost_usd": estimated,

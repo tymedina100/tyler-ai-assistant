@@ -164,6 +164,24 @@ class AutonomyTeamTests(unittest.TestCase):
         self.assertEqual(result["failure_classification"], "permission_denied")
         self.assertIn("permission", result["human_action"].lower())
 
+    def test_budget_only_company_block_is_deferred_without_owner_action(self):
+        state = {
+            "projects": [{"id": "proj-1", "status": "blocked"}],
+            "tasks": [{
+                "id": "t1", "project_id": "proj-1", "owner": "code",
+                "status": "needs_human", "title": "Large audit",
+                "result": "The next request cannot fit inside today's ordinary budget.",
+                "failure_classification": "budget", "spent_usd": 0.4,
+            }],
+            "cost_entries": [],
+        }
+
+        result = autonomy_team.aggregate_company_result(state, "proj-1")
+
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["failure_classification"], "budget_exhausted")
+        self.assertEqual(result["human_action"], "")
+
     def test_idea_context_includes_bounded_history_but_excludes_private_fields(self):
         context = autonomy_team.idea_project_context({
             "projects": [{

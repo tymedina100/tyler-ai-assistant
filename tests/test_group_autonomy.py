@@ -87,6 +87,67 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.group.autonomy_runner_task = None
         self.group.company_runner_task = None
 
+    async def test_autonomous_team_handoff_bypasses_suppression_as_configured_bot(self):
+        manager_bot = object()
+        code_bot = object()
+        suppression = self.group._suppress_company_updates.set(True)
+        try:
+            with patch.dict(
+                self.group.bots,
+                {"manager": manager_bot, "code": code_bot},
+                clear=True,
+            ), patch.object(
+                self.group, "send_chunks", new=AsyncMock()
+            ) as send:
+                await self.group.post_team_handoff(
+                    "code", "Vera, the bounded implementation is ready for review."
+                )
+        finally:
+            self.group._suppress_company_updates.reset(suppression)
+
+        send.assert_awaited_once_with(
+            code_bot,
+            self.group.GROUP_CHAT_ID,
+            "Vera, the bounded implementation is ready for review.",
+        )
+
+    async def test_autonomous_team_handoff_uses_explicit_miles_relay_and_char_cap(self):
+        manager_bot = object()
+        suppression = self.group._suppress_company_updates.set(True)
+        try:
+            with patch.dict(
+                self.group.bots, {"manager": manager_bot}, clear=True
+            ), patch.object(
+                self.group, "AUTONOMY_TEAM_CHAT_MAX_CHARS", 40
+            ), patch.object(
+                self.group, "send_chunks", new=AsyncMock()
+            ) as send:
+                await self.group.post_team_handoff("code", "x" * 100)
+        finally:
+            self.group._suppress_company_updates.reset(suppression)
+
+        relayed = send.await_args.args[2]
+        self.assertTrue(relayed.startswith("Code: "))
+        self.assertTrue(relayed.endswith("..."))
+        self.assertLessEqual(len(relayed), 40)
+
+    async def test_autonomous_team_handoff_can_be_disabled(self):
+        manager_bot = object()
+        suppression = self.group._suppress_company_updates.set(True)
+        try:
+            with patch.dict(
+                self.group.bots, {"manager": manager_bot}, clear=True
+            ), patch.object(
+                self.group, "AUTONOMY_TEAM_CHAT_ENABLED", False
+            ), patch.object(
+                self.group, "send_chunks", new=AsyncMock()
+            ) as send:
+                await self.group.post_team_handoff("manager", "No broadcast")
+        finally:
+            self.group._suppress_company_updates.reset(suppression)
+
+        send.assert_not_awaited()
+
     def test_autonomy_goal_includes_bounded_run_evidence_and_timing_boundary(self):
         item = {
             "id": "AUTO-IDEA-1",
@@ -1027,8 +1088,16 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_session_posts_each_child_deliverable_in_order_then_one_summary(self):
         children = [
-            {"id": "cycle-1", "telegram_summary": "DO NOT POST CHILD 1"},
-            {"id": "cycle-2", "telegram_summary": "DO NOT POST CHILD 2"},
+            {
+                "id": "cycle-1",
+                "result_agent": "code",
+                "telegram_summary": "DO NOT POST CHILD 1",
+            },
+            {
+                "id": "cycle-2",
+                "result_agent": "general",
+                "telegram_summary": "DO NOT POST CHILD 2",
+            },
             {
                 "id": "cycle-3",
                 "idea_proposals": [{"idea": "Add a deployment health digest"}],
@@ -1058,8 +1127,8 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [call.args for call in post.await_args_list],
             [
-                ("Autonomous deliverable: first", "manager"),
-                ("Autonomous deliverable: second", "manager"),
+                ("Autonomous deliverable: first", "code"),
+                ("Autonomous deliverable: second", "general"),
                 ("Lumen idea plan: deployment health digest", "manager"),
                 ("Autonomous session: completed", "manager"),
             ],
@@ -1132,6 +1201,32 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["model_invoked"])
         self.assertIn("isolated executor", result["reason"])
 
+    async def test_budget_only_preflight_deferral_waits_without_owner_escalation(self):
+        plan = {
+            "deferred": True,
+            "reason": "A bounded review could not be funded.",
+            "deferral_reason": "insufficient_budget",
+            "decisions": [{"deferred": True, "deferral_reason": "insufficient_budget"}],
+        }
+        with patch.object(
+            self.group, "_autonomy_runtime_deferral", new=AsyncMock(return_value=None)
+        ), patch.object(
+            self.group, "_company_budget_snapshot", return_value={"remaining_usd": 0.01}
+        ), patch.object(
+            self.group.autonomy_team, "build_company_plan", return_value=plan
+        ):
+            result = await self.group._execute_autonomy_item(
+                {"id": "assistant"},
+                {"id": "AUTO-BUDGET", "title": "Review", "authorization_level": "propose"},
+                types.SimpleNamespace(model_id="gpt-5.4-mini"),
+                "run-budget",
+            )
+
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["failure_classification"], "budget_exhausted")
+        self.assertEqual(result["human_action"], "")
+        self.assertFalse(result["model_invoked"])
+
     async def test_routed_task_uses_selected_model_and_read_only_tools(self):
         task = {
             "id": "task-1",
@@ -1169,6 +1264,192 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["allowed_tool_names"], {"read_file"})
         self.assertFalse(kwargs["include_memories"])
         self.assertFalse(any(call.args == (True,) for call in fake_main.set_company_execution.call_args_list))
+
+    async def test_autonomous_worker_posts_assignment_then_reviewer_handoff(self):
+        task = {
+            "id": "worker-1",
+            "owner": "code",
+            "title": "Implement the bounded change",
+            "model": "gpt-5.4-mini",
+            "model_reason": "Standard coding task fits the lower-cost capable model.",
+            "execution_attempts": 0,
+            "attempt_history": [],
+        }
+        project = {"id": "project-1", "title": "Project", "goal": "Ship safely"}
+        editor = {
+            "id": "review-1",
+            "project_id": "project-1",
+            "owner": "editor",
+            "status": "planned",
+        }
+        state = {"projects": [project], "tasks": [{**task, "status": "done"}, editor], "company": {}}
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        self.fake_main.ask_specialist = Mock(return_value="Implemented and verified the bounded change.")
+
+        with patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ), patch.object(
+            self.group.company_mode, "load_state", return_value=state
+        ), patch.object(
+            self.group.company_mode, "next_planned_task", return_value=editor
+        ), patch.object(
+            self.group.company_mode, "render_money", return_value="Budget ok"
+        ), patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ) as handoff:
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "done")
+        self.assertEqual([call.args[0] for call in handoff.await_args_list], ["manager", "code"])
+        self.assertIn("Model: gpt-5.4-mini", handoff.await_args_list[0].args[1])
+        self.assertIn("Routing: Standard coding task", handoff.await_args_list[0].args[1])
+        self.assertIn("Vera, I finished", handoff.await_args_list[1].args[1])
+        self.assertIn("Implemented and verified", handoff.await_args_list[1].args[1])
+
+    def test_blank_agent_answer_is_a_technical_failure(self):
+        self.assertEqual(self.group._answer_failure_classification(""), "technical")
+        self.assertEqual(self.group._answer_failure_classification("   "), "technical")
+
+    async def test_autonomous_reviewer_posts_approval_and_revision_as_vera(self):
+        project = {"id": "project-1", "title": "Project", "goal": "Ship safely"}
+        worker = {
+            "id": "worker-1",
+            "project_id": "project-1",
+            "owner": "code",
+            "status": "done",
+        }
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+
+        for verdict, answer, expected_text in (
+            ("approved", "APPROVED - all criteria have evidence.", "review complete"),
+            ("revise", "REVISIONS REQUIRED\n1. Add the missing test.", "Code, revisions are required"),
+        ):
+            with self.subTest(verdict=verdict):
+                task = {
+                    "id": f"review-{verdict}",
+                    "owner": "editor",
+                    "title": "Review against acceptance criteria",
+                    "model": "gpt-5.4-mini",
+                    "model_reason": "Standard evidence review.",
+                    "execution_attempts": 0,
+                    "attempt_history": [],
+                }
+                state = {
+                    "projects": [project],
+                    "tasks": [worker, {**task, "project_id": "project-1", "status": "done"}],
+                    "company": {},
+                }
+                self.fake_main.ask_specialist = Mock(return_value=answer)
+                with patch.object(
+                    self.group.company_mode, "update_task_status", return_value="ok"
+                ), patch.object(
+                    self.group.company_mode, "set_project_revision_flag", return_value=verdict
+                ), patch.object(
+                    self.group.company_mode, "load_state", return_value=state
+                ), patch.object(
+                    self.group.company_mode, "render_money", return_value="Budget ok"
+                ), patch.object(
+                    self.group, "post_to_group", new=AsyncMock()
+                ), patch.object(
+                    self.group, "post_agent_answer_to_group", new=AsyncMock()
+                ), patch.object(
+                    self.group, "post_team_handoff", new=AsyncMock()
+                ) as handoff:
+                    outcome = await self.group._execute_routed_task(
+                        project, task, "editor", "prompt", dict(sink)
+                    )
+
+                self.assertEqual(outcome, "done")
+                self.assertEqual(handoff.await_args_list[-1].args[0], "editor")
+                self.assertIn(expected_text, handoff.await_args_list[-1].args[1])
+                self.assertIn(answer, handoff.await_args_list[-1].args[1])
+
+    async def test_autonomous_reviewer_posts_structured_block_as_vera(self):
+        project = {"id": "project-1", "title": "Project", "goal": "Ship safely"}
+        task = {
+            "id": "review-blocked",
+            "owner": "editor",
+            "title": "Review against acceptance criteria",
+            "model": "gpt-5.4-mini",
+            "model_reason": "Standard evidence review.",
+            "execution_attempts": 0,
+            "attempt_history": [],
+        }
+        answer = "BLOCKED - NEEDS HUMAN REVIEW: MISSING_ACCESS\nProvide repository access."
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        self.fake_main.ask_specialist = Mock(return_value=answer)
+        with patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ), patch.object(
+            self.group.autonomous_workflow, "format_escalation", return_value="Escalated"
+        ), patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ) as handoff:
+            outcome = await self.group._execute_routed_task(
+                project, task, "editor", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(handoff.await_args_list[-1].args[0], "editor")
+        self.assertIn("review is blocked", handoff.await_args_list[-1].args[1])
+        self.assertIn("MISSING_ACCESS", handoff.await_args_list[-1].args[1])
+
+    async def test_autonomous_retry_posts_the_stronger_model_decision(self):
+        project = {"id": "project-1", "title": "Project", "goal": "Ship safely"}
+        task = {
+            "id": "worker-retry",
+            "owner": "code",
+            "title": "Debug the issue",
+            "model": "gpt-5.4-mini",
+            "model_reason": "Standard debugging route.",
+            "execution_attempts": 0,
+            "attempt_history": [],
+        }
+        editor = {"id": "review-1", "owner": "editor", "status": "planned"}
+        state = {"projects": [project], "tasks": [{**task, "status": "done"}, editor], "company": {}}
+        sink = {"cost_usd": 0.0, "artifacts": [], "usage_records": [], "context": "test"}
+        self.fake_main.ask_specialist = Mock(
+            side_effect=["Sorry, something went wrong processing that.", "Recovered result."]
+        )
+        stronger = types.SimpleNamespace(
+            deferred=False,
+            model_id="gpt-5.6-sol",
+            reason="The failed Mini attempt requires a stronger untried model.",
+        )
+        with patch.object(
+            self.group, "_company_task_route", return_value=stronger
+        ), patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ), patch.object(
+            self.group.company_mode, "load_state", return_value=state
+        ), patch.object(
+            self.group.company_mode, "next_planned_task", return_value=editor
+        ), patch.object(
+            self.group.company_mode, "render_money", return_value="Budget ok"
+        ), patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ) as handoff:
+            outcome = await self.group._execute_routed_task(
+                project, task, "code", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "done")
+        retry_messages = [call.args[1] for call in handoff.await_args_list if "retry" in call.args[1]]
+        self.assertEqual(len(retry_messages), 1)
+        self.assertIn("Model: gpt-5.6-sol", retry_messages[0])
+        self.assertIn("stronger untried model", retry_messages[0])
 
     async def test_company_task_sink_uses_its_persisted_reservation_as_hard_envelope(self):
         project = {"id": "project-1", "title": "Project", "goal": "Inspect"}

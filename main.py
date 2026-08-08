@@ -192,6 +192,10 @@ class ExecutionReservationStateError(RuntimeError):
     """Raised when a strict task hold cannot be updated safely in persistent state."""
 
 
+class IncompleteModelResponseError(RuntimeError):
+    """Raised when a model call does not produce one complete visible answer."""
+
+
 _BUDGET_INPUT_SAFETY_MULTIPLIER = 1.25
 _BUDGET_USABLE_FRACTION = 0.90
 _MIN_BUDGETED_OUTPUT_TOKENS = 16
@@ -199,10 +203,81 @@ _MIN_BUDGETED_OUTPUT_TOKENS = 16
 
 def _configured_budget_output_tokens():
     try:
-        value = int(os.environ.get("AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL", "1200"))
+        value = int(os.environ.get("AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL", "3000"))
     except (TypeError, ValueError):
-        value = 1200
+        value = 3000
     return min(8000, max(_MIN_BUDGETED_OUTPUT_TOKENS, value))
+
+
+def _configured_autonomy_tool_result_chars():
+    try:
+        value = int(os.environ.get("AUTONOMY_MAX_TOOL_RESULT_CHARS", "12000"))
+    except (TypeError, ValueError):
+        value = 12000
+    return min(100000, max(256, value))
+
+
+def _safe_response_metadata_value(value):
+    """Keep provider completion metadata useful without copying arbitrary text."""
+
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    return "".join(
+        character if character.isalnum() or character in {"_", "-", ".", ":"} else "_"
+        for character in text
+    )[:120]
+
+
+def _response_completion_metadata(response):
+    status = _safe_response_metadata_value(getattr(response, "status", ""))
+    details = getattr(response, "incomplete_details", None)
+    if isinstance(details, dict):
+        reason_value = details.get("reason")
+    else:
+        reason_value = getattr(details, "reason", "")
+    reason = _safe_response_metadata_value(reason_value)
+
+    sink = current_execution_sink()
+    if sink is not None and (status or reason):
+        sink["last_response_status"] = status
+        sink["last_response_reason"] = reason
+        history = sink.setdefault("response_completion_history", [])
+        history.append({"status": status, "reason": reason})
+        del history[:-10]
+    return status, reason
+
+
+def _response_needs_synthesis(response):
+    status, reason = _response_completion_metadata(response)
+    output_text = str(getattr(response, "output_text", "") or "")
+    return status == "incomplete" or not output_text.strip(), status, reason
+
+
+def _bounded_autonomy_tool_result(result):
+    """Bound tool evidence only while a strict autonomous task hold is active."""
+
+    sink = current_execution_sink()
+    if sink is None or sink.get("budget_cap_usd") is None:
+        return result
+
+    text = result if isinstance(result, str) else str(result)
+    limit = _configured_autonomy_tool_result_chars()
+    if len(text) <= limit:
+        return text
+
+    notice = "\n...[tool result truncated for autonomous budget safety]"
+    if limit <= len(notice):
+        bounded = notice[:limit]
+    else:
+        bounded = text[:limit - len(notice)] + notice
+    sink["tool_result_truncation_count"] = int(
+        sink.get("tool_result_truncation_count", 0) or 0
+    ) + 1
+    sink["tool_result_chars_removed"] = int(
+        sink.get("tool_result_chars_removed", 0) or 0
+    ) + len(text) - len(bounded)
+    return bounded
 
 
 def _budgeted_response_options(openai_client, model, instructions, input_items, tools=None):
@@ -901,6 +976,47 @@ Current message:
 """
 
 
+def _final_tool_synthesis(openai_client, model, instructions, input_items):
+    """Make the single no-tools synthesis attempt allowed for an incomplete turn."""
+
+    final_instructions = instructions + (
+        "\n\nDo not request any more tools. Produce one complete, visible final answer "
+        "now using the evidence already gathered, and clearly note anything you could "
+        "not fully verify."
+    )
+    final_kwargs = {
+        "model": model,
+        "instructions": final_instructions,
+        "input": input_items,
+    }
+    final_kwargs.update(
+        _budgeted_response_options(
+            openai_client, model, final_instructions, input_items
+        )
+    )
+    final_response = call_with_retries(
+        lambda: openai_client.responses.create(**final_kwargs),
+        label="OpenAI final synthesis call",
+    )
+    _accrue_cost(model, getattr(final_response, "usage", None))
+    incomplete, status, reason = _response_needs_synthesis(final_response)
+    if incomplete:
+        details = ", ".join(
+            value
+            for value in (
+                f"status={status}" if status else "",
+                f"reason={reason}" if reason else "",
+            )
+            if value
+        )
+        suffix = f" ({details})" if details else ""
+        raise IncompleteModelResponseError(
+            "The model did not produce a complete visible answer after one bounded "
+            f"final synthesis attempt{suffix}."
+        )
+    return str(getattr(final_response, "output_text", "") or "")
+
+
 def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITERATIONS, model=PREMIUM_MODEL):
     assistant_response = "Sorry, I tried too many tool calls without finishing. Please try rephrasing."
     authorized_tool_names = {
@@ -930,13 +1046,23 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
 
             _accrue_cost(model, getattr(response, "usage", None))
 
-            function_calls = [item for item in response.output if item.type == "function_call"]
+            response_status, _response_reason = _response_completion_metadata(response)
+            response_output = list(getattr(response, "output", []) or [])
+            function_calls = [item for item in response_output if item.type == "function_call"]
 
             if not function_calls:
-                assistant_response = response.output_text
+                response_text = str(getattr(response, "output_text", "") or "")
+                incomplete = response_status == "incomplete" or not response_text.strip()
+                if incomplete:
+                    input_items += response_output
+                    assistant_response = _final_tool_synthesis(
+                        openai_client, model, instructions, input_items
+                    )
+                else:
+                    assistant_response = response_text
                 break
 
-            input_items += response.output
+            input_items += response_output
 
             for call in function_calls:
                 if call.name not in authorized_tool_names:
@@ -950,6 +1076,7 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
                     )
                 else:
                     result = execute_tool(call.name, json.loads(call.arguments))
+                result = _bounded_autonomy_tool_result(result)
                 input_items.append({
                     "type": "function_call_output",
                     "call_id": call.call_id,
@@ -962,31 +1089,17 @@ def run_with_tools(instructions, input_items, tools, max_iterations=MAX_TOOL_ITE
             # final call with NO tools so the model is forced to synthesize an answer
             # from what it already has. This turns a wasted, answer-less run (e.g. a
             # research agent that kept searching) into a usable, if partial, reply.
-            final_instructions = instructions + (
-                "\n\nYou have used all of your tool calls for this turn. Do not "
-                "request any more tools - answer now using what you have already "
-                "gathered, and clearly note anything you could not fully verify."
+            assistant_response = _final_tool_synthesis(
+                openai_client, model, instructions, input_items
             )
-            final_kwargs = {
-                "model": model,
-                "instructions": final_instructions,
-                "input": input_items,
-            }
-            final_kwargs.update(
-                _budgeted_response_options(
-                    openai_client, model, final_instructions, input_items
-                )
-            )
-            final_response = call_with_retries(
-                lambda: openai_client.responses.create(**final_kwargs),
-                label="OpenAI final synthesis call",
-            )
-            _accrue_cost(model, getattr(final_response, "usage", None))
-            if final_response.output_text:
-                assistant_response = final_response.output_text
 
     except (ExecutionBudgetExceededError, ExecutionReservationStateError):
         raise
+    except IncompleteModelResponseError:
+        sink = current_execution_sink()
+        if sink is not None and sink.get("budget_cap_usd") is not None:
+            raise
+        assistant_response = "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
     except Exception:
         assistant_response = "Sorry, something went wrong while contacting the AI service. Check your API key, internet connection, or account billing."
 

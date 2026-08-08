@@ -686,7 +686,10 @@ Use these canonical environment variables (the complete copy-ready block is in
 | `AUTONOMY_MAX_SESSION_MINUTES` | `120`; elapsed-time ceiling checked before another item starts |
 | `AUTONOMY_COST_ESTIMATE_MULTIPLIER` | `4.0`; expands one-response estimates for bounded tool loops |
 | `AUTONOMY_MIN_TASK_RESERVATION_USD` | `0.05`; minimum live worker/reviewer reservation |
-| `AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL` | `1200`; per-request ceiling, reduced automatically to fit the task's unspent reservation |
+| `AUTONOMY_MAX_OUTPUT_TOKENS_PER_CALL` | `3000`; per-request ceiling, reduced automatically to fit the task's unspent reservation |
+| `AUTONOMY_MAX_TOOL_RESULT_CHARS` | `12000`; per-tool evidence cap applied only to strict autonomous tasks |
+| `AUTONOMY_TEAM_CHAT_ENABLED` | `true`; show deterministic assignment, handoff, review, and retry transitions without extra model calls |
+| `AUTONOMY_TEAM_CHAT_MAX_CHARS` | `900`; maximum text retained in one team-transition message before Telegram chunking |
 | `AUTONOMY_MAX_IDEAS_PER_RUN` | `3`; maximum ideas in Lumen's one idle batch; set `0` to disable ideation |
 | `AUTONOMY_IDEA_BACKLOG_LIMIT` | `50` proposed ideas retained |
 | `AUTONOMY_MAX_EXECUTION_ATTEMPTS` | `2` roadmap-level failed attempts before owner escalation |
@@ -715,6 +718,16 @@ task's reservation from otherwise-uncommitted ordinary budget, then recompute th
 limit. Other task holds and the emergency reserve remain protected; insufficient ordinary
 headroom still stops before generation. Network ambiguity and stale provider pricing still
 require an OpenAI project spending limit for an absolute invoice-level guarantee.
+
+OpenAI may separately offer complimentary daily tokens when an organization owner opts
+in to sharing API inputs and outputs. The offer is account- and project-specific, requires
+a positive balance, resets at 00:00 UTC, and applies automatically only to eligible shared
+traffic. OpenAI explicitly excludes tool use, and a request that crosses the complimentary
+quota is billed in full. The autonomous budget therefore does **not** count that offer as
+extra free capacity for repository/tool work or weaken the $5 paid ceiling. It can benefit
+an otherwise eligible no-tool planning request automatically after the owner enables data
+sharing for this API project; confirm actual incentive-tier usage in OpenAI's Usage and
+Costs dashboards. See OpenAI's [current complimentary-token rules](https://help.openai.com/en/articles/10306912).
 
 `MAX_REVISION_ROUNDS` and `MAX_EXECUTION_ATTEMPTS` bound Company Mode's review and task
 loops. Company Mode retains a larger bounded non-file worker result for review and marks
@@ -1038,6 +1051,14 @@ docs rather than trusting specifics here. Whichever you pick, you'll need to:
 (Manager + specialists) is its own real Telegram bot, all members of one shared group
 chat with you. It reuses the agent logic in `main.py` and owns the long-running Telegram,
 Company Mode, scheduler/autonomy, and optional Office API runtime coordination.
+
+During a live autonomous session, the group shows only real workflow transitions:
+Miles assigns a task and states the selected model/reason, the worker hands evidence to
+Vera, and Vera reports approval, a bounded revision request, or a blocker. These messages
+are generated from persisted state rather than extra role-play calls. Full intermediate
+tool output remains suppressed to keep the chat readable. When an optional worker has no
+dedicated bot token, the work still runs and Miles relays the transition with the worker's
+name; adding the matching token later gives that worker its own Telegram identity.
 
 **Setup, per agent you want in the group:**
 
