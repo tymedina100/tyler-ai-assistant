@@ -1175,6 +1175,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         task = {
             "id": "task-1", "project_id": "project-1", "owner": "manager",
             "title": "Inspect", "reserved_usd": 0.125,
+            "budget_reservation_id": "res-1",
         }
         state = {"projects": [project], "tasks": [task], "company": {}}
         with patch.object(
@@ -1193,6 +1194,16 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "done")
         sink = execute.await_args.args[4]
         self.assertEqual(sink["budget_cap_usd"], 0.125)
+        with patch.object(
+            self.group.company_mode,
+            "expand_task_budget_reservation",
+            return_value={"reason": "expanded", "amount_usd": 0.30},
+        ) as expand:
+            self.assertEqual(sink["budget_top_up"](0.20, 0.30), 0.30)
+        expand.assert_called_once_with(
+            "task-1", 0.20, 0.30, path=self.group.company_mode.COMPANY_STATE_FILE
+        )
+        self.assertEqual(sink["budget_top_up_reason"], "expanded")
 
     async def test_metered_no_usage_charges_reserved_estimate_as_estimated(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1544,6 +1555,8 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(tasks[1]["status"], "blocked")
         self.assertEqual(tasks[1]["reserved_usd"], 0.0)
+        self.assertEqual(tasks[1]["failure_classification"], "missing_access")
+        self.assertEqual(project["failure_classification"], "missing_access")
         self.assertEqual(final["company"]["reserved_today_usd"], 0.0)
         self.assertEqual(company_mode.open_projects(final), [])
 
