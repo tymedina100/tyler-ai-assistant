@@ -13,6 +13,30 @@ from filelock import FileLock
 import autonomous_workflow as autonomy
 
 
+CHAT_PROMPT_MARKERS = (
+    "OWNER ACTION NEEDED",
+    "Autonomous deliverable",
+    "trigger=",
+    "human_review=",
+    "Model:",
+    "Routing:",
+    "Task:",
+    "Agent:",
+    "Attempted:",
+    "Blocked by:",
+    "AUTONOMY_HELP_REQUEST",
+    "FINAL ANSWER",
+    "FILES_CHANGED:",
+    "REVISIONS REQUIRED",
+    "BLOCKED - NEEDS HUMAN REVIEW",
+)
+
+
+def assert_conversational_chat(test_case, text):
+    for marker in CHAT_PROMPT_MARKERS:
+        test_case.assertNotIn(marker, text)
+
+
 def roadmap_state(items):
     return {
         "version": 1,
@@ -331,6 +355,33 @@ class AutonomousWorkflowTests(unittest.TestCase):
             persisted["human_resolution_history"][0]["from_status"], "blocked"
         )
 
+    def test_retry_reset_accepts_budget_deferred_status(self):
+        previous_attempts = [{"attempt": 1, "failure": "budget_exhausted"}]
+        workflow = self.workflow([
+            item(
+                status="deferred",
+                failure_classification="budget_exhausted",
+                failure_reason="The prior estimate did not fit the remaining budget.",
+                previous_attempts=previous_attempts,
+                previous_models=["gpt-5.6-sol"],
+            )
+        ])
+
+        success, message = workflow.retry_item("task-1")
+
+        self.assertTrue(success)
+        self.assertIn("reset from 'deferred' to 'ready'", message)
+        self.assertIn("No model was invoked", message)
+        persisted = workflow.load_state()["projects"][0]["roadmap_items"][0]
+        self.assertEqual(persisted["status"], "ready")
+        self.assertNotIn("failure_classification", persisted)
+        self.assertNotIn("failure_reason", persisted)
+        self.assertEqual(persisted["previous_attempts"], previous_attempts)
+        self.assertEqual(persisted["previous_models"], ["gpt-5.6-sol"])
+        self.assertEqual(
+            persisted["human_resolution_history"][-1]["from_status"], "deferred"
+        )
+
     def test_retry_reset_rejects_unresolved_blockers_and_missing_acceptance_criteria(self):
         blocked_workflow = self.workflow([
             item(
@@ -432,7 +483,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertIn("was not found", message)
         success, message = workflow.retry_item("ready-item")
         self.assertFalse(success)
-        self.assertIn("only 'needs_human' or 'blocked'", message)
+        self.assertIn("only 'needs_human', 'blocked', or 'deferred'", message)
 
         duplicate_seed = self.root / "duplicate-seed.json"
         duplicate_state = self.root / "duplicate-state.json"
@@ -454,6 +505,29 @@ class AutonomousWorkflowTests(unittest.TestCase):
             for value in duplicate_workflow.load_state()["projects"][0]["roadmap_items"]
         ]
         self.assertEqual(statuses, ["needs_human", "blocked"])
+
+    def test_retry_reset_rejects_active_and_completed_items(self):
+        for status in ("in_progress", "completed"):
+            with self.subTest(status=status):
+                seed_path = self.root / f"retry-{status}-seed.json"
+                state_path = self.root / f"retry-{status}-state.json"
+                seed_path.write_text(
+                    json.dumps(roadmap_state([item("task-1", status=status)])),
+                    encoding="utf-8",
+                )
+                workflow = autonomy.AutonomousWorkflow(
+                    self.config,
+                    state_path=state_path,
+                    seed_path=seed_path,
+                )
+                workflow.load_state()
+                before = state_path.read_text(encoding="utf-8")
+
+                success, message = workflow.retry_item("task-1")
+
+                self.assertFalse(success)
+                self.assertIn(f"is '{status}'", message)
+                self.assertEqual(state_path.read_text(encoding="utf-8"), before)
 
     def test_retry_reset_rejects_active_run_claim_and_held_run_lock(self):
         workflow = self.workflow([item(status="needs_human", human_decision_required=True)])
@@ -1002,7 +1076,8 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertLessEqual(len(plan), autonomy.TELEGRAM_MESSAGE_LIMIT)
         for idea_id in ("idea-one", "idea-two", "idea-three"):
             self.assertIn(idea_id, plan)
-            self.assertIn(idea_id, summary)
+            self.assertNotIn(idea_id, summary)
+        self.assertIn("Lumen added 3 ideas", summary)
         self.assertIn("/autorun promote <idea-id>", plan)
 
     def test_selects_highest_priority_actionable_item_and_skips_blockers(self):
@@ -1047,18 +1122,19 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(autonomy.format_telegram_deliverable(report), "")
         self.assertEqual(workflow.load_state()["projects"][0]["roadmap_items"][0]["status"], "ready")
 
-    def test_telegram_summary_includes_at_a_glance_after_heading(self):
+    def test_telegram_summary_is_a_conversational_dry_run_recap(self):
         workflow = self.workflow([item()])
 
         report = workflow.run(trigger_source="telegram", dry_run=True)
 
-        self.assertEqual(
-            report["telegram_summary"].splitlines()[:2],
-            [
-                "Autonomous run: dry_run",
-                "trigger=telegram | final=dry_run | human_review=no",
-            ],
-        )
+        summary = report["telegram_summary"]
+        self.assertTrue(summary.startswith("Dry run complete."))
+        self.assertIn("Task task-1", summary)
+        self.assertIn("Nothing was executed or changed.", summary)
+        self.assertIn("You started this run from Telegram.", summary)
+        self.assertIn("Nothing needs your attention right now.", summary)
+        assert_conversational_chat(self, summary)
+        self.assertLessEqual(len(summary), autonomy.TELEGRAM_CHAT_RECAP_LIMIT)
 
     def test_telegram_summary_flags_only_owner_attention_as_human_review(self):
         base_report = {
@@ -1087,18 +1163,27 @@ class AutonomousWorkflowTests(unittest.TestCase):
             **base_report,
             "blockers": ["Creative generation was unavailable."],
         })
+        multiple_actions = autonomy.format_telegram_summary({
+            **base_report,
+            "human_actions": [
+                "Grant repository access.",
+                "Choose the production timeout.",
+            ],
+        })
 
-        expected = "trigger=scheduled | final=completed | human_review=yes"
-        self.assertEqual(action_summary.splitlines()[1], expected)
-        self.assertEqual(escalation_summary.splitlines()[1], expected)
-        self.assertEqual(
-            terminal_summary.splitlines()[1],
-            "trigger=scheduled | final=needs_human | human_review=yes",
-        )
-        self.assertEqual(
-            informational_blocker.splitlines()[1],
-            "trigger=scheduled | final=completed | human_review=no",
-        )
+        self.assertIn("Tyler, here's what I need from you next", action_summary)
+        self.assertIn("check the preceding blocker message", escalation_summary)
+        self.assertIn("check the preceding blocker message", terminal_summary)
+        self.assertIn("Nothing needs your attention right now.", informational_blocker)
+        self.assertIn("2 items need you", multiple_actions)
+        for summary in (
+            action_summary,
+            escalation_summary,
+            terminal_summary,
+            informational_blocker,
+            multiple_actions,
+        ):
+            assert_conversational_chat(self, summary)
 
     def test_dry_run_at_a_glance_surfaces_discovered_owner_action(self):
         workflow = self.workflow([item(acceptance_criteria=[])])
@@ -1107,10 +1192,133 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         self.assertEqual(report["final_status"], "dry_run")
         self.assertTrue(report["human_actions"])
-        self.assertEqual(
-            report["telegram_summary"].splitlines()[1],
-            "trigger=manual | final=dry_run | human_review=yes",
+        self.assertIn("Tyler, here's what I need from you next", report["telegram_summary"])
+        self.assertIn("Add at least one verifiable acceptance criterion", report["telegram_summary"])
+        assert_conversational_chat(self, report["telegram_summary"])
+
+    def test_team_transition_formatter_keeps_chat_copy_compact(self):
+        message = autonomy.format_team_chat_message(
+            "assignment",
+            recipient="Patch",
+            task=item("AUTO-042", title="Make stale run locks recover safely"),
+            model="gpt-5.4-mini",
+            max_chars=220,
         )
+
+        self.assertTrue(message.startswith("Patch, please take"))
+        self.assertIn("gpt-5.4-mini", message)
+        self.assertIn("Send Vera", message)
+        assert_conversational_chat(self, message)
+        self.assertLessEqual(len(message), 220)
+
+    def test_team_chat_projection_strips_protocol_without_corrupting_identifiers(self):
+        revision = autonomy.format_team_chat_message(
+            "review_revision",
+            recipient="Patch",
+            task=item("AUTO-042", title="Recover stale locks"),
+            detail=(
+                "REVISIONS REQUIRED\n"
+                "1. Set DATA_DIR=/app/memory_db and rename tests/test_stale_lock.py."
+            ),
+        )
+        helper = autonomy.format_team_chat_message(
+            "help_response",
+            recipient="Patch",
+            task=item("AUTO-042"),
+            detail="FINAL ANSWER RESULT: The check passed. FILES_CHANGED: none.",
+        )
+        blocked = autonomy.format_team_chat_message(
+            "worker_blocked",
+            recipient="Miles",
+            task=item("AUTO-042"),
+            detail="BLOCKED - NEEDS HUMAN REVIEW: MISSING_ACCESS\nGrant repository access.",
+        )
+        help_request = autonomy.format_team_chat_message(
+            "help_request",
+            recipient="Vega",
+            task=item("AUTO-042"),
+            question="Can you verify the integration?",
+            reason="I need API and URL evidence.",
+        )
+
+        self.assertIn("DATA_DIR=/app/memory_db", revision)
+        self.assertIn("tests/test_stale_lock.py", revision)
+        self.assertIn("The check passed", helper)
+        self.assertIn("Missing access", blocked)
+        self.assertIn("I need API and URL evidence", help_request)
+        for message in (revision, helper, blocked, help_request):
+            assert_conversational_chat(self, message)
+            self.assertLessEqual(len(message), autonomy.TELEGRAM_CHAT_TRANSITION_LIMIT)
+
+    def test_summary_preserves_owner_action_and_budget_when_optional_details_are_crowded(self):
+        exact_action = (
+            "Open Railway, grant the service read and write access to /app/memory_db, "
+            "confirm DATA_DIR uses that mounted volume, redeploy, and then run "
+            "/autorun retry AUTO-042 from the Telegram group."
+        )
+        report = {
+            "trigger_source": "telegram",
+            "status": "needs_human",
+            "final_status": "needs_human",
+            "tasks_selected": [
+                {"id": f"AUTO-{index:03d}", "title": "X" * 180, "status": "completed"}
+                for index in range(12)
+            ],
+            "files_changed": [f"files/very_long_change_{index}.md" for index in range(12)],
+            "deferred": ["Deferred detail " + "Y" * 240 for _ in range(6)],
+            "blockers": ["Blocked detail " + "Z" * 240 for _ in range(6)],
+            "human_actions": [exact_action],
+            "budget": {
+                "daily_budget_usd": 10,
+                "spent_today_usd": 8.25,
+                "remaining_usd": 1.50,
+            },
+        }
+
+        summary = autonomy.format_telegram_summary(report)
+
+        self.assertIn(exact_action, summary)
+        self.assertIn("Budget today:", summary)
+        self.assertLessEqual(len(summary), autonomy.TELEGRAM_CHAT_RECAP_LIMIT)
+        assert_conversational_chat(self, summary)
+
+    def test_escalation_is_bounded_and_preserves_a_realistic_owner_action(self):
+        exact_action = (
+            "Grant the Railway service read and write access to /app/memory_db, verify "
+            "the volume is mounted, redeploy once, and run /autorun retry AUTO-042. "
+            + "Confirm the mounted state remains writable after restart. " * 8
+        ).strip()
+        self.assertLess(len(exact_action), 700)
+        message = autonomy.format_escalation(
+            "Assistant " + "P" * 2000,
+            item("AUTO-042", title="Recover stale locks"),
+            "Attempted the recovery check. " + "A" * 4000,
+            "The service could not reach the mounted state volume. " + "B" * 4000,
+            "missing_access",
+            exact_action,
+        )
+
+        self.assertIn(exact_action, message)
+        self.assertIn("unrelated work can continue", message)
+        self.assertLessEqual(len(message), autonomy.TELEGRAM_CHAT_RECAP_LIMIT)
+        assert_conversational_chat(self, message)
+
+    def test_deliverable_uses_exact_approval_and_shows_a_short_takeaway(self):
+        report = {
+            "tasks_selected": [
+                item("AUTO-042", title="Recover stale locks", status="completed")
+            ],
+            "result_text": "Implemented safe lock recovery and added two passing tests.",
+            "review_outcomes": [
+                "REVISIONS REQUIRED - not approved until the cancellation test passes."
+            ],
+        }
+
+        message = autonomy.format_telegram_deliverable(report)
+
+        self.assertIn("Implemented safe lock recovery and added two passing tests.", message)
+        self.assertNotIn("Vera approved", message)
+        assert_conversational_chat(self, message)
 
     def test_execution_receives_bounded_redacted_recent_run_evidence(self):
         captured = {}
@@ -1440,6 +1648,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "result_task_id": "worker-1",
             "result_agent": "general",
             "review_outcomes": ["APPROVED: every criterion is satisfied."],
+            "team_handoff_failed": True,
             "actual_cost_usd": 0.01,
             "artifacts": ["file: files/config-check.md"],
             "files_changed": ["files/config-check.md"],
@@ -1452,6 +1661,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(report["final_status"], "completed")
         self.assertEqual(report["result_task_id"], "worker-1")
         self.assertEqual(report["result_agent"], "general")
+        self.assertTrue(report["team_handoff_failed"])
         self.assertTrue(report["result_truncated"])
         self.assertLessEqual(len(report["result_text"]), 5000)
         self.assertIn("Production checklist begins", report["result_text"])
@@ -1461,19 +1671,18 @@ class AutonomousWorkflowTests(unittest.TestCase):
             report["tasks_selected"][0]["result_summary"],
             report["result_text"][:1000],
         )
-        self.assertIn("Result:", report["telegram_summary"])
-        self.assertIn("[preview truncated]", report["telegram_summary"])
-        self.assertIn("Budget:", report["telegram_summary"])
-        self.assertIn("Your action:", report["telegram_summary"])
-        self.assertEqual(
-            report["telegram_summary"].splitlines()[1],
-            "trigger=manual | final=completed | human_review=no",
-        )
-        self.assertLessEqual(len(report["telegram_summary"]), autonomy.TELEGRAM_MESSAGE_LIMIT)
+        self.assertNotIn("Production checklist begins", report["telegram_summary"])
+        self.assertIn("Budget today:", report["telegram_summary"])
+        self.assertIn("Nothing needs your attention", report["telegram_summary"])
+        assert_conversational_chat(self, report["telegram_summary"])
+        self.assertLessEqual(len(report["telegram_summary"]), autonomy.TELEGRAM_CHAT_RECAP_LIMIT)
         deliverable = autonomy.format_telegram_deliverable(report)
-        self.assertIn("Autonomous deliverable", deliverable)
-        self.assertIn("Agent: general", deliverable)
+        self.assertTrue(deliverable.startswith('I finished "'))
+        self.assertIn("Vera approved", deliverable)
+        self.assertIn("captured result in the run record", deliverable)
         self.assertIn("configured storage limit", deliverable)
+        self.assertNotIn("Production checklist begins", deliverable)
+        assert_conversational_chat(self, deliverable)
         persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
         self.assertEqual(persisted["result_text"], report["result_text"])
         self.assertNotIn("top-secret", json.dumps(persisted))
@@ -1627,8 +1836,8 @@ class AutonomousWorkflowTests(unittest.TestCase):
         }
         self.assertTrue(required.issubset(report))
         self.assertEqual(report["final_status"], "needs_human")
-        self.assertIn("Grant read access", report["telegram_summary"])
-        self.assertIn("Budget:", report["telegram_summary"])
+        self.assertIn("grant read access", report["telegram_summary"].lower())
+        self.assertIn("Budget today:", report["telegram_summary"])
         persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
         self.assertEqual(persisted["run_id"], report["run_id"])
 
@@ -1757,11 +1966,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(report["actual_cost_usd"], 0.0)
         self.assertIn("/company", report["human_actions"][0])
         self.assertIn("/autorun live", report["telegram_summary"])
-        self.assertNotIn("Your action: None", report["telegram_summary"])
+        assert_conversational_chat(self, report["telegram_summary"])
         self.assertEqual(len(report["escalations"]), 1)
-        self.assertIn("OWNER ACTION NEEDED", report["escalations"][0])
-        self.assertIn("decision_required", report["escalations"][0])
+        self.assertTrue(report["escalations"][0].startswith("Tyler,"))
+        self.assertIn("decision required", report["escalations"][0])
         self.assertIn("Checked the persisted Company Mode ledger", report["escalations"][0])
+        assert_conversational_chat(self, report["escalations"][0])
 
     def test_authorization_above_ceiling_escalates_without_execution(self):
         executor = Mock()
@@ -1771,7 +1981,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         )
         report = workflow.run(dry_run=False)
         self.assertEqual(report["final_status"], "needs_human")
-        self.assertIn("Approve this task", report["telegram_summary"])
+        self.assertIn("approve this task", report["telegram_summary"].lower())
         executor.assert_not_called()
 
     def test_missing_acceptance_criteria_escalates_before_routing_or_execution(self):
@@ -1785,7 +1995,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         self.assertEqual(report["final_status"], "needs_human")
         self.assertIn("missing_acceptance_criteria", report["blockers"])
-        self.assertIn("Add at least one", report["telegram_summary"])
+        self.assertIn("add at least one", report["telegram_summary"].lower())
         router.route.assert_not_called()
         executor.assert_not_called()
 
@@ -1806,7 +2016,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         self.assertEqual(first["tasks_selected"][0]["status"], "ready")
         self.assertEqual(second["final_status"], "needs_human")
-        self.assertIn("Review the failure", second["telegram_summary"])
+        self.assertIn("review the failure", second["telegram_summary"].lower())
         self.assertIn(third["final_status"], {"idle", "ideas_proposed"})
         self.assertEqual(executor.call_count, 2)
         persisted = workflow.load_state()["projects"][0]["roadmap_items"][0]
@@ -1829,8 +2039,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         self.assertEqual(report["final_status"], "needs_human")
         self.assertEqual(report["tasks_selected"][0]["status"], "needs_human")
-        self.assertIn("missing_access", report["escalations"][0])
-        self.assertIn("Grant read access", report["telegram_summary"])
+        self.assertIn("missing access", report["escalations"][0])
+        self.assertIn("grant read access", report["telegram_summary"].lower())
+        assert_conversational_chat(self, report["escalations"][0])
         persisted = workflow.load_state()["projects"][0]["roadmap_items"][0]
         self.assertTrue(persisted["human_decision_required"])
         self.assertEqual(
@@ -1884,7 +2095,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
             [entry["helper_agent"] for entry in report["collaborations"]],
             ["helper-high", "helper-middle", "helper-low"],
         )
-        self.assertIn("Task high, Task middle, Task low", report["telegram_summary"])
+        for task_name in ("Task high", "Task middle", "Task low"):
+            self.assertIn(task_name, report["telegram_summary"])
+        self.assertEqual(report["telegram_summary"].count("\n- Task "), 3)
         persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
         self.assertEqual(len(persisted["cycle_reports"]), 4)
         self.assertEqual(persisted["collaborations"], report["collaborations"])
@@ -2113,7 +2326,10 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         self.assertEqual(calls, ["first"])
         self.assertEqual(report["stop_reason"], "budget_date_changed")
-        self.assertIn("Stop: budget date changed", report["telegram_summary"])
+        self.assertIn(
+            "stopped before another item because the budget day changed",
+            report["telegram_summary"].lower(),
+        )
         self.assertEqual(workflow.load_state()["projects"][0]["roadmap_items"][1]["status"], "ready")
 
     def test_session_honors_task_and_elapsed_time_caps(self):
