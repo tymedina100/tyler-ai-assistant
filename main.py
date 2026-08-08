@@ -1322,6 +1322,46 @@ def _allowed_tools(tools, allowed_tool_names=None):
     return [tool for tool in tools if tool.get("name") in allowed]
 
 
+# Optional reactive-model routing integration.  Telegram installs this hook at
+# runtime; CLI and the single-bot interface leave it unset and retain the existing
+# per-agent defaults.  Explicit model arguments always bypass the hook.
+on_model_route = None
+
+
+def _resolve_reactive_model(agent_key, prompt, tools, explicit_model, default_model):
+    """Resolve one reactive call without adding a second model/classifier request."""
+    if explicit_model is not None:
+        return explicit_model
+    if on_model_route is None:
+        return default_model
+
+    tool_names = tuple(
+        str(tool["name"])
+        for tool in tools
+        if isinstance(tool, dict) and tool.get("name")
+    )
+    routed_model = on_model_route(agent_key, prompt, tool_names)
+    return routed_model or default_model
+
+
+def _run_as_active_agent(agent_key, callback):
+    """Attribute nested model usage to the active worker and restore its caller."""
+    sink = current_execution_sink()
+    if sink is None:
+        return callback()
+
+    had_active_agent = "active_agent" in sink
+    previous_active_agent = sink.get("active_agent")
+    sink["active_agent"] = agent_key
+    try:
+        return callback()
+    finally:
+        if had_active_agent:
+            sink["active_agent"] = previous_active_agent
+        else:
+            sink.pop("active_agent", None)
+
+
 def ask_ai(
     prompt,
     record_history=True,
@@ -1359,11 +1399,18 @@ def ask_ai(
         # history entry itself, using the user's verbatim message.
         input_items = [{"role": "user", "content": augmented_prompt}]
 
-    assistant_response = run_with_tools(
-        ASSISTANT_INSTRUCTIONS,
-        input_items,
-        _allowed_tools(TOOLS, allowed_tool_names),
-        model=model or GENERAL_MODEL,
+    selected_tools = _allowed_tools(TOOLS, allowed_tool_names)
+    selected_model = _resolve_reactive_model(
+        "general", prompt, selected_tools, model, GENERAL_MODEL
+    )
+    assistant_response = _run_as_active_agent(
+        "general",
+        lambda: run_with_tools(
+            ASSISTANT_INSTRUCTIONS,
+            input_items,
+            selected_tools,
+            model=selected_model,
+        ),
     )
 
     if record_history:
@@ -2249,10 +2296,16 @@ def generate_plan(kind, project_key, text):
         context = f"Project key: {project_key or 'current'} (no profile found; use general judgment)."
 
     prompt = f"{context}\n\n{kind.capitalize()} request:\n{text}"
-    return get_ai_response(
-        [{"role": "user", "content": prompt}],
-        model=PREMIUM_MODEL,
-        instructions=instructions,
+    selected_model = _resolve_reactive_model(
+        "manager", prompt, (), None, PREMIUM_MODEL
+    )
+    return _run_as_active_agent(
+        "manager",
+        lambda: get_ai_response(
+            [{"role": "user", "content": prompt}],
+            model=selected_model,
+            instructions=instructions,
+        ),
     )
 
 
@@ -2288,10 +2341,17 @@ def sprint_issue_specs(project_key, goal, max_issues=7):
     if profile:
         context = (f"Project: {profile.get('name', project_key)} ({project_key}), "
                    f"repo {profile.get('repo')}, {profile.get('type', '')}\n")
-    raw = get_ai_response(
-        [{"role": "user", "content": f"{context}Sprint goal: {goal}"}],
-        model=PREMIUM_MODEL,
-        instructions=instructions,
+    prompt = f"{context}Sprint goal: {goal}"
+    selected_model = _resolve_reactive_model(
+        "linear", prompt, (), None, PREMIUM_MODEL
+    )
+    raw = _run_as_active_agent(
+        "linear",
+        lambda: get_ai_response(
+            [{"role": "user", "content": prompt}],
+            model=selected_model,
+            instructions=instructions,
+        ),
     )
     specs = []
     for line in (raw or "").splitlines():
@@ -3077,6 +3137,13 @@ def execute_tool(name, arguments):
 
         return f"Unknown tool: {name}"
 
+    except (
+        ExecutionBudgetExceededError,
+        ExecutionReservationStateError,
+        ExecutionDeadlineExceededError,
+    ):
+        raise
+
     except KeyError as e:
         error_message = f"Tool error: missing required argument {e} for {name}."
         logger.error(error_message)
@@ -3487,10 +3554,16 @@ def ask_specialist(
     )
     input_items = [{"role": "user", "content": augmented_prompt}]
 
-    answer = run_with_tools(
-        build_persona_instructions(profile), input_items, specialist_tools,
-        max_iterations=profile.get("max_iterations", MAX_TOOL_ITERATIONS),
-        model=model or profile["model"],
+    selected_model = _resolve_reactive_model(
+        specialist_key, prompt, specialist_tools, model, profile["model"]
+    )
+    answer = _run_as_active_agent(
+        specialist_key,
+        lambda: run_with_tools(
+            build_persona_instructions(profile), input_items, specialist_tools,
+            max_iterations=profile.get("max_iterations", MAX_TOOL_ITERATIONS),
+            model=selected_model,
+        ),
     )
 
     if record_history:
@@ -3514,11 +3587,17 @@ def ask_specialist(
     return answer
 
 
-def ask_manager(prompt):
+def ask_manager(prompt, model=None):
     input_items = [{"role": "user", "content": prompt}]
-    answer = run_with_tools(
-        MANAGER_INSTRUCTIONS, input_items, DELEGATION_TOOLS,
-        max_iterations=MAX_MANAGER_TOOL_ITERATIONS, model=FAST_MODEL
+    selected_model = _resolve_reactive_model(
+        "manager", prompt, DELEGATION_TOOLS, model, FAST_MODEL
+    )
+    answer = _run_as_active_agent(
+        "manager",
+        lambda: run_with_tools(
+            MANAGER_INSTRUCTIONS, input_items, DELEGATION_TOOLS,
+            max_iterations=MAX_MANAGER_TOOL_ITERATIONS, model=selected_model,
+        ),
     )
 
     # The Manager owns the history record (using the user's literal message), not
@@ -3563,15 +3642,21 @@ def select_group_responders(text):
     any model or parse error, so a routing glitch never drops the message."""
     try:
         openai_client = get_openai_client()
-        response = _call_responses_create(
-            openai_client,
-            FAST_MODEL,
-            {
-                "model": FAST_MODEL,
-                "instructions": _GROUP_ROUTER_INSTRUCTIONS,
-                "input": [{"role": "user", "content": text}],
-            },
-            label="Group router call",
+        selected_model = _resolve_reactive_model(
+            "router", text, (), None, FAST_MODEL
+        )
+        response = _run_as_active_agent(
+            "router",
+            lambda: _call_responses_create(
+                openai_client,
+                selected_model,
+                {
+                    "model": selected_model,
+                    "instructions": _GROUP_ROUTER_INSTRUCTIONS,
+                    "input": [{"role": "user", "content": text}],
+                },
+                label="Group router call",
+            ),
         )
         raw = response.output_text.strip()
 

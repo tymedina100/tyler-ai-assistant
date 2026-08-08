@@ -1,10 +1,12 @@
 {
   "version": 1,
   "pricing_basis": "usd_per_1m_tokens",
-  "snapshot_note": "Enabled-model pricing verified against official OpenAI model pages on 2026-07-27. Re-verify before deployment; context limits are conservative application routing limits.",
+  "snapshot_note": "Enabled-model pricing verified against official OpenAI model pages on 2026-08-08. Re-verify before deployment; context limits are conservative application routing limits.",
   "pricing_sources": [
     "https://developers.openai.com/api/docs/models/gpt-5.4-nano",
     "https://developers.openai.com/api/docs/models/gpt-5.4-mini",
+    "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+    "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
     "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
   ],
   "models": [
@@ -54,6 +56,64 @@
       "input_usd_per_million": 0.75,
       "cached_input_usd_per_million": 0.075,
       "output_usd_per_million": 4.5,
+      "enabled": true
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "level": "standard",
+      "strength": 25,
+      "capabilities": [
+        "text",
+        "classification",
+        "formatting",
+        "summarization",
+        "extraction",
+        "routing",
+        "status_updates",
+        "planning",
+        "coding",
+        "debugging",
+        "documentation",
+        "research",
+        "review",
+        "ideation",
+        "tool_use",
+        "reasoning",
+        "long_context"
+      ],
+      "context_limit_tokens": 256000,
+      "input_usd_per_million": 1.0,
+      "cached_input_usd_per_million": 0.1,
+      "output_usd_per_million": 6.0,
+      "enabled": true
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "level": "advanced",
+      "strength": 35,
+      "capabilities": [
+        "text",
+        "classification",
+        "formatting",
+        "summarization",
+        "extraction",
+        "routing",
+        "status_updates",
+        "planning",
+        "coding",
+        "debugging",
+        "documentation",
+        "research",
+        "review",
+        "ideation",
+        "tool_use",
+        "reasoning",
+        "long_context"
+      ],
+      "context_limit_tokens": 256000,
+      "input_usd_per_million": 2.5,
+      "cached_input_usd_per_million": 0.25,
+      "output_usd_per_million": 15.0,
       "enabled": true
     },
     {

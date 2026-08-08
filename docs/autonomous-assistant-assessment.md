@@ -46,7 +46,7 @@ The reactive path is:
 
 1. A CLI or Telegram message arrives.
 2. A lightweight group router selects a specialist, or Miles coordinates a multi-agent request.
-3. The selected specialist runs through the shared bounded tool loop with its curated tools and fixed model.
+3. The selected specialist runs through the shared bounded tool loop with its curated tools. In Telegram, ordinary reactive calls are routed deterministically against the model catalog and current per-turn budget envelope; explicit autonomous/Company routes remain authoritative.
 4. Sensitive actions may stage a per-chat `/confirm` request.
 5. Telegram posts the specialist answer or Miles's recap.
 6. Ad-hoc token cost is recorded after the work completes.

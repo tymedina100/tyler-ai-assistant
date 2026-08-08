@@ -205,6 +205,210 @@ def _env_flag(name, default):
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# Ordinary Telegram turns use the same configuration-backed router as autonomous
+# roadmap work.  Classification is deliberately local and deterministic: routing a
+# request never spends a second model call merely to choose the first model.
+_REACTIVE_TASK_TYPES = {
+    "router": "routing",
+    "manager": "planning",
+    "general": "planning",
+    "task": "planning",
+    "linear": "planning",
+    "code": "coding",
+    "research": "research",
+    "write": "documentation",
+    "marketing": "documentation",
+    "sales": "documentation",
+    "gmail": "documentation",
+    "editor": "review",
+    "finance": "status_update",
+    "analytics": "status_update",
+    "calendar": "status_update",
+}
+_REACTIVE_ADVANCED_PATTERNS = (
+    ("security_review", re.compile(
+        r"\b(security|vulnerabilit(?:y|ies)|threat model|authorization|authn|authz|"
+        r"credential(?:s)?|secret(?:s)?|customer data)\b", re.I
+    )),
+    ("cross_project_reasoning", re.compile(
+        r"\b(cross[- ]project|across (?:multiple )?projects|multiple projects)\b", re.I
+    )),
+    ("complex_debugging", re.compile(
+        r"\b(complex debug(?:ging)?|difficult debug(?:ging)?|race condition|deadlock|"
+        r"data corruption|root[- ]cause analysis)\b", re.I
+    )),
+    ("architecture", re.compile(
+        r"\b(architecture|architectural|system design|migration strategy)\b", re.I
+    )),
+)
+_REACTIVE_HIGH_IMPACT_PATTERN = re.compile(
+    r"\b(high[- ]impact|production|deploy(?:ment)?|merge|publish|delete|purchase|"
+    r"payment|billing|irreversible|external action)\b",
+    re.I,
+)
+_REACTIVE_ROUTE_REASON_MAX_CHARS = 800
+
+
+def _bounded_env_tokens(name, default, *, minimum, maximum):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _reactive_token_estimate(prompt, tool_names):
+    """Return a conservative, bounded estimate without inspecting private state."""
+
+    input_floor = _bounded_env_tokens(
+        "REACTIVE_ROUTING_INPUT_TOKENS", 3000, minimum=512, maximum=120000
+    )
+    output_tokens = _bounded_env_tokens(
+        "REACTIVE_ROUTING_OUTPUT_TOKENS", 800, minimum=64, maximum=8000
+    )
+    # Three characters/token is intentionally more conservative than the common
+    # four-character rule of thumb.  The fixed/tool allowance covers persona and
+    # tool-schema input that is not present in the literal user prompt.
+    prompt_tokens = (len(str(prompt or "")) + 2) // 3
+    tool_count = len(tuple(tool_names or ()))
+    input_tokens = max(input_floor, prompt_tokens + 1000 + (tool_count * 200))
+    return min(120000, input_tokens), output_tokens
+
+
+def _current_execution_sink():
+    getter = getattr(main, "current_execution_sink", None)
+    return getter() if callable(getter) else None
+
+
+def _reactive_remaining_budget(sink):
+    if isinstance(sink, dict) and sink.get("budget_cap_usd") is not None:
+        try:
+            usable_fraction = float(getattr(main, "_BUDGET_USABLE_FRACTION", 0.90))
+        except (TypeError, ValueError):
+            usable_fraction = 0.90
+        usable_fraction = min(1.0, max(0.0, usable_fraction))
+        try:
+            cap = max(0.0, float(sink.get("budget_cap_usd", 0.0) or 0.0))
+            spent = max(0.0, float(sink.get("cost_usd", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, (cap * usable_fraction) - spent)
+    try:
+        return max(
+            0.0,
+            float(company_mode.remaining_budget(company_mode.load_state())),
+        )
+    except Exception as exc:
+        # A ledger read failure is never interpreted as permission to spend.
+        main.logger.error(
+            "Reactive model routing could not read the remaining budget "
+            f"({type(exc).__name__}); deferring fail-closed."
+        )
+        return 0.0
+
+
+def _route_reactive_model(agent_key, prompt, tool_names=()):
+    """Choose one Telegram-turn model from deterministic task facts.
+
+    The returned decision is recorded without prompt content.  Any deferral raises
+    before the caller reaches the provider, allowing strict metering to reconcile a
+    known-zero call instead of silently falling back to another paid agent.
+    """
+
+    agent = re.sub(r"[^a-z0-9_]+", "_", str(agent_key or "general").lower()).strip("_")
+    agent = agent or "general"
+    task_type = _REACTIVE_TASK_TYPES.get(agent, "planning")
+    complexity = "lightweight" if agent == "router" else "standard"
+    risk = "low"
+    prompt_text = str(prompt or "")
+
+    # The router is always a classification task even when the classified message
+    # mentions architecture/security.  The selected worker performs the promotion.
+    if agent != "router":
+        for promoted_task_type, pattern in _REACTIVE_ADVANCED_PATTERNS:
+            if pattern.search(prompt_text):
+                task_type = promoted_task_type
+                complexity = "advanced"
+                risk = "high"
+                break
+        if _REACTIVE_HIGH_IMPACT_PATTERN.search(prompt_text):
+            complexity = "advanced"
+            risk = "high"
+
+    tools = tuple(tool_names or ())
+    required_capabilities = ("tool_use",) if tools else ()
+    estimated_input_tokens, estimated_output_tokens = _reactive_token_estimate(
+        prompt_text, tools
+    )
+    sink = _current_execution_sink()
+    remaining_usd = _reactive_remaining_budget(sink)
+    decision = AUTONOMY_ROUTER.route(model_router.RoutingRequest(
+        task_type=task_type,
+        complexity=complexity,
+        risk=risk,
+        required_capabilities=required_capabilities,
+        estimated_input_tokens=estimated_input_tokens,
+        estimated_output_tokens=estimated_output_tokens,
+        remaining_budget_usd=remaining_usd,
+    ))
+    reason = str(decision.reason or "")[:_REACTIVE_ROUTE_REASON_MAX_CHARS]
+    route_record = {
+        "agent": agent,
+        "task_type": task_type,
+        "complexity": complexity,
+        "risk": risk,
+        "uses_tools": bool(tools),
+        "tool_count": len(tools),
+        "estimated_input_tokens": estimated_input_tokens,
+        "estimated_output_tokens": estimated_output_tokens,
+        "remaining_budget_usd": round(remaining_usd, 6),
+        "model": decision.model_id or "",
+        "model_level": (
+            decision.model_level.value if decision.model_level is not None else ""
+        ),
+        "estimated_cost_usd": round(float(decision.estimated_cost_usd or 0.0), 9),
+        "status": decision.status,
+        "deferral_reason": decision.deferral_reason or "",
+        "reason": reason,
+    }
+    if isinstance(sink, dict):
+        sink.setdefault("model_route_decisions", []).append(route_record)
+    if decision.deferred or not decision.model_id:
+        message = (
+            "Reactive model admission stopped before a provider call: "
+            + (reason or decision.deferral_reason or "no capable model was admitted")
+        )
+        if isinstance(sink, dict):
+            sink["budget_guard_blocked"] = True
+            sink["budget_guard_reason"] = message
+        raise main.ExecutionBudgetExceededError(message)
+    return decision.model_id
+
+
+def _is_admission_failure(error):
+    classes = [company_mode.BudgetExceededError]
+    for name in (
+        "ExecutionBudgetExceededError",
+        "ExecutionReservationStateError",
+        "ExecutionDeadlineExceededError",
+    ):
+        error_type = getattr(main, name, None)
+        if isinstance(error_type, type):
+            classes.append(error_type)
+    return isinstance(error, tuple(classes))
+
+
+def _admission_stopped_message(error):
+    reason = autonomous_workflow.redact_secrets(str(error or "")).strip()
+    reason = reason[:600] or "The configured model or budget envelope was unavailable."
+    return (
+        "AI admission stopped this request before another fallback was started.\n"
+        f"Reason: {reason}\n"
+        "Action: check /status. If the ordinary daily budget is exhausted, wait for "
+        "the next budget day or change it deliberately with /setbudget in The Crew."
+    )
+
+
 AUTONOMY_TEAM_CHAT_ENABLED = _env_flag("AUTONOMY_TEAM_CHAT_ENABLED", True)
 try:
     AUTONOMY_TEAM_CHAT_MAX_CHARS = int(
@@ -1125,10 +1329,32 @@ def build_specialist_handler(key):
                 # Robin (general) isn't a SPECIALISTS entry; it runs through ask_ai
                 # (all-rounder, full toolset) rather than ask_specialist.
                 if key == "general":
-                    answer = await _run_metered(main.ask_ai, request)
+                    answer = await _run_metered(
+                        main.ask_ai,
+                        request,
+                        context=f"telegram {kind} direct request",
+                        agent=key,
+                        strict_budget=True,
+                    )
                 else:
-                    answer = await _run_metered(main.ask_specialist, key, request)
+                    answer = await _run_metered(
+                        main.ask_specialist,
+                        key,
+                        request,
+                        context=f"telegram {kind} direct request",
+                        agent=key,
+                        strict_budget=True,
+                    )
         except Exception as e:
+            if _is_admission_failure(e):
+                main.logger.warning(
+                    f"AI admission stopped the {key} specialist handler: {e}"
+                )
+                _office_call(
+                    "set_agent_status", key, "blocked", "Budget/model admission stopped the request.", OFFICE_ERROR_SECONDS
+                )
+                await reply_chunks(update.message, _admission_stopped_message(e))
+                return
             main.logger.error(f"Unhandled error in {key} specialist handler: {e}")
             _office_call(
                 "set_agent_status", key, "error", "Could not complete that request.", OFFICE_ERROR_SECONDS
@@ -1155,8 +1381,9 @@ async def _maybe_handle_project_linear_command(update, text):
     Miles as plain chat instead. Returns True if it handled the message.
 
     The handlers may hit the Linear API or the model (planning commands), so run them
-    off the event loop in a thread. Not company-metered - same as the CLI slash
-    commands."""
+    off the event loop in a thread. Model-backed Telegram commands use the same strict
+    daily-budget admission and model routing as ordinary Telegram turns; read-only and
+    explicit Linear mutation commands preserve their existing non-model path."""
     stripped = _strip_bot_suffix(text)
     lowered = stripped.lower()
 
@@ -1166,7 +1393,28 @@ async def _maybe_handle_project_linear_command(update, text):
         return True
 
     if lowered == "/project" or lowered.startswith("/project "):
-        response = await asyncio.to_thread(main.handle_project_command, stripped[len("/project"):])
+        rest = stripped[len("/project"):]
+        subcommand = rest.strip().partition(" ")[0].lower()
+        try:
+            if subcommand in {"brainstorm", "sprint", "prd"}:
+                response = await _run_metered(
+                    main.handle_project_command,
+                    rest,
+                    context=f"telegram project {subcommand}",
+                    agent="manager",
+                    strict_budget=True,
+                    no_model_is_zero=True,
+                )
+            else:
+                response = await asyncio.to_thread(main.handle_project_command, rest)
+        except Exception as e:
+            if _is_admission_failure(e):
+                main.logger.warning(
+                    f"Project planning admission stopped without a provider fallback: {e}"
+                )
+                await reply_chunks(update.message, _admission_stopped_message(e))
+                return True
+            raise
         await reply_chunks(update.message, response)
         return True
 
@@ -1179,7 +1427,28 @@ async def _maybe_handle_project_linear_command(update, text):
         return True
 
     if lowered == "/linear" or lowered.startswith("/linear "):
-        response = await asyncio.to_thread(main.handle_linear_command, stripped[len("/linear"):])
+        rest = stripped[len("/linear"):]
+        subcommand = rest.strip().partition(" ")[0].lower()
+        try:
+            if subcommand == "from-sprint":
+                response = await _run_metered(
+                    main.handle_linear_command,
+                    rest,
+                    context="telegram linear from-sprint",
+                    agent="linear",
+                    strict_budget=True,
+                    no_model_is_zero=True,
+                )
+            else:
+                response = await asyncio.to_thread(main.handle_linear_command, rest)
+        except Exception as e:
+            if _is_admission_failure(e):
+                main.logger.warning(
+                    f"Linear planning admission stopped without a provider fallback: {e}"
+                )
+                await reply_chunks(update.message, _admission_stopped_message(e))
+                return True
+            raise
         await reply_chunks(update.message, response)
         return True
 
@@ -1280,11 +1549,20 @@ async def handle_group_message(update: Update):
                 main.select_group_responders,
                 text,
                 estimate_usd=0.02,
-                context="group message routing",
-                agent="manager",
-                meter_model=main.FAST_MODEL,
+                context="telegram group routing",
+                agent="router",
+                strict_budget=True,
             )
         except Exception as e:
+            if _is_admission_failure(e):
+                main.logger.warning(
+                    f"Group router admission stopped without fallback: {e}"
+                )
+                _office_call(
+                    "set_agent_status", "manager", "blocked", "Budget/model admission stopped routing.", OFFICE_ERROR_SECONDS
+                )
+                await reply_chunks(update.message, _admission_stopped_message(e))
+                return
             main.logger.error(f"Group router error, falling back to Miles: {e}")
             responders = ["manager"]
 
@@ -1296,8 +1574,21 @@ async def handle_group_message(update: Update):
             # then Miles's recap is posted here.
             try:
                 _office_call("set_agent_status", "manager", "delegated", "Coordinating the request.")
-                answer = await _run_metered(main.ask_manager, text)
+                answer = await _run_metered(
+                    main.ask_manager,
+                    text,
+                    context="telegram group manager request",
+                    agent="manager",
+                    strict_budget=True,
+                )
             except Exception as e:
+                if _is_admission_failure(e):
+                    main.logger.warning(f"Miles admission stopped in the group: {e}")
+                    _office_call(
+                        "set_agent_status", "manager", "blocked", "Budget/model admission stopped the request.", OFFICE_ERROR_SECONDS
+                    )
+                    await reply_chunks(update.message, _admission_stopped_message(e))
+                    return
                 main.logger.error(f"Unhandled error in manager handler: {e}")
                 _office_call(
                     "set_agent_status", "manager", "error", "Could not coordinate that request.", OFFICE_ERROR_SECONDS
@@ -1317,10 +1608,32 @@ async def handle_group_message(update: Update):
                 _office_call("set_agent_status", key, "thinking", text)
                 _office_call("add_event", "thinking", key, "Picked up a routed request.")
                 if key == "general":
-                    answer = await _run_metered(main.ask_ai, text)
+                    answer = await _run_metered(
+                        main.ask_ai,
+                        text,
+                        context="telegram routed group reply",
+                        agent=key,
+                        strict_budget=True,
+                    )
                 else:
-                    answer = await _run_metered(main.ask_specialist, key, text)
+                    answer = await _run_metered(
+                        main.ask_specialist,
+                        key,
+                        text,
+                        context="telegram routed group reply",
+                        agent=key,
+                        strict_budget=True,
+                    )
             except Exception as e:
+                if _is_admission_failure(e):
+                    main.logger.warning(
+                        f"AI admission stopped while {key} handled a group request: {e}"
+                    )
+                    _office_call(
+                        "set_agent_status", key, "blocked", "Budget/model admission stopped the request.", OFFICE_ERROR_SECONDS
+                    )
+                    await reply_chunks(update.message, _admission_stopped_message(e))
+                    return
                 main.logger.error(f"Error while '{key}' answered a group message: {e}")
                 _office_call(
                     "set_agent_status", key, "error", "Could not complete that routed request.", OFFICE_ERROR_SECONDS
@@ -1377,8 +1690,18 @@ async def handle_manager_dm(update: Update):
             return
 
         try:
-            answer = await _run_metered(main.ask_manager, text)
+            answer = await _run_metered(
+                main.ask_manager,
+                text,
+                context="telegram manager dm",
+                agent="manager",
+                strict_budget=True,
+            )
         except Exception as e:
+            if _is_admission_failure(e):
+                main.logger.warning(f"Miles DM admission stopped: {e}")
+                await reply_chunks(update.message, _admission_stopped_message(e))
+                return
             main.logger.error(f"Unhandled error in manager DM handler: {e}")
             await update.message.reply_text("Sorry, something went wrong processing that.")
             return
@@ -1399,6 +1722,22 @@ def on_delegation(specialist_key, request_text, answer_text):
     ctx = main.current_reply_context() or {"kind": "group"}
     label = "General Assistant" if specialist_key == "general" else main.SPECIALISTS[specialist_key]["label"]
     target_bot = bots.get(specialist_key, bots["manager"])
+    route_note = ""
+    sink = _current_execution_sink()
+    if isinstance(sink, dict):
+        matching_routes = [
+            value
+            for value in sink.get("model_route_decisions", [])
+            if isinstance(value, dict)
+            and value.get("agent") == specialist_key
+            and value.get("model")
+        ]
+        if matching_routes:
+            route = matching_routes[-1]
+            route_note = (
+                f"\nModel: {str(route.get('model') or '')[:80]}"
+                f"\nRouting: {str(route.get('reason') or '')[:500]}"
+            )
     _office_call("set_agent_status", specialist_key, "speaking", answer_text, OFFICE_REPLY_SECONDS)
     _office_call("add_event", "reply", specialist_key, answer_text)
     try:
@@ -1408,8 +1747,11 @@ def on_delegation(specialist_key, request_text, answer_text):
 
     async def post_group():
         try:
-            if specialist_key != "general":
-                await send_chunks(bots["manager"], GROUP_CHAT_ID, f"Delegating to the {label}: {request_text}")
+            await send_chunks(
+                bots["manager"],
+                GROUP_CHAT_ID,
+                f"Delegating to the {label}: {request_text}{route_note}",
+            )
             await send_chunks(target_bot, GROUP_CHAT_ID, answer_text)
         except Exception as e:
             main.logger.error(f"Failed to post delegation visibility message: {e}")
@@ -1440,6 +1782,36 @@ def on_delegation(specialist_key, request_text, answer_text):
 # between tasks, and linking each finished task to a real deliverable (artifact).
 # --------------------------------------------------------------------------- #
 
+
+def _metered_route_attribution(sink, fallback_model=""):
+    decisions = [
+        value
+        for value in sink.get("model_route_decisions", [])
+        if isinstance(value, dict)
+    ]
+    if not decisions:
+        return str(fallback_model or ""), ""
+    models = list(dict.fromkeys(
+        str(value["model"])
+        for value in decisions
+        if value.get("model")
+    ))
+    model_value = ",".join(models)[:240]
+    reason_parts = []
+    for value in decisions:
+        agent = str(value.get("agent") or "agent")[:40]
+        model = str(value.get("model") or "deferred")[:80]
+        reason = str(value.get("reason") or "")[:300]
+        deferral_reason = str(value.get("deferral_reason") or "")[:80]
+        if deferral_reason:
+            reason = f"{deferral_reason}: {reason}"
+        reason_parts.append(f"{agent}->{model}: {reason}")
+    return (
+        model_value or str(fallback_model or ""),
+        ("Reactive model route: " + " | ".join(reason_parts))[:1600],
+    )
+
+
 async def _run_metered(
     fn,
     *args,
@@ -1451,34 +1823,58 @@ async def _run_metered(
     task_id=None,
     return_receipt=False,
     strict_budget=False,
+    no_model_is_zero=False,
 ):
     """Reserve before a paid call, then reconcile measured usage atomically.
 
     This is intentionally used by reactive chat and idle ideation as well as the
-    autonomous runner. Strict request-level enforcement is opt-in so ordinary chat
-    behavior stays unchanged; persisted Company tasks install their own task envelope.
-    This helper does not enable Company Mode's produce bypass.
+    autonomous runner. Telegram model calls opt into strict request-level enforcement;
+    persisted Company tasks install their own task envelope. This helper does not
+    enable Company Mode's produce bypass.
     """
     if estimate_usd is None:
         try:
             estimate_usd = max(0.001, float(os.environ.get("ADHOC_RESERVATION_USD", "0.10")))
         except (TypeError, ValueError):
             estimate_usd = 0.10
-    reservation = await asyncio.to_thread(
-        company_mode.reserve_budget,
-        estimate_usd,
-        company_mode.COMPANY_STATE_FILE,
-        context=context,
-        project_id=project_id,
-        task_id=task_id,
-        agent=agent,
-        model=meter_model or "",
-        reason=f"Pre-call estimate for {context}",
-    )
+    try:
+        reservation = await asyncio.to_thread(
+            company_mode.reserve_budget,
+            estimate_usd,
+            company_mode.COMPANY_STATE_FILE,
+            context=context,
+            project_id=project_id,
+            task_id=task_id,
+            agent=agent,
+            model=meter_model or "",
+            reason=f"Pre-call estimate for {context}",
+        )
+    except company_mode.BudgetExceededError as exc:
+        reason = autonomous_workflow.redact_secrets(str(exc or "")).strip()
+        reason = reason[:600] or "The daily budget reservation was denied."
+        try:
+            await asyncio.to_thread(
+                company_mode.record_budget_deferral,
+                company_mode.COMPANY_STATE_FILE,
+                context=context,
+                project_id=project_id,
+                task_id=task_id,
+                agent=agent,
+                model=meter_model or "",
+                reason=reason,
+            )
+        except Exception as record_error:
+            main.logger.error(
+                "Failed to persist a zero-cost budget admission deferral: "
+                f"{type(record_error).__name__}"
+            )
+        raise
     sink = {
         "cost_usd": 0.0,
         "artifacts": [],
         "usage_records": [],
+        "model_route_decisions": [],
+        "active_agent": str(agent or "manager"),
         "context": context,
     }
     if strict_budget:
@@ -1509,7 +1905,10 @@ async def _run_metered(
         try:
             unmeasured = bool(sink.get("unmeasured_model_calls"))
             known_zero = (
-                bool(sink.get("budget_guard_blocked"))
+                (
+                    bool(sink.get("budget_guard_blocked"))
+                    or bool(no_model_is_zero)
+                )
                 and not sink["usage_records"]
                 and not unmeasured
                 and not sink.get("model_requests_started")
@@ -1523,12 +1922,16 @@ async def _run_metered(
                 if sink["usage_records"]
                 else None
             )
+            routed_model, routed_reason = _metered_route_attribution(
+                sink, meter_model or ""
+            )
             receipt = await asyncio.to_thread(
                 company_mode.reconcile_budget,
                 reservation["id"],
                 reconciled_actual,
                 company_mode.COMPANY_STATE_FILE,
                 usage_records=sink["usage_records"],
+                model_route_decisions=sink["model_route_decisions"],
                 estimated=(
                     unmeasured
                     or (not bool(sink["usage_records"]) and not known_zero)
@@ -1537,8 +1940,8 @@ async def _run_metered(
                 project_id=project_id,
                 task_id=task_id,
                 agent=agent,
-                model=meter_model or "",
-                reason=f"Measured usage for {context}",
+                model=routed_model,
+                reason=routed_reason or f"Measured usage for {context}",
             )
             if sink["artifacts"]:
                 await asyncio.to_thread(
@@ -1559,6 +1962,7 @@ async def _run_metered(
         receipt = dict(receipt or {})
         receipt["artifacts"] = list(sink["artifacts"])
         receipt["usage_records"] = list(sink["usage_records"])
+        receipt["model_route_decisions"] = list(sink["model_route_decisions"])
         return result, receipt
     return result
 
@@ -4169,6 +4573,7 @@ async def run_all():
         )
 
     _office_call("configure_agents", _office_roster())
+    main.on_model_route = _route_reactive_model
     main.on_delegation = on_delegation
     main.on_delegation_started = on_delegation_started
     # Mirror Company Mode work into Linear (no-op unless LINEAR_API_KEY is set).

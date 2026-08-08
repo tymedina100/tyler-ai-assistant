@@ -2990,6 +2990,283 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["company"]["reserved_today_usd"], 0.0)
         self.assertEqual(company_mode.open_projects(final), [])
 
+    def test_reactive_router_stays_lightweight_for_architecture_text(self):
+        sink = {
+            "cost_usd": 0.0,
+            "budget_cap_usd": 1.0,
+            "model_route_decisions": [],
+        }
+        with patch.object(
+            self.group.main,
+            "current_execution_sink",
+            new=Mock(return_value=sink),
+            create=True,
+        ), patch.dict(os.environ, {
+            "REACTIVE_ROUTING_INPUT_TOKENS": "3000",
+            "REACTIVE_ROUTING_OUTPUT_TOKENS": "800",
+        }):
+            selected = self.group._route_reactive_model(
+                "router",
+                "Route this production architecture and security review.",
+                (),
+            )
+
+        self.assertEqual(selected, "gpt-5.4-nano")
+        route = sink["model_route_decisions"][0]
+        self.assertEqual(route["task_type"], "routing")
+        self.assertEqual(route["complexity"], "lightweight")
+        self.assertEqual(route["risk"], "low")
+        self.assertNotIn("prompt", route)
+
+    def test_reactive_standard_tool_task_selects_mini(self):
+        sink = {
+            "cost_usd": 0.0,
+            "budget_cap_usd": 1.0,
+            "model_route_decisions": [],
+        }
+        with patch.object(
+            self.group.main,
+            "current_execution_sink",
+            new=Mock(return_value=sink),
+            create=True,
+        ):
+            selected = self.group._route_reactive_model(
+                "code", "Implement a small parser and run its tests.", ["read_file"]
+            )
+
+        self.assertEqual(selected, "gpt-5.4-mini")
+        route = sink["model_route_decisions"][0]
+        self.assertEqual(route["task_type"], "coding")
+        self.assertTrue(route["uses_tools"])
+        self.assertEqual(route["model_level"], "standard")
+
+    def test_reactive_advanced_high_risk_task_selects_sol(self):
+        sink = {
+            "cost_usd": 0.0,
+            "budget_cap_usd": 1.0,
+            "model_route_decisions": [],
+        }
+        with patch.object(
+            self.group.main,
+            "current_execution_sink",
+            new=Mock(return_value=sink),
+            create=True,
+        ):
+            selected = self.group._route_reactive_model(
+                "code",
+                "Review the production security architecture before deployment.",
+                ["read_file"],
+            )
+
+        self.assertEqual(selected, "gpt-5.6-sol")
+        route = sink["model_route_decisions"][0]
+        self.assertEqual(route["task_type"], "security_review")
+        self.assertEqual(route["complexity"], "advanced")
+        self.assertEqual(route["risk"], "high")
+
+    def test_reactive_complex_debugging_selects_terra(self):
+        sink = {
+            "cost_usd": 0.0,
+            "budget_cap_usd": 1.0,
+            "model_route_decisions": [],
+        }
+        with patch.object(
+            self.group.main,
+            "current_execution_sink",
+            new=Mock(return_value=sink),
+            create=True,
+        ):
+            selected = self.group._route_reactive_model(
+                "code",
+                "Perform root-cause analysis for this difficult debugging failure.",
+                ["read_file"],
+            )
+
+        self.assertEqual(selected, "gpt-5.6-terra")
+        route = sink["model_route_decisions"][0]
+        self.assertEqual(route["task_type"], "complex_debugging")
+        self.assertEqual(route["model_level"], "advanced")
+
+    def test_reactive_insufficient_budget_starts_no_provider_call(self):
+        sink = {
+            "cost_usd": 0.0,
+            "budget_cap_usd": 0.0001,
+            "model_route_decisions": [],
+        }
+        provider_call = Mock(return_value="should not run")
+
+        def admitted_call():
+            self.group._route_reactive_model("router", "Route this.", ())
+            return provider_call()
+
+        with patch.object(
+            self.group.main,
+            "current_execution_sink",
+            new=Mock(return_value=sink),
+            create=True,
+        ):
+            with self.assertRaises(self.fake_main.ExecutionBudgetExceededError):
+                admitted_call()
+
+        provider_call.assert_not_called()
+        self.assertTrue(sink["budget_guard_blocked"])
+        self.assertEqual(sink["model_route_decisions"][0]["status"], "deferred")
+        self.assertEqual(sink["model_route_decisions"][0]["model"], "")
+
+    async def test_metered_reconciliation_persists_reactive_route(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "company.json"
+            company_mode.set_daily_budget(1.0, path)
+            current = {"sink": None}
+
+            def set_sink(value):
+                current["sink"] = value
+
+            def routed_work():
+                return self.group._route_reactive_model(
+                    "code", "Implement a small parser.", ["read_file"]
+                )
+
+            with patch.object(
+                self.group.company_mode, "COMPANY_STATE_FILE", path
+            ), patch.object(
+                self.group.main, "set_execution_sink", side_effect=set_sink
+            ), patch.object(
+                self.group.main,
+                "current_execution_sink",
+                new=lambda: current["sink"],
+                create=True,
+            ):
+                result, receipt = await self.group._run_metered(
+                    routed_work,
+                    estimate_usd=0.10,
+                    context="telegram route persistence test",
+                    agent="code",
+                    return_receipt=True,
+                    strict_budget=True,
+                )
+            state = company_mode.load_state(path)
+
+        self.assertEqual(result, "gpt-5.4-mini")
+        self.assertEqual(receipt["model_route_decisions"][0]["model"], "gpt-5.4-mini")
+        entry = state["cost_entries"][-1]
+        self.assertEqual(entry["agent"], "code")
+        self.assertEqual(entry["model"], "gpt-5.4-mini")
+        self.assertIn("Reactive model route", entry["reason"])
+        self.assertIn("code->gpt-5.4-mini", entry["reason"])
+
+    async def test_metered_route_deferral_persists_reason_with_zero_spend(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "company.json"
+            company_mode.set_daily_budget(1.0, path)
+            current = {"sink": None}
+
+            def set_sink(value):
+                current["sink"] = value
+
+            def deferred_work():
+                current["sink"]["budget_cap_usd"] = 0.0001
+                return self.group._route_reactive_model(
+                    "router", "Route this request.", ()
+                )
+
+            with patch.object(
+                self.group.company_mode, "COMPANY_STATE_FILE", path
+            ), patch.object(
+                self.group.main, "set_execution_sink", side_effect=set_sink
+            ), patch.object(
+                self.group.main,
+                "current_execution_sink",
+                new=lambda: current["sink"],
+                create=True,
+            ):
+                with self.assertRaises(self.fake_main.ExecutionBudgetExceededError):
+                    await self.group._run_metered(
+                        deferred_work,
+                        estimate_usd=0.10,
+                        context="telegram route deferral persistence test",
+                        agent="router",
+                        strict_budget=True,
+                    )
+            state = company_mode.load_state(path)
+
+        entry = state["cost_entries"][-1]
+        self.assertEqual(entry["amount_usd"], 0.0)
+        self.assertEqual(entry["model"], "")
+        self.assertIn("router->deferred", entry["reason"])
+        self.assertIn("insufficient_budget", entry["reason"])
+
+    async def test_metered_reservation_denial_persists_zero_cost_deferral(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "company.json"
+            # The default $0.25 emergency reserve leaves no ordinary budget here.
+            company_mode.set_daily_budget(0.25, path)
+            provider_call = Mock(return_value="must not run")
+
+            with patch.object(
+                self.group.company_mode, "COMPANY_STATE_FILE", path
+            ):
+                with self.assertRaises(company_mode.BudgetExceededError):
+                    await self.group._run_metered(
+                        provider_call,
+                        estimate_usd=0.01,
+                        context="telegram exhausted-budget test",
+                        agent="code",
+                        strict_budget=True,
+                    )
+            state = company_mode.load_state(path)
+
+        provider_call.assert_not_called()
+        self.assertEqual(state["company"]["spent_today_usd"], 0.0)
+        self.assertEqual(state["company"]["reserved_today_usd"], 0.0)
+        entry = state["cost_entries"][-1]
+        self.assertEqual(entry["amount_usd"], 0.0)
+        self.assertEqual(entry["context"], "telegram exhausted-budget test")
+        self.assertEqual(entry["agent"], "code")
+        self.assertIn("reserve", entry["reason"].lower())
+        decision = entry["model_route_decisions"][0]
+        self.assertEqual(decision["status"], "deferred")
+        self.assertEqual(decision["deferral_reason"], "reservation_denied")
+        self.assertEqual(state["events"][-1]["type"], "budget_deferred")
+
+    async def test_group_router_budget_failure_does_not_fallback_to_miles(self):
+        error = self.fake_main.ExecutionBudgetExceededError(
+            "The routing request cannot fit its strict budget envelope."
+        )
+        update = types.SimpleNamespace(
+            message=types.SimpleNamespace(
+                text="Please review the architecture.", reply_text=AsyncMock()
+            )
+        )
+        usernames = {key: f"{key}_bot" for key in self.group.BOT_KEYS}
+        ask_manager = Mock(return_value="Miles should not run")
+        with patch.object(
+            self.group, "bot_usernames", usernames
+        ), patch.object(
+            self.group, "_handle_pending_confirmation", new=AsyncMock(return_value=False)
+        ), patch.object(
+            self.group, "_maybe_handle_project_linear_command", new=AsyncMock(return_value=False)
+        ), patch.object(
+            self.group.company_mode, "parse_company_command", return_value=None
+        ), patch.object(
+            self.group.company_mode, "handle_company_command", return_value=None
+        ), patch.object(
+            self.group.main, "select_group_responders", new=Mock(), create=True
+        ), patch.object(
+            self.group.main, "ask_manager", new=ask_manager, create=True
+        ), patch.object(
+            self.group, "_run_metered", new=AsyncMock(side_effect=error)
+        ) as metered, patch.object(
+            self.group, "reply_chunks", new=AsyncMock()
+        ) as reply:
+            await self.group.handle_group_message(update)
+
+        ask_manager.assert_not_called()
+        self.assertEqual(metered.await_count, 1)
+        self.assertEqual(metered.await_args.kwargs["agent"], "router")
+        self.assertTrue(metered.await_args.kwargs["strict_budget"])
+        self.assertIn("before another fallback", reply.await_args.args[1])
+
 
 if __name__ == "__main__":
     unittest.main()

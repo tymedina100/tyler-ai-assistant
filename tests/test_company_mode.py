@@ -688,6 +688,92 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(state["company"]["spent_today_usd"], 0.234568)
         self.assertEqual(state["budget_reservations"][-1]["status"], "released")
 
+    def test_reconcile_persists_bounded_structured_model_route_decisions(self):
+        company_mode.set_daily_budget(10, self.state_path)
+        reservation = company_mode.reserve_budget(
+            0.5, self.state_path, context="telegram manager request"
+        )
+        decisions = []
+        for index in range(company_mode.MAX_MODEL_ROUTE_DECISIONS + 2):
+            decisions.append({
+                "agent": f"agent-{index}",
+                "task_type": "coding",
+                "complexity": "standard",
+                "risk": "low",
+                "uses_tools": True,
+                "tool_count": 4,
+                "estimated_input_tokens": 3000,
+                "estimated_output_tokens": 800,
+                "remaining_budget_usd": 0.45,
+                "model": "gpt-5.4-mini",
+                "model_level": "standard",
+                "estimated_cost_usd": 0.006,
+                "status": "selected",
+                "deferral_reason": "",
+                "reason": (
+                    "Selected the lowest-cost capable model."
+                    if index < company_mode.MAX_MODEL_ROUTE_DECISIONS + 1
+                    else "r" * (company_mode.MAX_MODEL_ROUTE_REASON_CHARS + 50)
+                ),
+            })
+
+        cost = company_mode.reconcile_budget(
+            reservation["id"],
+            0.01,
+            self.state_path,
+            model_route_decisions=[None, "ignored", *decisions],
+        )
+
+        self.assertEqual(
+            len(cost["model_route_decisions"]),
+            company_mode.MAX_MODEL_ROUTE_DECISIONS,
+        )
+        self.assertTrue(cost["model_route_decisions_truncated"])
+        self.assertEqual(cost["model_route_decisions"][0]["agent"], "agent-2")
+        latest = cost["model_route_decisions"][-1]
+        self.assertEqual(latest["model"], "gpt-5.4-mini")
+        self.assertEqual(latest["estimated_input_tokens"], 3000)
+        self.assertEqual(len(latest["reason"]), company_mode.MAX_MODEL_ROUTE_REASON_CHARS)
+        self.assertTrue(latest["reason_truncated"])
+
+        persisted = company_mode.load_state(self.state_path)["cost_entries"][-1]
+        self.assertEqual(persisted["model_route_decisions"], cost["model_route_decisions"])
+        self.assertTrue(persisted["model_route_decisions_truncated"])
+
+    def test_record_adhoc_spend_can_persist_zero_cost_route_deferral(self):
+        company_mode.record_adhoc_spend(
+            0.0,
+            path=self.state_path,
+            context="telegram route deferral",
+            model_route_decisions=[{
+                "agent": "router",
+                "task_type": "routing",
+                "complexity": "lightweight",
+                "risk": "low",
+                "uses_tools": False,
+                "tool_count": 0,
+                "estimated_input_tokens": "invalid",
+                "estimated_output_tokens": 800,
+                "remaining_budget_usd": "NaN",
+                "model": "",
+                "model_level": "",
+                "estimated_cost_usd": 0.002,
+                "status": "deferred",
+                "deferral_reason": "insufficient_budget",
+                "reason": "No capable model fits the remaining budget.",
+            }],
+        )
+
+        entry = company_mode.load_state(self.state_path)["cost_entries"][-1]
+        self.assertEqual(entry["amount_usd"], 0.0)
+        self.assertEqual(entry["model_route_decisions"][0]["agent"], "router")
+        self.assertEqual(
+            entry["model_route_decisions"][0]["deferral_reason"],
+            "insufficient_budget",
+        )
+        self.assertEqual(entry["model_route_decisions"][0]["estimated_input_tokens"], 0)
+        self.assertEqual(entry["model_route_decisions"][0]["remaining_budget_usd"], 0.0)
+
     def test_concurrent_reservations_cannot_overspend(self):
         company_mode.set_daily_budget(2.25, self.state_path)  # $2 ordinary + $0.25 emergency
 
