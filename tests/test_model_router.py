@@ -68,6 +68,46 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(decision.model_id, "gpt-5.4-mini")
         self.assertIn("stronger than gpt-5.4-nano", decision.reason)
 
+    def test_standard_failure_ladder_uses_luna_then_terra(self):
+        luna = self.router.route(
+            RoutingRequest(
+                task_type="coding",
+                complexity="standard",
+                required_capabilities=("tool_use",),
+                previous_failures=1,
+                previous_models=("gpt-5.4-mini",),
+                remaining_budget_usd=5.0,
+            )
+        )
+        terra = self.router.route(
+            RoutingRequest(
+                task_type="coding",
+                complexity="standard",
+                required_capabilities=("tool_use",),
+                previous_failures=2,
+                previous_models=("gpt-5.4-mini", "gpt-5.6-luna"),
+                remaining_budget_usd=5.0,
+            )
+        )
+
+        self.assertEqual(luna.model_id, "gpt-5.6-luna")
+        self.assertEqual(terra.model_id, "gpt-5.6-terra")
+
+    def test_generic_advanced_debugging_uses_terra(self):
+        decision = self.router.route(
+            RoutingRequest(
+                task_type="complex_debugging",
+                complexity="advanced",
+                risk="medium",
+                required_capabilities=("debugging",),
+                remaining_budget_usd=5.0,
+            )
+        )
+
+        self.assertFalse(decision.deferred)
+        self.assertEqual(decision.model_id, "gpt-5.6-terra")
+        self.assertEqual(decision.model_level, CapabilityLevel.ADVANCED)
+
     def test_required_capability_filters_out_lightweight_model(self):
         decision = self.router.route(
             RoutingRequest(

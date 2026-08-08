@@ -221,6 +221,66 @@ def _normalize_usage_records(records):
     return normalized
 
 
+def _normalize_model_route_decisions(records):
+    """Keep a small, explicit audit schema for deterministic model decisions.
+
+    Route records are operational metadata, not prompt storage.  Preserve enough
+    detail to explain each selection or deferral while bounding both the number of
+    decisions and every text/numeric field before persistent state is written.
+    """
+
+    normalized = []
+    for raw in _list(records):
+        if not isinstance(raw, dict):
+            continue
+
+        def metadata(name, limit=MAX_MODEL_ROUTE_METADATA_CHARS):
+            return _bounded_text(raw.get(name), limit, strip=True)[0]
+
+        def bounded_count(name, maximum=MAX_MODEL_ROUTE_TOKEN_COUNT):
+            try:
+                value = int(raw.get(name, 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return 0
+            return min(maximum, max(0, value))
+
+        def bounded_amount(name):
+            try:
+                value = Decimal(str(raw.get(name, 0.0) or 0.0))
+            except (InvalidOperation, TypeError, ValueError):
+                return 0.0
+            if not value.is_finite() or value < 0:
+                return 0.0
+            return _amount(min(value, Decimal(str(MAX_MODEL_ROUTE_USD))))
+
+        reason, reason_truncated = _bounded_text(
+            raw.get("reason"), MAX_MODEL_ROUTE_REASON_CHARS, strip=True
+        )
+        normalized.append({
+            "agent": metadata("agent"),
+            "task_type": metadata("task_type"),
+            "complexity": metadata("complexity", MAX_MODEL_ROUTE_STATUS_CHARS),
+            "risk": metadata("risk", MAX_MODEL_ROUTE_STATUS_CHARS),
+            "uses_tools": bool(raw.get("uses_tools", False)),
+            "tool_count": bounded_count("tool_count", MAX_MODEL_ROUTE_TOOL_COUNT),
+            "estimated_input_tokens": bounded_count("estimated_input_tokens"),
+            "estimated_output_tokens": bounded_count("estimated_output_tokens"),
+            "remaining_budget_usd": bounded_amount("remaining_budget_usd"),
+            "model": metadata("model"),
+            "model_level": metadata("model_level", MAX_MODEL_ROUTE_STATUS_CHARS),
+            "estimated_cost_usd": bounded_amount("estimated_cost_usd"),
+            "status": metadata("status", MAX_MODEL_ROUTE_STATUS_CHARS),
+            "deferral_reason": metadata("deferral_reason"),
+            "reason": reason,
+            "reason_truncated": bool(raw.get("reason_truncated")) or reason_truncated,
+        })
+
+    return (
+        normalized[-MAX_MODEL_ROUTE_DECISIONS:],
+        len(normalized) > MAX_MODEL_ROUTE_DECISIONS,
+    )
+
+
 def _normalize_team_help_events(records):
     """Normalize the bounded audit trail for one task's specialist help calls.
 
@@ -422,6 +482,13 @@ def _normalize_cost_entry(entry):
     for key in ("project_id", "task_id", "agent", "model", "reason"):
         item.setdefault(key, None if key.endswith("_id") else "")
     item["usage_records"] = _normalize_usage_records(item.get("usage_records"))
+    route_decisions, route_decisions_truncated = _normalize_model_route_decisions(
+        item.get("model_route_decisions")
+    )
+    item["model_route_decisions"] = route_decisions
+    item["model_route_decisions_truncated"] = bool(
+        item.get("model_route_decisions_truncated")
+    ) or route_decisions_truncated
     item["input_tokens"] = int(item.get("input_tokens", sum(r["input_tokens"] for r in item["usage_records"])) or 0)
     item["output_tokens"] = int(item.get("output_tokens", sum(r["output_tokens"] for r in item["usage_records"])) or 0)
     item["total_tokens"] = int(
@@ -785,6 +852,7 @@ def _record_cost_entry_in_state(
     *,
     reservation_id="",
     usage_records=None,
+    model_route_decisions=None,
     estimated=False,
     context="task",
     project_id=None,
@@ -796,6 +864,9 @@ def _record_cost_entry_in_state(
     amount = _amount(amount_usd)
     attribution = _attribution(context, project_id, task_id, agent, model, reason)
     usage = _normalize_usage_records(usage_records)
+    route_decisions, route_decisions_truncated = _normalize_model_route_decisions(
+        model_route_decisions
+    )
     input_tokens = sum(item["input_tokens"] for item in usage)
     output_tokens = sum(item["output_tokens"] for item in usage)
     total_tokens = sum(item["total_tokens"] for item in usage)
@@ -808,6 +879,8 @@ def _record_cost_entry_in_state(
         "reservation_id": reservation_id or "",
         **attribution,
         "usage_records": usage,
+        "model_route_decisions": route_decisions,
+        "model_route_decisions_truncated": route_decisions_truncated,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
@@ -826,6 +899,7 @@ def _reconcile_budget_in_state(
     actual_usd=None,
     *,
     usage_records=None,
+    model_route_decisions=None,
     estimated=False,
     context=None,
     project_id=None,
@@ -873,6 +947,7 @@ def _reconcile_budget_in_state(
         actual,
         reservation_id=reservation_id,
         usage_records=usage_records,
+        model_route_decisions=model_route_decisions,
         estimated=estimated,
         **attribution,
     )
@@ -899,6 +974,7 @@ def reconcile_budget(
     path=COMPANY_STATE_FILE,
     *,
     usage_records=None,
+    model_route_decisions=None,
     estimated=False,
     context=None,
     project_id=None,
@@ -914,6 +990,7 @@ def reconcile_budget(
             reservation_id,
             actual_usd,
             usage_records=usage_records,
+            model_route_decisions=model_route_decisions,
             estimated=estimated,
             context=context,
             project_id=project_id,
@@ -1505,6 +1582,13 @@ MAX_TEAM_HELP_MODEL_REASON_CHARS = 500
 MAX_TEAM_HELP_METADATA_CHARS = 120
 MAX_TEAM_HELP_STATUS_CHARS = 40
 MAX_TEAM_HELP_TIMESTAMP_CHARS = 64
+MAX_MODEL_ROUTE_DECISIONS = 20
+MAX_MODEL_ROUTE_REASON_CHARS = 800
+MAX_MODEL_ROUTE_METADATA_CHARS = 120
+MAX_MODEL_ROUTE_STATUS_CHARS = 40
+MAX_MODEL_ROUTE_TOKEN_COUNT = 10_000_000
+MAX_MODEL_ROUTE_TOOL_COUNT = 10_000
+MAX_MODEL_ROUTE_USD = 1_000_000
 FAILURE_CLASSIFICATIONS = {
     "missing_access",
     "missing_information",
@@ -1961,6 +2045,7 @@ def record_adhoc_spend(
     path=COMPANY_STATE_FILE,
     *,
     usage_records=None,
+    model_route_decisions=None,
     context="adhoc",
     project_id=None,
     task_id=None,
@@ -1974,15 +2059,16 @@ def record_adhoc_spend(
     autonomous engine. A no-op when there's nothing to record."""
     spend = _amount(spent_usd) if spent_usd else 0.0
     artifacts = list(artifacts or [])
-    if not spend and not artifacts and not usage_records:
+    if not spend and not artifacts and not usage_records and not model_route_decisions:
         return
 
     with _state_transaction(path) as state:
         project = active_project(state)
         effective_project_id = project_id or (project.get("id") if project else None)
-        if spend or usage_records:
+        if spend or usage_records or model_route_decisions:
             _record_cost_entry_in_state(
-                state, spend, usage_records=usage_records, context=context,
+                state, spend, usage_records=usage_records,
+                model_route_decisions=model_route_decisions, context=context,
                 project_id=effective_project_id, task_id=task_id, agent=agent, model=model, reason=reason,
             )
         if project and artifacts:
@@ -1996,6 +2082,69 @@ def active_project(state):
         if project["id"] == project_id:
             return project
     return None
+
+
+def record_budget_deferral(
+    path=COMPANY_STATE_FILE,
+    *,
+    context="admission",
+    project_id=None,
+    task_id=None,
+    agent="manager",
+    model="",
+    reason="Budget reservation was denied.",
+):
+    """Persist a known-zero admission failure without changing today's spend.
+
+    Reservation denial happens before a model execution sink exists, so normal
+    reconciliation has nothing to close.  This explicit zero-cost record keeps the
+    refusal visible in the same ledger as admitted calls while leaving both spent and
+    reserved totals unchanged.
+    """
+    bounded_reason, _truncated = _bounded_text(
+        reason, MAX_MODEL_ROUTE_REASON_CHARS, strip=True
+    )
+    bounded_reason = bounded_reason or "Budget reservation was denied."
+    with _state_transaction(path) as state:
+        project = active_project(state)
+        effective_project_id = project_id or (project.get("id") if project else None)
+        decision = {
+            "agent": agent,
+            "task_type": "budget_admission",
+            "complexity": "",
+            "risk": "low",
+            "uses_tools": False,
+            "tool_count": 0,
+            "estimated_input_tokens": 0,
+            "estimated_output_tokens": 0,
+            "remaining_budget_usd": remaining_budget(state),
+            "model": model,
+            "model_level": "",
+            "estimated_cost_usd": 0.0,
+            "status": "deferred",
+            "deferral_reason": "reservation_denied",
+            "reason": bounded_reason,
+        }
+        entry = _record_cost_entry_in_state(
+            state,
+            0.0,
+            model_route_decisions=[decision],
+            context=context,
+            project_id=effective_project_id,
+            task_id=task_id,
+            agent=agent,
+            model=model,
+            reason=bounded_reason,
+        )
+        add_event(
+            state,
+            "budget_deferred",
+            f"Budget admission deferred for {str(context or 'request')[:160]}.",
+            project_id=effective_project_id,
+            task_id=task_id,
+        )
+        result = deepcopy(entry)
+    return result
 
 
 def project_tasks(state, project_id):

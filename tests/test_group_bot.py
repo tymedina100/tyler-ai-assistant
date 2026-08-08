@@ -4,7 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -201,6 +201,34 @@ class SlashInterceptTests(unittest.TestCase):
         self.assertEqual(captured["rest"].strip(), "use vantage")
         self.assertIn("PROJECT-OK", update.message.replies)
 
+    def test_project_brainstorm_uses_strict_metered_model_path(self):
+        update = FakeUpdate()
+        with patch.object(self.main, "handle_project_command") as command, patch.object(
+            self.gb,
+            "_run_metered",
+            new=AsyncMock(return_value="PROJECT-PLAN"),
+        ) as metered:
+            handled = asyncio.run(
+                self.gb._maybe_handle_project_linear_command(
+                    update,
+                    "/project@TyManagerBot brainstorm assistant improve onboarding",
+                )
+            )
+
+        self.assertTrue(handled)
+        command.assert_not_called()
+        metered.assert_awaited_once()
+        self.assertIs(metered.await_args.args[0], command)
+        self.assertEqual(
+            metered.await_args.args[1].strip(),
+            "brainstorm assistant improve onboarding",
+        )
+        self.assertEqual(metered.await_args.kwargs["context"], "telegram project brainstorm")
+        self.assertEqual(metered.await_args.kwargs["agent"], "manager")
+        self.assertTrue(metered.await_args.kwargs["strict_budget"])
+        self.assertTrue(metered.await_args.kwargs["no_model_is_zero"])
+        self.assertEqual(update.message.replies, ["PROJECT-PLAN"])
+
     def test_linear_with_bot_suffix_is_intercepted(self):
         update = FakeUpdate()
         with patch.object(self.main, "handle_linear_command", lambda rest: "LINEAR-OK"):
@@ -209,6 +237,85 @@ class SlashInterceptTests(unittest.TestCase):
             )
         self.assertTrue(handled)
         self.assertIn("LINEAR-OK", update.message.replies)
+
+    def test_linear_from_sprint_uses_strict_metered_model_path(self):
+        update = FakeUpdate()
+        with patch.object(self.main, "handle_linear_command") as command, patch.object(
+            self.gb,
+            "_run_metered",
+            new=AsyncMock(return_value="LINEAR-PLAN"),
+        ) as metered:
+            handled = asyncio.run(
+                self.gb._maybe_handle_project_linear_command(
+                    update,
+                    "/linear@TyManagerBot from-sprint assistant harden routing",
+                )
+            )
+
+        self.assertTrue(handled)
+        command.assert_not_called()
+        metered.assert_awaited_once()
+        self.assertIs(metered.await_args.args[0], command)
+        self.assertEqual(
+            metered.await_args.args[1].strip(),
+            "from-sprint assistant harden routing",
+        )
+        self.assertEqual(metered.await_args.kwargs["context"], "telegram linear from-sprint")
+        self.assertEqual(metered.await_args.kwargs["agent"], "linear")
+        self.assertTrue(metered.await_args.kwargs["strict_budget"])
+        self.assertTrue(metered.await_args.kwargs["no_model_is_zero"])
+        self.assertEqual(update.message.replies, ["LINEAR-PLAN"])
+
+    def test_read_only_project_and_linear_commands_remain_unmetered(self):
+        project_update = FakeUpdate()
+        linear_update = FakeUpdate()
+        with patch.object(
+            self.main, "handle_project_command", return_value="PROJECT-STATUS"
+        ) as project_command, patch.object(
+            self.main, "handle_linear_command", return_value="LINEAR-ISSUES"
+        ) as linear_command, patch.object(
+            self.gb, "_run_metered", new=AsyncMock()
+        ) as metered:
+            project_handled = asyncio.run(
+                self.gb._maybe_handle_project_linear_command(
+                    project_update, "/project status"
+                )
+            )
+            linear_handled = asyncio.run(
+                self.gb._maybe_handle_project_linear_command(
+                    linear_update, "/linear issues"
+                )
+            )
+
+        self.assertTrue(project_handled)
+        self.assertTrue(linear_handled)
+        project_command.assert_called_once_with(" status")
+        linear_command.assert_called_once_with(" issues")
+        metered.assert_not_awaited()
+        self.assertEqual(project_update.message.replies, ["PROJECT-STATUS"])
+        self.assertEqual(linear_update.message.replies, ["LINEAR-ISSUES"])
+
+    def test_model_command_admission_failure_replies_once_with_action(self):
+        update = FakeUpdate()
+        failure = self.main.ExecutionBudgetExceededError("daily budget exhausted")
+        with patch.object(
+            self.gb,
+            "_run_metered",
+            new=AsyncMock(side_effect=failure),
+        ) as metered:
+            handled = asyncio.run(
+                self.gb._maybe_handle_project_linear_command(
+                    update, "/project brainstorm assistant improve onboarding"
+                )
+            )
+
+        self.assertTrue(handled)
+        metered.assert_awaited_once()
+        self.assertEqual(len(update.message.replies), 1)
+        self.assertIn("AI admission stopped", update.message.replies[0])
+        self.assertIn("daily budget exhausted", update.message.replies[0])
+        self.assertIn("Action:", update.message.replies[0])
+        self.assertIn("/status", update.message.replies[0])
 
     def test_plain_chat_is_not_intercepted(self):
         update = FakeUpdate()

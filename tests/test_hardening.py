@@ -1047,6 +1047,230 @@ class HardeningTests(unittest.TestCase):
         self.assertIn("structured roadmap task", sent_input)
         self.assertNotIn("Relevant memories", sent_input)
 
+    def test_reactive_model_hook_routes_each_core_entrypoint(self):
+        main = self.main
+        routed_models = {
+            "general": "model-general",
+            "research": "model-research",
+            "manager": "model-manager",
+            "router": "model-router",
+        }
+        run_models = []
+        route_calls = []
+        history = []
+
+        def route(agent_key, prompt, tool_names):
+            route_calls.append((agent_key, prompt, tool_names))
+            return routed_models[agent_key]
+
+        def fake_run(*_args, **kwargs):
+            run_models.append(kwargs["model"])
+            return "routed answer"
+
+        def fake_router_call(_client, model, request_kwargs, **_kwargs):
+            self.assertEqual(model, "model-router")
+            self.assertEqual(request_kwargs["model"], "model-router")
+            return types.SimpleNamespace(
+                output_text='{"responders": ["general"]}'
+            )
+
+        with patch.object(main, "on_model_route", side_effect=route), patch.object(
+            main, "run_with_tools", side_effect=fake_run
+        ), patch.object(main, "get_history", return_value=history), patch.object(
+            main, "store_memory"
+        ), patch.object(main, "get_openai_client", return_value=object()), patch.object(
+            main, "_call_responses_create", side_effect=fake_router_call
+        ):
+            self.assertEqual(
+                main.ask_ai(
+                    "summarize this",
+                    record_history=False,
+                    allowed_tool_names={"read_file"},
+                    include_memories=False,
+                ),
+                "routed answer",
+            )
+            self.assertEqual(
+                main.ask_specialist(
+                    "research",
+                    "find evidence",
+                    record_history=False,
+                    allowed_tool_names=set(),
+                    include_memories=False,
+                ),
+                "routed answer",
+            )
+            self.assertEqual(main.ask_manager("coordinate this"), "routed answer")
+            self.assertEqual(main.select_group_responders("hello team"), ["general"])
+
+        self.assertEqual(
+            run_models,
+            ["model-general", "model-research", "model-manager"],
+        )
+        self.assertEqual([call[0] for call in route_calls], [
+            "general", "research", "manager", "router",
+        ])
+        self.assertEqual(route_calls[0][2], ("read_file",))
+        self.assertEqual(route_calls[1][2], ())
+        self.assertIn("delegate_to_research_agent", route_calls[2][2])
+        self.assertEqual(route_calls[3][2], ())
+
+    def test_explicit_reactive_models_bypass_route_hook(self):
+        main = self.main
+        route = Mock(side_effect=AssertionError("explicit model must bypass hook"))
+        selected_models = []
+        history = []
+
+        def fake_run(*_args, **kwargs):
+            selected_models.append(kwargs["model"])
+            return "answer"
+
+        with patch.object(main, "on_model_route", route), patch.object(
+            main, "run_with_tools", side_effect=fake_run
+        ), patch.object(main, "get_history", return_value=history), patch.object(
+            main, "store_memory"
+        ):
+            main.ask_ai(
+                "general", record_history=False, model="explicit-general",
+                include_memories=False,
+            )
+            main.ask_specialist(
+                "research", "specialist", record_history=False,
+                model="explicit-research", include_memories=False,
+            )
+            main.ask_manager("manager", model="explicit-manager")
+
+        route.assert_not_called()
+        self.assertEqual(selected_models, [
+            "explicit-general", "explicit-research", "explicit-manager",
+        ])
+
+    def test_reactive_asks_scope_and_restore_active_agent(self):
+        main = self.main
+        sink = {"active_agent": "outer-manager"}
+        active_agents = []
+        selected_models = []
+        history = []
+
+        def fake_run(*_args, **kwargs):
+            active_agents.append(sink.get("active_agent"))
+            selected_models.append(kwargs["model"])
+            return "answer"
+
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(main, "on_model_route", None), patch.object(
+                main, "run_with_tools", side_effect=fake_run
+            ), patch.object(main, "get_history", return_value=history), patch.object(
+                main, "store_memory"
+            ):
+                main.ask_ai(
+                    "general", record_history=False, include_memories=False
+                )
+                self.assertEqual(sink["active_agent"], "outer-manager")
+                main.ask_specialist(
+                    "research", "specialist", record_history=False,
+                    include_memories=False,
+                )
+                self.assertEqual(sink["active_agent"], "outer-manager")
+                main.ask_manager("manager")
+                self.assertEqual(sink["active_agent"], "outer-manager")
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(active_agents, ["general", "research", "manager"])
+        self.assertEqual(selected_models, [
+            main.GENERAL_MODEL,
+            main.SPECIALISTS["research"]["model"],
+            main.FAST_MODEL,
+        ])
+
+    def test_delegated_strict_execution_failures_propagate(self):
+        main = self.main
+        strict_errors = (
+            main.ExecutionBudgetExceededError,
+            main.ExecutionReservationStateError,
+            main.ExecutionDeadlineExceededError,
+        )
+        for error_type in strict_errors:
+            with self.subTest(error_type=error_type.__name__), patch.object(
+                main, "ask_specialist", side_effect=error_type("stop")
+            ), patch.object(main, "on_delegation", None):
+                with self.assertRaises(error_type):
+                    main.execute_tool(
+                        "delegate_to_research_agent", {"topic": "bounded research"}
+                    )
+
+    def test_generate_plan_uses_routed_model_and_manager_attribution(self):
+        main = self.main
+        sink = {"active_agent": "outer-agent"}
+        active_agents = []
+        selected_models = []
+
+        def fake_response(_messages, **kwargs):
+            active_agents.append(main.current_execution_sink().get("active_agent"))
+            selected_models.append(kwargs["model"])
+            return "ranked plan"
+
+        route = Mock(return_value="routed-planning-model")
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(main, "on_model_route", route), patch.object(
+                main, "get_ai_response", side_effect=fake_response
+            ), patch.object(main.projects, "get_project", return_value=None):
+                result = main.generate_plan(
+                    "brainstorm", "assistant", "improve onboarding"
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(result, "ranked plan")
+        route.assert_called_once()
+        self.assertEqual(route.call_args.args[0], "manager")
+        self.assertIn("Brainstorm request", route.call_args.args[1])
+        self.assertEqual(route.call_args.args[2], ())
+        self.assertEqual(selected_models, ["routed-planning-model"])
+        self.assertEqual(active_agents, ["manager"])
+        self.assertEqual(sink["active_agent"], "outer-agent")
+
+    def test_sprint_issue_specs_uses_routed_model_and_linear_attribution(self):
+        main = self.main
+        sink = {"active_agent": "outer-agent"}
+        active_agents = []
+        selected_models = []
+
+        def fake_response(_messages, **kwargs):
+            active_agents.append(main.current_execution_sink().get("active_agent"))
+            selected_models.append(kwargs["model"])
+            return (
+                "Harden routing :: Acceptance tests pass\n"
+                "Document controls :: Setup guide names the limits"
+            )
+
+        route = Mock(return_value="routed-linear-model")
+        main.set_execution_sink(sink)
+        try:
+            with patch.object(main, "on_model_route", route), patch.object(
+                main, "get_ai_response", side_effect=fake_response
+            ), patch.object(main.projects, "get_project", return_value=None):
+                specs = main.sprint_issue_specs(
+                    "assistant", "make Telegram routing budget-safe"
+                )
+        finally:
+            main.set_execution_sink(None)
+
+        self.assertEqual(specs, [
+            ("Harden routing", "Acceptance tests pass"),
+            ("Document controls", "Setup guide names the limits"),
+        ])
+        route.assert_called_once()
+        self.assertEqual(route.call_args.args[0], "linear")
+        self.assertIn("Sprint goal", route.call_args.args[1])
+        self.assertEqual(route.call_args.args[2], ())
+        self.assertEqual(selected_models, ["routed-linear-model"])
+        self.assertEqual(active_agents, ["linear"])
+        self.assertEqual(sink["active_agent"], "outer-agent")
+
     def test_company_execution_writes_file_directly_and_records_artifact(self):
         self.main.set_conversation("test:companywrite")
         sink = {"cost_usd": 0.0, "artifacts": [], "context": "Project p / task t"}

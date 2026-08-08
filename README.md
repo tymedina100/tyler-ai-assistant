@@ -347,10 +347,20 @@ a name never drifts between interfaces.
 
 ## Cost: catalog-backed model routing
 
-Reactive chat keeps two persona defaults: `PREMIUM_MODEL` for reasoning-heavy agents and
-`FAST_MODEL` for routing and routine connector work. Their defaults now come from
-[`config/model-catalog.json`](config/model-catalog.json); `OPENAI_PREMIUM_MODEL` and
-`OPENAI_FAST_MODEL` can override the reactive aliases.
+Reactive Telegram chat routes each ordinary Manager, specialist, general-assistant, and
+group-classifier call through the same catalog. Model-backed `/project` planning and
+`/linear from-sprint` commands use that path too; read-only slash commands do not reserve
+model budget. The decision is deterministic (there is
+no extra classification model call): task type, risk/complexity cues, available tools,
+estimated tokens, and the current reserved budget envelope choose Nano, Mini, or Sol.
+The classifier itself remains a lightweight routing task even when the message describes
+advanced work; the selected worker is routed independently. The enabled ladder uses
+GPT-5.4 Nano for classification, GPT-5.4 Mini for normal tool work, GPT-5.6 Luna after a
+cheaper standard model fails, GPT-5.6 Terra for advanced work that does not require the
+architecture/security tier, and GPT-5.6 Sol for those highest-capability routes. CLI and single-bot callers
+retain the two persona fallbacks, `PREMIUM_MODEL` and `FAST_MODEL`, when the Telegram hook
+is not installed. Their defaults come from [`config/model-catalog.json`](config/model-catalog.json);
+`OPENAI_PREMIUM_MODEL` and `OPENAI_FAST_MODEL` can override those fallback aliases.
 
 Autonomous roadmap work is routed per task instead. `model_router.py` considers task
 type, complexity, risk, required capabilities, context size, remaining budget, and prior
@@ -369,8 +379,8 @@ team communication, not open-ended bot roleplay.
 Catalog capability claims, context limits, model availability, and prices are
 **operator-maintained configuration snapshots**. Cost figures are routing estimates,
 not guaranteed current OpenAI prices or a substitute for provider billing. The enabled
-snapshot (GPT-5.4 nano, GPT-5.4 mini, and GPT-5.6 Sol) and source URLs were refreshed on
-2026-07-27; still verify the catalog against the models and prices available to your
+snapshot (GPT-5.4 Nano/Mini and GPT-5.6 Luna/Terra/Sol) and source URLs were refreshed on
+2026-08-08; still verify the catalog against the models and prices available to your
 account before enabling live autonomy. Reactive Company Mode metering uses a conservative
 unknown-model fallback rather than silently recording zero cost; strict autonomous calls
 fail closed when the selected model has no catalog price.
@@ -742,6 +752,8 @@ Use these canonical environment variables (the complete copy-ready block is in
 | `AUTONOMY_ROADMAP_FILE` | `config/autonomous-roadmap.json`; first-use seed |
 | `AUTONOMY_PROJECT_PACK_DIR` | `config/autonomous-projects`; repository-owned manifests that require owner confirmation before additive import |
 | `MODEL_CATALOG_FILE` | `config/model-catalog.json`; routing/pricing snapshot |
+| `REACTIVE_ROUTING_INPUT_TOKENS` | `3000`; conservative input-token floor for deterministic Telegram routing; longer prompts may raise it |
+| `REACTIVE_ROUTING_OUTPUT_TOKENS` | `800`; expected response size used for Telegram route admission and cost estimation |
 
 In the Telegram runtime, the persisted Company Mode ledger is the authoritative budget
 source for routing and reports, including spend and reservations from other work. Use
@@ -761,7 +773,9 @@ headroom still stops before generation. Network ambiguity and stale provider pri
 require an OpenAI project spending limit for an absolute invoice-level guarantee.
 
 OpenAI may separately offer complimentary daily tokens when an organization owner opts
-in to sharing API inputs and outputs. The offer is account- and project-specific, requires
+in to sharing API inputs and outputs. A dashboard banner that says the account is
+**eligible** does not by itself prove the API project is **enrolled**. The offer is
+account- and project-specific, requires
 a positive balance, resets at 00:00 UTC, and applies automatically only to eligible shared
 traffic. OpenAI explicitly excludes tool use, and a request that crosses the complimentary
 quota is billed in full. The autonomous budget therefore does **not** count that offer as
@@ -787,8 +801,14 @@ round. Ordinary, actionable review feedback remains eligible for a bounded revis
 `MAX_TASK_RESULT_CHARS` defaults to `5000` and bounds the smaller copy placed in the run
 report and Telegram delivery. Each setting also has a defensive hard maximum. Live worker/reviewer
 estimates and controlled idle ideation are reserved atomically
-before paid calls and then released or reconciled. `ADHOC_RESERVATION_USD` defaults to
-`0.10` when metered group work has no task-specific estimate. Concurrent reservations on
+before paid calls and then released or reconciled. Ordinary Telegram model calls use the
+same strict provider preflight: a routed request that cannot fit its hold stops before
+generation, and a routing-budget stop never falls through to a second paid Miles attempt.
+Reservation denials and admitted routing decisions are persisted as bounded, prompt-free
+structured records, including agent, selected model, estimate, status, and reason.
+`ADHOC_RESERVATION_USD` defaults to `0.10` when metered group work has no task-specific
+estimate. It is a temporary hold, not a guaranteed charge; measured usage replaces it at
+reconciliation. Concurrent reservations on
 one shared filesystem cannot each claim the same remaining dollars. If a metered caller
 is cancelled after its Python worker thread starts, the runner waits for that thread to
 finish before reconciling so provider spend cannot continue outside the ledger.
