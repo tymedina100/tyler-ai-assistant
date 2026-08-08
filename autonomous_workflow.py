@@ -2561,6 +2561,7 @@ class AutonomousWorkflow:
             "agents_involved": [],
             "models_selected": [],
             "model_selection_reasons": [],
+            "collaborations": [],
             "token_usage": {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             "estimated_cost_usd": 0.0,
             "actual_cost_usd": 0.0,
@@ -3024,6 +3025,15 @@ class AutonomousWorkflow:
             involved_agent = str(involved_agent)
             if involved_agent and involved_agent not in report["agents_involved"]:
                 report["agents_involved"].append(involved_agent)
+        for routing_reason in result.get("model_selection_reasons", []) or []:
+            routing_reason = str(routing_reason).strip()
+            if routing_reason and routing_reason not in report["model_selection_reasons"]:
+                report["model_selection_reasons"].append(routing_reason)
+        report["collaborations"] = [
+            dict(value)
+            for value in (result.get("collaborations", []) or [])
+            if isinstance(value, Mapping)
+        ][:30]
         state["budget_tracking"]["actual_or_reconciled_cost_usd"] = _money(spent_before + reconciled_cost)
         state["budget_tracking"]["cost_is_estimated"] = report["cost_is_estimated"]
         if self.budget_provider is None:
@@ -3420,6 +3430,7 @@ class AutonomousWorkflow:
             "agents_involved",
             "models_selected",
             "model_selection_reasons",
+            "collaborations",
             "review_outcomes",
             "blockers",
             "deferred",

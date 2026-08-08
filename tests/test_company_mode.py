@@ -864,6 +864,149 @@ class CompanyModeTests(unittest.TestCase):
         self.assertEqual(cost["cost_basis"], "estimated")
         self.assertEqual(cost["total_tokens"], 13)
 
+    def test_update_task_status_persists_bounded_team_help_evidence(self):
+        self._assign()
+        task_id = company_mode.load_state(self.state_path)["tasks"][0]["id"]
+        event = {
+            "requesting_agent": "code",
+            "helper_agent": "research",
+            "question": "Confirm the primary-source requirement.",
+            "reason": "The implementation depends on the policy source.",
+            "response": "Use the official policy and record its retrieval date.",
+            "helper_model": "gpt-5.4-nano",
+            "model_reason": "A lightweight source check needs only text retrieval.",
+            "task_type": "research",
+            "complexity": "lightweight",
+            "risk": "low",
+            "status": "completed",
+            "request_delivery": "direct",
+            "routing_delivery": "direct",
+            "response_delivery": "relayed_by_manager",
+            "created_at": "2026-08-08T12:00:00+00:00",
+            "completed_at": "2026-08-08T12:00:01+00:00",
+            "input_tokens": 21,
+            "output_tokens": 8,
+            "cost_usd": 0.0001234,
+        }
+
+        company_mode.update_task_status(
+            task_id,
+            "in_progress",
+            path=self.state_path,
+            model="gpt-5.4-mini",
+            model_reason="Standard implementation route.",
+            team_help_events=[event],
+        )
+        # A caller may replay its complete evidence snapshot at terminal update.
+        # Persist the exchange once rather than duplicating it.
+        company_mode.update_task_status(
+            task_id,
+            "done",
+            spent_usd=0.001,
+            path=self.state_path,
+            team_help_events=[event],
+        )
+
+        task = next(
+            value for value in company_mode.load_state(self.state_path)["tasks"]
+            if value["id"] == task_id
+        )
+        self.assertEqual(len(task["team_help_events"]), 1)
+        persisted = task["team_help_events"][0]
+        self.assertEqual(persisted["requesting_agent"], "code")
+        self.assertEqual(persisted["helper_agent"], "research")
+        self.assertEqual(persisted["helper_model"], "gpt-5.4-nano")
+        self.assertEqual(persisted["request_delivery"], "direct")
+        self.assertEqual(persisted["routing_delivery"], "direct")
+        self.assertEqual(persisted["response_delivery"], "relayed_by_manager")
+        self.assertEqual(
+            persisted["model_reason"],
+            "A lightweight source check needs only text retrieval.",
+        )
+        self.assertEqual(persisted["input_tokens"], 21)
+        self.assertEqual(persisted["output_tokens"], 8)
+        self.assertEqual(persisted["cost_usd"], 0.000123)
+        self.assertFalse(task["team_help_events_truncated"])
+        self.assertEqual(
+            task["attempt_history"][0]["model_reason"],
+            "Standard implementation route.",
+        )
+
+    def test_team_help_normalization_keeps_latest_three_and_bounds_all_text(self):
+        self._assign()
+        state = company_mode.load_state(self.state_path)
+        task = state["tasks"][0]
+        task["team_help_events"] = [
+            {
+                "requesting_agent": f"requester-{index}",
+                "helper_agent": "h" * (company_mode.MAX_TEAM_HELP_METADATA_CHARS + 20),
+                "question": "q" * (company_mode.MAX_TEAM_HELP_QUESTION_CHARS + 20),
+                "reason": "r" * (company_mode.MAX_TEAM_HELP_REASON_CHARS + 20),
+                "response": "a" * (company_mode.MAX_TEAM_HELP_RESPONSE_CHARS + 20),
+                "helper_model": "m" * (company_mode.MAX_TEAM_HELP_METADATA_CHARS + 20),
+                "model_reason": "d" * (
+                    company_mode.MAX_TEAM_HELP_MODEL_REASON_CHARS + 20
+                ),
+                "task_type": "research",
+                "complexity": "lightweight",
+                "risk": "low",
+                "status": "completed",
+                "created_at": "2026-08-08T12:00:00+00:00",
+                "completed_at": "2026-08-08T12:00:01+00:00",
+                "input_tokens": -2,
+                "output_tokens": "invalid",
+                "cost_usd": 0.001,
+                "unexpected_unbounded_field": "x" * 10000,
+            }
+            for index in range(5)
+        ]
+        company_mode.save_state(state, self.state_path)
+
+        persisted = company_mode.load_state(self.state_path)["tasks"][0]
+        events = persisted["team_help_events"]
+        self.assertEqual(
+            [event["requesting_agent"] for event in events],
+            ["requester-2", "requester-3", "requester-4"],
+        )
+        self.assertTrue(persisted["team_help_events_truncated"])
+        self.assertTrue(events[0]["question_truncated"])
+        self.assertTrue(events[0]["reason_truncated"])
+        self.assertTrue(events[0]["response_truncated"])
+        self.assertTrue(events[0]["model_reason_truncated"])
+        self.assertEqual(len(events[0]["question"]), company_mode.MAX_TEAM_HELP_QUESTION_CHARS)
+        self.assertEqual(len(events[0]["response"]), company_mode.MAX_TEAM_HELP_RESPONSE_CHARS)
+        self.assertEqual(
+            len(events[0]["helper_agent"]), company_mode.MAX_TEAM_HELP_METADATA_CHARS
+        )
+        self.assertEqual(events[0]["input_tokens"], 0)
+        self.assertEqual(events[0]["output_tokens"], 0)
+        self.assertNotIn("unexpected_unbounded_field", events[0])
+
+    def test_team_help_evidence_is_redacted_before_persistence(self):
+        self._assign()
+        task_id = company_mode.load_state(self.state_path)["tasks"][0]["id"]
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        company_mode.update_task_status(
+            task_id,
+            "done",
+            spent_usd=0.0,
+            path=self.state_path,
+            team_help_events=[{
+                "requesting_agent": "code",
+                "helper_agent": "research",
+                "question": f"Check GITHUB_TOKEN={secret}",
+                "response": f"Never expose {secret} in a report.",
+                "helper_model": "gpt-5.4-nano",
+                "model_reason": "Lightweight redaction check.",
+                "status": "completed",
+            }],
+        )
+
+        raw = self.state_path.read_text(encoding="utf-8")
+        self.assertNotIn("ghp_", raw)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", raw)
+        self.assertIn("[REDACTED]", raw)
+
     def test_failure_classifier_covers_actionable_categories(self):
         cases = {
             "API key is missing": "missing_access",
@@ -1017,7 +1160,11 @@ class CompanyModeTests(unittest.TestCase):
         hook.assert_not_called()
         revised = company_mode.project_tasks(company_mode.load_state(self.state_path), project_id)[-2:]
         self.assertEqual([task["estimate_usd"] for task in revised], [0.10, 0.12])
-        self.assertEqual([task["model"] for task in revised], ["small-model", "review-model"])
+        # A revision is new work after a rejected result.  Preserve its scope and
+        # estimate, but require a fresh runtime routing decision instead of silently
+        # inheriting the model that produced/reviewed the rejected candidate.
+        self.assertEqual([task["model"] for task in revised], ["", ""])
+        self.assertEqual([task["model_reason"] for task in revised], ["", ""])
         self.assertTrue(all(task["enforce_authorization"] for task in revised))
         self.assertTrue(all(task["acceptance_criteria"] == criteria for task in revised))
         self.assertTrue(all(task["revision_round"] == 1 for task in revised))

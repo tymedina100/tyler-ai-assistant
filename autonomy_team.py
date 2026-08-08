@@ -284,6 +284,32 @@ def aggregate_company_result(
         for usage in task.get("usage_records", []) or []
         if isinstance(usage, Mapping)
     ]
+    collaborations = [
+        {
+            key: event.get(key)
+            for key in (
+                "requesting_agent",
+                "helper_agent",
+                "question",
+                "reason",
+                "response",
+                "helper_model",
+                "model_reason",
+                "task_type",
+                "complexity",
+                "risk",
+                "status",
+                "created_at",
+                "completed_at",
+                "input_tokens",
+                "output_tokens",
+                "cost_usd",
+            )
+        }
+        for task in tasks
+        for event in task.get("team_help_events", []) or []
+        if isinstance(event, Mapping)
+    ]
     token_usage = {
         "input_tokens": sum(int(value.get("input_tokens", 0) or 0) for value in usage_records),
         "cached_input_tokens": sum(int(value.get("cached_input_tokens", 0) or 0) for value in usage_records),
@@ -320,11 +346,17 @@ def aggregate_company_result(
         for value in (
             [task.get("model") for task in tasks]
             + [usage.get("model") for usage in usage_records]
+            + [event.get("helper_model") for event in collaborations]
         )
         if str(value or "").strip()
     ))
     agents = list(dict.fromkeys(
-        str(task.get("owner")) for task in tasks if str(task.get("owner") or "").strip()
+        str(value)
+        for value in (
+            [task.get("owner") for task in tasks]
+            + [event.get("helper_agent") for event in collaborations]
+        )
+        if str(value or "").strip()
     ))
     by_task = {
         str(task.get("id")): _money(task.get("spent_usd", 0.0))
@@ -336,19 +368,47 @@ def aggregate_company_result(
     for task in tasks:
         amount = _money(task.get("spent_usd", 0.0))
         agent_name = str(task.get("owner") or "unrecorded")
-        by_agent[agent_name] = _money(by_agent.get(agent_name, 0.0) + amount)
         attributed = 0.0
         for usage in task.get("usage_records", []) or []:
             if not isinstance(usage, Mapping) or not usage.get("model"):
                 continue
             usage_cost = _money(usage.get("cost_usd", 0.0))
+            usage_agent = str(usage.get("agent") or agent_name)
+            by_agent[usage_agent] = _money(
+                by_agent.get(usage_agent, 0.0) + usage_cost
+            )
             model_name = str(usage["model"])
             by_model[model_name] = _money(by_model.get(model_name, 0.0) + usage_cost)
             attributed = _money(attributed + usage_cost)
         residual = _money(max(0.0, amount - attributed))
         if residual or not task.get("usage_records"):
+            by_agent[agent_name] = _money(by_agent.get(agent_name, 0.0) + residual)
+        if residual or not task.get("usage_records"):
             model_name = str(task.get("model") or "unrecorded")
             by_model[model_name] = _money(by_model.get(model_name, 0.0) + residual)
+    model_selection_reasons = []
+    for task in tasks:
+        owner_name = str(task.get("owner") or "unrecorded")
+        for attempt in task.get("attempt_history", []) or []:
+            if not isinstance(attempt, Mapping) or not attempt.get("model_reason"):
+                continue
+            model_selection_reasons.append(
+                f"{owner_name} / {attempt.get('model') or 'unrecorded'}: "
+                f"{attempt['model_reason']}"
+            )
+        if task.get("model_reason") and not task.get("attempt_history"):
+            model_selection_reasons.append(
+                f"{owner_name} / {task.get('model') or 'unrecorded'}: "
+                f"{task['model_reason']}"
+            )
+    for event in collaborations:
+        if event.get("model_reason"):
+            model_selection_reasons.append(
+                f"help {event.get('requesting_agent') or 'worker'} -> "
+                f"{event.get('helper_agent') or 'helper'} / "
+                f"{event.get('helper_model') or 'deferred'}: {event['model_reason']}"
+            )
+    model_selection_reasons = list(dict.fromkeys(model_selection_reasons))
     failure = workflow_failure(
         next(
             (task.get("failure_classification") for task in blocked if task.get("failure_classification")),
@@ -411,6 +471,8 @@ def aggregate_company_result(
         "model": fallback_model or (models[0] if models else None),
         "models": models,
         "agents": agents,
+        "collaborations": collaborations,
+        "model_selection_reasons": model_selection_reasons,
         "costs": {
             "by_project": {project_id: spent},
             "by_task": by_task,
