@@ -2405,6 +2405,238 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         )
         budget.assert_not_called()
 
+    async def test_prepare_campaign_fetches_prior_bluesky_metrics_before_claim(self):
+        prior_action = {
+            "id": "action-prior",
+            "run_id": "run-prior",
+            "action_type": "publish",
+            "target": "bluesky:company.example",
+            "status": "succeeded",
+            "provider_receipt": {
+                "uri": "at://did:plc:company/app.bsky.feed.post/1",
+                "cid": "cid-1",
+            },
+            "result": "Bluesky created uri=at://did:plc:company/post/1 cid=cid-1.",
+        }
+        sprint = {
+            "id": "sprint-1",
+            "status": "active",
+            "product": {"gumroad_url": "https://company.gumroad.com/l/kit"},
+            "action_journal": [prior_action, {
+                "id": "action-failed",
+                "action_type": "publish",
+                "target": "bluesky:company.example",
+                "status": "failed",
+            }],
+        }
+        item = {
+            "id": "CAMPAIGN-D02",
+            "revenue_sprint_id": "sprint-1",
+            "external_action": {"action_type": "publish"},
+        }
+        products = [{
+            "short_url": "https://company.gumroad.com/l/kit",
+            "published": True,
+        }]
+        engagement = [{"action_id": "action-prior", "like_count": 2}]
+        order = []
+
+        with patch.object(
+            self.group.company_mode, "load_state", return_value={"revenue_sprints": [sprint]}
+        ), patch.object(
+            self.group.company_mode, "active_revenue_sprint", return_value=sprint
+        ), patch.object(
+            self.group.gumroad_helpers, "list_products", return_value=(products, None)
+        ), patch.object(
+            self.group.revenue_actions,
+            "fetch_bluesky_engagement",
+            create=True,
+            side_effect=lambda actions: order.append(("fetch", actions)) or engagement,
+        ) as fetch, patch.object(
+            self.group.company_mode,
+            "claim_revenue_sprint_run",
+            side_effect=lambda *args, **kwargs: order.append(("claim", args[0])) or {"status": "claimed"},
+        ), patch.object(
+            self.group.company_mode,
+            "record_bluesky_engagement_snapshot",
+            create=True,
+            side_effect=lambda *args, **kwargs: order.append(("engagement", args[1], args[2])),
+        ) as record_engagement, patch.object(
+            self.group.company_mode,
+            "record_revenue_snapshot",
+            side_effect=lambda *args, **kwargs: order.append(("gumroad", args[1], args[2])),
+        ), patch.object(
+            self.group.company_mode,
+            "sync_revenue",
+            side_effect=lambda *args, **kwargs: order.append(("sync",)),
+        ):
+            await self.group._prepare_campaign_item(item, "run-current")
+
+        fetch.assert_called_once_with([prior_action])
+        record_engagement.assert_called_once_with(
+            engagement,
+            "before",
+            "run-current",
+            sprint_id="sprint-1",
+        )
+        self.assertEqual(
+            [event[0] for event in order],
+            ["fetch", "claim", "engagement", "gumroad", "sync"],
+        )
+
+    async def test_prepare_campaign_fetch_failure_consumes_no_run_day(self):
+        sprint = {
+            "id": "sprint-1",
+            "status": "active",
+            "product": {"gumroad_url": "https://company.gumroad.com/l/kit"},
+            "action_journal": [],
+        }
+        item = {"id": "D01", "revenue_sprint_id": "sprint-1"}
+        products = [{
+            "short_url": "https://company.gumroad.com/l/kit",
+            "published": True,
+        }]
+
+        with patch.object(
+            self.group.company_mode, "load_state", return_value={"revenue_sprints": [sprint]}
+        ), patch.object(
+            self.group.company_mode, "active_revenue_sprint", return_value=sprint
+        ), patch.object(
+            self.group.gumroad_helpers, "list_products", return_value=(products, None)
+        ), patch.object(
+            self.group.revenue_actions,
+            "fetch_bluesky_engagement",
+            create=True,
+            side_effect=RuntimeError("provider unavailable"),
+        ) as fetch, patch.object(
+            self.group.company_mode, "claim_revenue_sprint_run"
+        ) as claim:
+            with self.assertRaises(self.group.company_mode.RevenueSprintError) as caught:
+                await self.group._prepare_campaign_item(item, "run-1")
+
+        self.assertIn("no campaign day was consumed", str(caught.exception))
+        fetch.assert_called_once_with([])
+        claim.assert_not_called()
+
+    async def test_prepare_campaign_legacy_post_without_receipt_fails_before_claim(self):
+        sprint = {
+            "id": "sprint-1",
+            "status": "active",
+            "product": {"gumroad_url": "https://company.gumroad.com/l/kit"},
+            "action_journal": [{
+                "id": "legacy-action",
+                "run_id": "legacy-run",
+                "action_type": "publish",
+                "target": "bluesky:company.example",
+                "status": "succeeded",
+                "provider_receipt": {},
+            }],
+        }
+        products = [{
+            "short_url": "https://company.gumroad.com/l/kit",
+            "published": True,
+        }]
+
+        with patch.object(
+            self.group.company_mode, "load_state", return_value={"revenue_sprints": [sprint]}
+        ), patch.object(
+            self.group.company_mode, "active_revenue_sprint", return_value=sprint
+        ), patch.object(
+            self.group.gumroad_helpers, "list_products", return_value=(products, None)
+        ), patch.object(
+            self.group.revenue_actions.requests, "get"
+        ) as get, patch.object(
+            self.group.company_mode, "claim_revenue_sprint_run"
+        ) as claim:
+            with self.assertRaises(self.group.company_mode.RevenueSprintError) as caught:
+                await self.group._prepare_campaign_item(
+                    {"revenue_sprint_id": "sprint-1"}, "run-current"
+                )
+
+        self.assertIn("no campaign day was consumed", str(caught.exception))
+        get.assert_not_called()
+        claim.assert_not_called()
+
+    async def test_prepare_campaign_engagement_persistence_failure_stops_claimed_run(self):
+        sprint = {
+            "id": "sprint-1",
+            "status": "active",
+            "product": {"gumroad_url": "https://company.gumroad.com/l/kit"},
+            "action_journal": [],
+        }
+        item = {"id": "D01", "revenue_sprint_id": "sprint-1"}
+        products = [{
+            "short_url": "https://company.gumroad.com/l/kit",
+            "published": True,
+        }]
+        complete = Mock()
+        stop = Mock()
+
+        with patch.object(
+            self.group.company_mode, "load_state", return_value={"revenue_sprints": [sprint]}
+        ), patch.object(
+            self.group.company_mode, "active_revenue_sprint", return_value=sprint
+        ), patch.object(
+            self.group.gumroad_helpers, "list_products", return_value=(products, None)
+        ), patch.object(
+            self.group.revenue_actions,
+            "fetch_bluesky_engagement",
+            create=True,
+            return_value=[],
+        ), patch.object(
+            self.group.company_mode, "claim_revenue_sprint_run", return_value={"status": "claimed"}
+        ), patch.object(
+            self.group.company_mode,
+            "record_bluesky_engagement_snapshot",
+            create=True,
+            side_effect=OSError("disk unavailable"),
+        ), patch.object(
+            self.group.company_mode, "complete_revenue_sprint_run", complete
+        ), patch.object(
+            self.group.company_mode, "stop_revenue_sprint", stop
+        ), patch.object(
+            self.group.company_mode, "record_revenue_snapshot"
+        ) as revenue_snapshot:
+            with self.assertRaises(OSError):
+                await self.group._prepare_campaign_item(item, "run-1")
+
+        complete.assert_called_once_with(
+            "run-1",
+            "needs_human",
+            sprint_id="sprint-1",
+            progress=False,
+            result=(
+                "The required before-execution Bluesky engagement snapshot could not "
+                "be persisted."
+            ),
+        )
+        stop.assert_called_once_with(
+            sprint_id="sprint-1",
+            reason="before_bluesky_engagement_snapshot_failed",
+        )
+        revenue_snapshot.assert_not_called()
+
+    async def test_prepare_campaign_dry_run_does_not_fetch_engagement(self):
+        with patch.object(
+            self.group.revenue_actions,
+            "fetch_bluesky_engagement",
+            create=True,
+        ) as fetch, patch.object(
+            self.group.gumroad_helpers, "list_products"
+        ) as products, patch.object(
+            self.group.company_mode, "claim_revenue_sprint_run"
+        ) as claim:
+            result = await self.group._prepare_campaign_item(
+                {"revenue_sprint_id": "sprint-1"},
+                "run-1",
+                dry_run=True,
+            )
+
+        self.assertIsNone(result)
+        fetch.assert_not_called()
+        products.assert_not_called()
+        claim.assert_not_called()
+
     async def test_campaign_completion_derives_progress_from_commercial_evidence(self):
         target = "bluesky:company.example"
         payload_digest = "a" * 64
@@ -2421,10 +2653,15 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             "id": "sprint-1",
             "status": "active",
             "action_journal": [{
+                "id": "action-1",
                 "run_id": "run-1",
                 "action_type": "publish",
                 "target": target,
                 "status": "succeeded",
+                "provider_receipt": {
+                    "uri": "at://did:plc:company/app.bsky.feed.post/1",
+                    "cid": "cid-1",
+                },
                 "metadata": {"payload_digest": payload_digest},
             }],
         }
@@ -2445,6 +2682,7 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             "sales_usd_cents": 0,
             "published": True,
         }]
+        order = []
         complete = Mock(return_value={"status": "completed", "progress": False})
 
         with patch.object(
@@ -2454,9 +2692,123 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             self.group.company_mode, "active_revenue_sprint", return_value=sprint
         ), patch.object(
+            self.group.revenue_actions,
+            "fetch_bluesky_engagement",
+            create=True,
+            side_effect=lambda actions: order.append("engagement_fetch") or [{
+                "action_id": "action-1",
+                "like_count": 0,
+            }],
+        ), patch.object(
+            self.group.company_mode,
+            "record_bluesky_engagement_snapshot",
+            create=True,
+            side_effect=lambda *args, **kwargs: order.append("engagement_persist") or {
+                "phase": "after"
+            },
+        ), patch.object(
+            self.group.gumroad_helpers,
+            "list_products",
+            side_effect=lambda: order.append("gumroad_fetch") or (products, None),
+        ), patch.object(
+            self.group.company_mode,
+            "record_revenue_snapshot",
+            side_effect=lambda *args, **kwargs: order.append("gumroad_persist") or {
+                "sales_delta": 0
+            },
+        ), patch.object(
+            self.group.company_mode,
+            "sync_revenue",
+            side_effect=lambda *args, **kwargs: order.append("gumroad_sync"),
+        ), patch.object(
+            self.group.company_mode,
+            "complete_revenue_sprint_run",
+            side_effect=lambda *args, **kwargs: order.append("run_complete") or complete(
+                *args, **kwargs
+            ),
+        ):
+            returned = await self.group._complete_campaign_item(
+                item,
+                "run-1",
+                {"status": "completed", "result_text": "Provider receipt persisted."},
+            )
+
+        self.assertEqual(returned["status"], "completed")
+        complete.assert_called_once()
+        self.assertIsNone(complete.call_args.kwargs["progress"])
+        self.assertEqual(
+            order,
+            [
+                "engagement_fetch",
+                "engagement_persist",
+                "gumroad_fetch",
+                "gumroad_persist",
+                "gumroad_sync",
+                "run_complete",
+            ],
+        )
+
+    async def test_campaign_completion_engagement_fetch_failure_stops_without_republish(self):
+        target = "bluesky:company.example"
+        payload_digest = "a" * 64
+        action = {
+            "id": "action-current",
+            "run_id": "run-1",
+            "action_type": "publish",
+            "target": target,
+            "status": "succeeded",
+            "provider_receipt": {
+                "uri": "at://did:plc:company/app.bsky.feed.post/current",
+                "cid": "cid-current",
+            },
+            "metadata": {"payload_digest": payload_digest},
+        }
+        sprint = {"id": "sprint-1", "status": "active", "action_journal": [action]}
+        project = {
+            "campaign_id": "sprint-1",
+            "revenue_sprint_run_id": "run-1",
+            "approved_revenue_action": {
+                "payload_digest": payload_digest,
+                "action_type": "publish",
+                "target": target,
+                "policy_revision": "policy-1",
+            },
+        }
+        item = {
+            "revenue_sprint_id": "sprint-1",
+            "external_action": {
+                "action_type": "publish",
+                "target": target,
+                "policy_revision": "policy-1",
+            },
+        }
+        products = [{"short_url": "https://company.gumroad.com/l/kit", "published": True}]
+        stop = Mock()
+        complete = Mock(return_value={"status": "completed"})
+
+        with patch.object(
+            self.group.company_mode,
+            "load_state",
+            return_value={"revenue_sprints": [sprint], "projects": [project]},
+        ), patch.object(
+            self.group.company_mode, "active_revenue_sprint", return_value=sprint
+        ), patch.object(
+            self.group.revenue_actions,
+            "fetch_bluesky_engagement",
+            create=True,
+            side_effect=RuntimeError("read failed"),
+        ) as fetch, patch.object(
+            self.group.company_mode,
+            "record_bluesky_engagement_snapshot",
+            create=True,
+        ) as record_engagement, patch.object(
+            self.group.company_mode, "revenue_sprint_status", return_value={"active": True}
+        ), patch.object(
+            self.group.company_mode, "stop_revenue_sprint", stop
+        ), patch.object(
             self.group.gumroad_helpers, "list_products", return_value=(products, None)
         ), patch.object(
-            self.group.company_mode, "record_revenue_snapshot", return_value={"sales_delta": 0}
+            self.group.company_mode, "record_revenue_snapshot", return_value={}
         ), patch.object(
             self.group.company_mode, "sync_revenue", return_value=None
         ), patch.object(
@@ -2468,9 +2820,15 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
                 {"status": "completed", "result_text": "Provider receipt persisted."},
             )
 
-        self.assertEqual(returned["status"], "completed")
+        self.assertEqual(returned["status"], "needs_human")
+        self.assertIn("not retried", returned["reason"])
+        fetch.assert_called_once_with([action])
+        record_engagement.assert_not_called()
+        stop.assert_called_once_with(
+            sprint_id="sprint-1",
+            reason="after_bluesky_engagement_snapshot_failed",
+        )
         complete.assert_called_once()
-        self.assertIsNone(complete.call_args.kwargs["progress"])
 
     async def test_autonomous_worker_posts_assignment_then_reviewer_handoff(self):
         task = {

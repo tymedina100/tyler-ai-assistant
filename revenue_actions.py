@@ -121,6 +121,7 @@ class ProviderOutcome:
     result: str
     actual_purchase_usd: Optional[float] = None
     response_json: Optional[Mapping[str, Any]] = None
+    provider_receipt: Optional[Mapping[str, str]] = None
 
 
 _active_context: contextvars.ContextVar[Optional[CampaignActionContext]] = (
@@ -908,6 +909,7 @@ def _complete(
         sprint_id=context.campaign_id,
         actual_purchase_usd=outcome.actual_purchase_usd,
         result=result,
+        provider_receipt=outcome.provider_receipt,
     )
 
 
@@ -1267,14 +1269,34 @@ def publish_bluesky(
                 "uncertain",
                 "Bluesky accepted the request but returned no verifiable post receipt.",
             )
-        uri = _safe_receipt(posted.get("uri"))
-        cid = _safe_receipt(posted.get("cid"))
-        if not uri or not cid:
+        raw_uri = posted.get("uri")
+        raw_cid = posted.get("cid")
+        uri_prefix = f"at://{did}/app.bsky.feed.post/"
+        receipt_is_exact = (
+            isinstance(raw_uri, str)
+            and isinstance(raw_cid, str)
+            and raw_uri.startswith(uri_prefix)
+            and bool(raw_uri[len(uri_prefix):])
+            and bool(raw_cid)
+            and "/" not in raw_uri[len(uri_prefix):]
+            and "?" not in raw_uri[len(uri_prefix):]
+            and "#" not in raw_uri[len(uri_prefix):]
+            and _safe_receipt(raw_uri) == raw_uri
+            and _safe_receipt(raw_cid) == raw_cid
+        )
+        if not receipt_is_exact:
             return ProviderOutcome(
                 "uncertain",
-                "Bluesky accepted the request but returned an incomplete post receipt.",
+                "Bluesky accepted the request but returned a post receipt that did "
+                "not match the authenticated company repository and feed collection.",
             )
-        return ProviderOutcome("succeeded", f"Bluesky created uri={uri} cid={cid}.")
+        uri = raw_uri
+        cid = raw_cid
+        return ProviderOutcome(
+            "succeeded",
+            f"Bluesky created uri={uri} cid={cid}.",
+            provider_receipt={"uri": uri, "cid": cid},
+        )
 
     return _execute(
         PUBLISH_ACTION,
@@ -1283,6 +1305,150 @@ def publish_bluesky(
         provider_call,
         dry_run=dry_run,
     )
+
+
+def fetch_bluesky_engagement(actions: Any) -> list[dict[str, Any]]:
+    """Fetch public engagement counts for exact persisted Bluesky receipts.
+
+    This read-only adapter accepts only successful Bluesky journal actions and
+    matches every public response back to both its URI and CID.  It deliberately
+    uses the public endpoint without credentials and fails closed on any partial,
+    duplicated, malformed, or identity-mismatched response.
+    """
+
+    if isinstance(actions, (str, bytes, bytearray, Mapping)):
+        raise RevenueActionDenied(
+            "Bluesky engagement actions must be a bounded iterable of action mappings."
+        )
+    try:
+        iterator = iter(actions)
+    except TypeError as exc:
+        raise RevenueActionDenied(
+            "Bluesky engagement actions must be a bounded iterable of action mappings."
+        ) from exc
+
+    requested: list[dict[str, str]] = []
+    action_ids: set[str] = set()
+    uris: set[str] = set()
+    for raw in iterator:
+        if len(requested) >= 20:
+            raise RevenueActionDenied(
+                "Bluesky engagement fetches are limited to 20 actions."
+            )
+        if not isinstance(raw, Mapping):
+            raise RevenueActionDenied(
+                "Every Bluesky engagement action must be a mapping."
+            )
+        receipt = raw.get("provider_receipt")
+        action_id = raw.get("id")
+        uri = receipt.get("uri") if isinstance(receipt, Mapping) else None
+        cid = receipt.get("cid") if isinstance(receipt, Mapping) else None
+        if (
+            raw.get("status") != "succeeded"
+            or raw.get("action_type") != PUBLISH_ACTION
+            or not isinstance(raw.get("target"), str)
+            or not raw["target"].startswith("bluesky:")
+            or not isinstance(action_id, str)
+            or not isinstance(uri, str)
+            or not isinstance(cid, str)
+            or not action_id
+            or not uri.startswith("at://")
+            or not cid
+            or _safe_receipt(action_id) != action_id
+            or _safe_receipt(uri) != uri
+            or _safe_receipt(cid) != cid
+        ):
+            raise RevenueActionDenied(
+                "Each engagement lookup requires one successful Bluesky action with an exact URI/CID receipt."
+            )
+        if action_id in action_ids or uri in uris:
+            raise RevenueActionDenied(
+                "Bluesky engagement actions must have unique action IDs and post URIs."
+            )
+        action_ids.add(action_id)
+        uris.add(uri)
+        requested.append({"action_id": action_id, "uri": uri, "cid": cid})
+
+    if not requested:
+        return []
+
+    try:
+        response = requests.get(
+            "https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts",
+            params=[("uris", entry["uri"]) for entry in requested],
+            timeout=20,
+            allow_redirects=False,
+            stream=True,
+        )
+    except Exception as exc:
+        raise RevenueActionDenied(
+            f"Bluesky engagement request failed ({type(exc).__name__})."
+        ) from None
+
+    try:
+        try:
+            status_code = int(response.status_code)
+        except (TypeError, ValueError) as exc:
+            raise RevenueActionDenied(
+                "Bluesky engagement response had an invalid HTTP status."
+            ) from exc
+        if not 200 <= status_code < 300:
+            raise RevenueActionDenied(
+                f"Bluesky engagement request failed with HTTP {status_code}."
+            )
+        payload = _bounded_response_json(response)
+    finally:
+        _close_response(response)
+
+    posts = payload.get("posts") if isinstance(payload, Mapping) else None
+    if not isinstance(posts, list) or len(posts) != len(requested):
+        raise RevenueActionDenied(
+            "Bluesky engagement response did not contain one exact post per requested URI."
+        )
+
+    expected_by_uri = {entry["uri"]: entry for entry in requested}
+    returned_by_uri: dict[str, dict[str, Any]] = {}
+    count_fields = {
+        "like_count": "likeCount",
+        "reply_count": "replyCount",
+        "repost_count": "repostCount",
+        "quote_count": "quoteCount",
+    }
+    for post in posts:
+        if not isinstance(post, Mapping):
+            raise RevenueActionDenied("Bluesky engagement response contains a malformed post.")
+        uri = post.get("uri")
+        cid = post.get("cid")
+        if (
+            not isinstance(uri, str)
+            or not isinstance(cid, str)
+            or uri not in expected_by_uri
+            or uri in returned_by_uri
+            or cid != expected_by_uri[uri]["cid"]
+        ):
+            raise RevenueActionDenied(
+                "Bluesky engagement response did not match the requested URI/CID receipts."
+            )
+        normalized_counts: dict[str, int] = {}
+        for output_name, provider_name in count_fields.items():
+            value = post.get(provider_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RevenueActionDenied(
+                    "Bluesky engagement response contains an invalid count."
+                )
+            normalized_counts[output_name] = value
+        returned_by_uri[uri] = {
+            "action_id": expected_by_uri[uri]["action_id"],
+            "uri": uri,
+            "cid": cid,
+            **normalized_counts,
+        }
+
+    if set(returned_by_uri) != set(expected_by_uri):
+        raise RevenueActionDenied(
+            "Bluesky engagement response omitted a requested post."
+        )
+    return [returned_by_uri[entry["uri"]] for entry in requested]
 
 
 def _webhook_provider(
@@ -1403,6 +1569,7 @@ __all__ = [
     "current_campaign_action_context",
     "deploy_vercel",
     "execute_approved_campaign_draft",
+    "fetch_bluesky_engagement",
     "parse_campaign_draft",
     "publish_bluesky",
     "publish_webhook",

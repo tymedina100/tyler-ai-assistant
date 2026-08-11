@@ -26,8 +26,10 @@ READ_ONLY_TOOLS = frozenset({
     "railway_get_project",
     "railway_list_vars",
     "railway_deploy_status",
-    "github_list_files",
-    "github_read_file",
+    # Autonomous roadmap work is always scoped to a registered project repo.
+    # Do not expose the separate GITHUB_REPO file mirror here: giving a worker
+    # both namespaces lets it inspect an unrelated `patch-files` repo instead
+    # of the project selected by begin_scoped_project().
     "code_list_files",
     "code_read_file",
     "code_read_pr",

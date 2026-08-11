@@ -700,8 +700,12 @@ unconditional day-20 stop. Account registration remains a one-time provider boot
 because signup may require terms acceptance and anti-abuse verification; after the company
 account and app password exist, the confirmed exact-target publish action may run
 unattended. Each day is draft first, Vera review/revision second, and deterministic
-publication of only the approved payload last. See [docs/revenue-sprint.md](docs/revenue-sprint.md) for the Railway variables,
-activation commands, safety boundary, and test procedure.
+publication of only the approved payload last. The coordinator also reads public Bluesky
+like, reply, repost, and quote counts for exact persisted URI/CID receipts before and after
+live execution. Only increases above each post's persisted high-water counts become day-5 interest evidence; a publish
+receipt alone is not progress, and day 15 still requires a Gumroad sale or an explicitly
+supported strong-intent signal. See [docs/revenue-sprint.md](docs/revenue-sprint.md) for the
+Railway variables, activation commands, safety boundary, and test procedure.
 
 When a run reaches `needs_human` or `blocked`, resolve the stated access problem or
 owner decision first. A `deferred` item can also be reset after you increase the available

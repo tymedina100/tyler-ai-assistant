@@ -24,6 +24,7 @@ class FakeResponse:
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
         self._payload = payload
+        self.closed = False
         self.content = (
             json.dumps(payload).encode("utf-8") if payload is not None else b""
         )
@@ -32,6 +33,9 @@ class FakeResponse:
         if self._payload is None:
             raise ValueError("no JSON")
         return self._payload
+
+    def close(self):
+        self.closed = True
 
 
 def capability(action_type, target, *, amount=0.0, allowed=True):
@@ -251,6 +255,238 @@ class RevenueActionsTests(unittest.TestCase):
         persisted_result = completion.kwargs["result"]
         self.assertIn("at://did:plc:company", persisted_result)
         self.assertNotIn("session-secret-token", persisted_result)
+        self.assertEqual(
+            completion.kwargs["provider_receipt"],
+            {
+                "uri": "at://did:plc:company/app.bsky.feed.post/abc",
+                "cid": "bafy-post-cid",
+            },
+        )
+
+    def test_bluesky_publish_rejects_receipt_from_wrong_repository_or_collection(self):
+        target = "bluesky:company.example"
+        cap = capability("publish", target)
+        self.live_capability.return_value = cap
+        text = "A bounded company update"
+        approved_payload = {
+            "action_type": "publish",
+            "target": target,
+            "text": text,
+            "url": "",
+        }
+        approved_digest = hashlib.sha256(
+            json.dumps(
+                approved_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        session_payload = {
+            "handle": "company.example",
+            "did": "did:plc:company",
+            "accessJwt": "session-secret-token",
+        }
+        bad_receipts = (
+            ("at://did:plc:other/app.bsky.feed.post/abc", "bafy-post-cid"),
+            ("at://did:plc:company/app.bsky.feed.like/abc", "bafy-post-cid"),
+            ("at://did:plc:company/app.bsky.feed.post/", "bafy-post-cid"),
+            ("at://did:plc:company/app.bsky.feed.post/abc", ""),
+            (
+                "at://did:plc:company/app.bsky.feed.post/abc",
+                "token=provider-controlled-secret-value",
+            ),
+        )
+        env = {
+            "REVENUE_BLUESKY_HANDLE": "company.example",
+            "REVENUE_BLUESKY_APP_PASSWORD": "app-password-secret",
+        }
+
+        with self.configure_target(
+            "publish", target, account_id="company.example"
+        ), patch.dict(os.environ, env, clear=False):
+            for bad_uri, bad_cid in bad_receipts:
+                with self.subTest(uri=bad_uri, cid=bad_cid), patch.object(
+                    revenue_actions.requests,
+                    "post",
+                    side_effect=[
+                        FakeResponse(200, session_payload),
+                        FakeResponse(200, {"uri": bad_uri, "cid": bad_cid}),
+                    ],
+                ), self.active(cap, approved_payload_digest=approved_digest):
+                    result = revenue_actions.publish_bluesky(target, text)
+
+                self.assertIn("uncertain", result)
+                completion = self.complete.call_args
+                self.assertEqual(completion.args[1], "uncertain")
+                self.assertIsNone(completion.kwargs["provider_receipt"])
+                self.claim.reset_mock()
+                self.complete.reset_mock()
+
+    @staticmethod
+    def bluesky_action(index=1, *, status="succeeded", uri=None, cid=None):
+        return {
+            "id": f"action-{index}",
+            "status": status,
+            "action_type": "publish",
+            "target": "bluesky:company.example",
+            "provider_receipt": {
+                "uri": uri or f"at://did:plc:company/app.bsky.feed.post/{index}",
+                "cid": cid or f"bafy-cid-{index}",
+            },
+        }
+
+    def test_bluesky_engagement_empty_input_makes_no_network_request(self):
+        with patch.object(revenue_actions.requests, "get") as get:
+            result = revenue_actions.fetch_bluesky_engagement([])
+
+        self.assertEqual(result, [])
+        get.assert_not_called()
+
+    def test_bluesky_engagement_matches_exact_receipts_and_preserves_input_order(self):
+        first = self.bluesky_action(1)
+        second = self.bluesky_action(2)
+        response = FakeResponse(200, {"posts": [
+            {
+                "uri": second["provider_receipt"]["uri"],
+                "cid": second["provider_receipt"]["cid"],
+                "likeCount": 5,
+                "replyCount": 2,
+                "repostCount": 3,
+                "quoteCount": 1,
+            },
+            {
+                "uri": first["provider_receipt"]["uri"],
+                "cid": first["provider_receipt"]["cid"],
+                "likeCount": 1,
+                "replyCount": 0,
+                "repostCount": 2,
+                "quoteCount": 0,
+            },
+        ]})
+
+        with patch.object(
+            revenue_actions.requests, "get", return_value=response
+        ) as get:
+            result = revenue_actions.fetch_bluesky_engagement([first, second])
+
+        self.assertEqual(result, [
+            {
+                "action_id": "action-1",
+                "uri": first["provider_receipt"]["uri"],
+                "cid": first["provider_receipt"]["cid"],
+                "like_count": 1,
+                "reply_count": 0,
+                "repost_count": 2,
+                "quote_count": 0,
+            },
+            {
+                "action_id": "action-2",
+                "uri": second["provider_receipt"]["uri"],
+                "cid": second["provider_receipt"]["cid"],
+                "like_count": 5,
+                "reply_count": 2,
+                "repost_count": 3,
+                "quote_count": 1,
+            },
+        ])
+        get.assert_called_once_with(
+            "https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts",
+            params=[
+                ("uris", first["provider_receipt"]["uri"]),
+                ("uris", second["provider_receipt"]["uri"]),
+            ],
+            timeout=20,
+            allow_redirects=False,
+            stream=True,
+        )
+        self.assertTrue(response.closed)
+
+    def test_bluesky_engagement_rejects_invalid_actions_before_network(self):
+        invalid = [
+            [self.bluesky_action(1, status="failed")],
+            [{**self.bluesky_action(1), "action_type": "outreach"}],
+            [{**self.bluesky_action(1), "target": "web:company-site"}],
+            [{**self.bluesky_action(1), "provider_receipt": {"uri": "at://post"}}],
+            [self.bluesky_action(1), self.bluesky_action(2, uri=self.bluesky_action(1)["provider_receipt"]["uri"])],
+            [self.bluesky_action(index) for index in range(1, 22)],
+        ]
+
+        with patch.object(revenue_actions.requests, "get") as get:
+            for actions in invalid:
+                with self.subTest(actions=actions):
+                    with self.assertRaises(revenue_actions.RevenueActionDenied):
+                        revenue_actions.fetch_bluesky_engagement(actions)
+
+        get.assert_not_called()
+
+    def test_bluesky_engagement_fails_closed_on_provider_response_anomalies(self):
+        first = self.bluesky_action(1)
+        second = self.bluesky_action(2)
+        valid_first = {
+            "uri": first["provider_receipt"]["uri"],
+            "cid": first["provider_receipt"]["cid"],
+            "likeCount": 1,
+            "replyCount": 0,
+            "repostCount": 0,
+            "quoteCount": 0,
+        }
+        cases = [
+            ([first], FakeResponse(503, {"error": "unavailable"})),
+            ([first], FakeResponse(200, [valid_first])),
+            ([first], FakeResponse(200, {"posts": []})),
+            (
+                [first, second],
+                FakeResponse(200, {"posts": [valid_first, dict(valid_first)]}),
+            ),
+            (
+                [first],
+                FakeResponse(200, {"posts": [{**valid_first, "cid": "wrong-cid"}]}),
+            ),
+            (
+                [first],
+                FakeResponse(200, {"posts": [{**valid_first, "likeCount": True}]}),
+            ),
+            (
+                [first],
+                FakeResponse(200, {"posts": [{**valid_first, "replyCount": -1}]}),
+            ),
+            (
+                [first],
+                FakeResponse(200, {"posts": [{
+                    key: value for key, value in valid_first.items()
+                    if key != "quoteCount"
+                }]}),
+            ),
+        ]
+
+        for actions, response in cases:
+            with self.subTest(payload=response._payload):
+                with patch.object(
+                    revenue_actions.requests, "get", return_value=response
+                ):
+                    with self.assertRaises(revenue_actions.RevenueActionDenied):
+                        revenue_actions.fetch_bluesky_engagement(actions)
+                self.assertTrue(response.closed)
+
+    def test_bluesky_engagement_network_failure_redacts_exception_and_logs_nothing(self):
+        secret = "token=provider-secret-value"
+        with patch.object(
+            revenue_actions.requests,
+            "get",
+            side_effect=RuntimeError(secret),
+        ), patch.object(
+            revenue_actions.logger, "warning"
+        ) as warning, patch.object(
+            revenue_actions.logger, "error"
+        ) as error:
+            with self.assertRaises(revenue_actions.RevenueActionDenied) as caught:
+                revenue_actions.fetch_bluesky_engagement([self.bluesky_action(1)])
+
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn("provider-secret-value", str(caught.exception))
+        warning.assert_not_called()
+        error.assert_not_called()
 
     def test_bluesky_never_falls_back_to_unmapped_or_personal_account(self):
         target = "bluesky:company.example"
