@@ -79,6 +79,20 @@ Ordinary work auto-executes only `observe` and `propose`. The existing `run_pyth
 14. After roadmap work is exhausted and the session has no unresolved blocked task, Lumen may run one controlled batch containing at most the configured number of deduplicated ideas. A blocker suppresses ideation so proposals cannot mask an owner action. Ideas remain `proposed` backlog records and are never executed automatically. The owner may stage `/autorun promote <idea-id>`; the read-only preview deterministically creates explicit acceptance criteria and requires `/confirm`. Confirmation revalidates the full proposal and destination under the run/state locks, then atomically creates one `ready`, `propose` roadmap item and records bidirectional provenance. It never starts execution in the promotion turn.
 15. The coordinator releases the lock after projecting real team transitions into short conversational Telegram messages and sends one aggregate Miles recap summarizing selected work, outcomes, cost, owner actions, and proposed ideas. Complete routes, attempts, results, blockers, and escalation evidence remain in the persisted run record. Trigger, outcome, and owner-attention facts appear in natural wording derived from that state without another model call. A successful worker/reviewer path is assignment, optional focused help, ready-for-review, Vera's decision, and one recap; it does not repost the approved deliverable while team chat is enabled.
 
+For the owner-confirmed Bluesky Revenue Sprint, the coordinator performs an additional
+read-only evidence cycle around live execution. It verifies the exact Gumroad product
+and fetches public metrics for prior successful URI/CID receipts before claiming the
+day; after the claim it persists that result as the run's `before` snapshot. After one
+review-bound post has a verified receipt, it fetches all successful post metrics again
+and persists the `after` snapshot. Only like, reply, repost, and quote increases above
+each post's persisted high-water counts become day-5 interest signals. A receipt alone
+is not progress, and those social counts
+are not day-15 strong intent; day 15 still requires a sale or a separately supported
+strong-intent signal. A preflight read failure consumes no day. A post-publish evidence
+failure stops and escalates without retrying the already-verified publish; a failed
+`before` snapshot write after claim also stops before model or publish execution.
+Dry-run mode does not enter this network path.
+
 ## Budget design
 
 Company Mode remains the source of truth for daily spend. Its JSON mutations become file-locked transactions with atomic replacement and corruption quarantine.
@@ -143,6 +157,7 @@ bot-to-bot loop.
 ## Safety boundaries
 
 - Dry-run may write only local run/audit state; it performs no model call, connector call, code change, deploy, publish, delete, send, or production mutation.
+- Enforced autonomous project tasks expose only the `code_*` read tools bound to the selected `projects.json` repository. The separate `GITHUB_REPO` file mirror is not available to those workers, preventing an assistant-code audit from silently reading an unrelated `patch-files` repository.
 - External actions remain human-gated unless an active Revenue Sprint contains an owner-confirmed, revision-bound grant for the exact action, company-owned account, target, daily/total cap, and claimed run. Provider registration and anti-abuse verification remain a one-time human bootstrap; the runtime never generates accounts or falls back to a personal identity.
 - Autonomous/Company persistence and autonomous outbound text apply key/value and embedded-value redaction. Secret references may appear in blockers, but secret values must never be placed in roadmap state.
 - Telegram startup evaluates the expected Manager + every specialist + General roster with bounded, secret-free API retries. Missing tokens, privacy-enabled bots, bots outside the group, and temporarily unavailable membership checks are reported distinctly. Invalid or reused configured identities always stop before polling; `TELEGRAM_REQUIRE_COMPLETE_ROSTER=true` additionally makes every incomplete roster state a startup block after the owner installs all identities.
@@ -150,7 +165,7 @@ bot-to-bot loop.
 - Corrupt state is quarantined and causes a conservative blocked run; it never silently grants a fresh budget.
 - Idea promotion is fail-closed: an unknown/duplicate/changed proposal, ambiguous or inactive project, active run, roadmap-ID collision, or failed atomic write creates no roadmap work. A successful repeat confirmation is an idempotent no-op.
 - Roadmap-pack import is fail-closed and additive: unsupported schema fields, changed revisions, inactive or ambiguous projects, ID collisions, bad/cyclic dependencies, active runs, non-campaign authorization above `propose`, partial prior imports, or write failures leave the primary state unchanged. Revenue Sprint items must be exact revision-bound `external_action` entries from the same validated manifest. A receipt binds successful repeats to the same intact goal/items.
-- Revenue Sprint import is additionally bound to one existing linked product, one company-owned channel, exact external-action targets, separate campaign/daily budgets, before/after revenue evidence, and checkpoint/stop rules. Action claims are idempotent and are persisted before provider I/O; an uncertain provider outcome is never retried blindly.
+- Revenue Sprint import is additionally bound to one existing linked product, one company-owned channel, exact external-action targets, separate campaign/daily budgets, before/after revenue evidence, and checkpoint/stop rules. Public Bluesky evidence is accepted only for exact successful URI/CID receipts; only increases above persisted high-water counts produce signals, and ordinary social engagement is limited to the day-5 checkpoint. Action claims are idempotent and are persisted before mutation provider I/O; an uncertain provider outcome or already-verified publish is never retried blindly.
 
 ## Implementation footprint
 
@@ -180,5 +195,5 @@ bot-to-bot loop.
 - A run-history task's transient execution context includes only an allowlisted snapshot from up to five prior runs, with global metadata distinguished from current-project task details; it excludes full narratives, private outputs, arbitrary files, unrelated-project task text, and milestones.
 - The task deadline bounds strict provider I/O and prevents retry, but is not a kill signal for arbitrary Python threads; the runner joins them to preserve accounting.
 - Automatic local modification is disabled until work can run in a killable, isolated checkout without remote side effects.
-- Live Telegram, OpenAI billing reconciliation, Docker, Railway volume behavior, Gumroad snapshots, Bluesky authentication/publishing, and scheduled campaign execution require post-merge smoke tests with real credentials.
+- Live Telegram, OpenAI billing reconciliation, Docker, Railway volume behavior, Gumroad snapshots, Bluesky authentication/publishing, public engagement reads, and scheduled campaign execution require post-merge smoke tests with real credentials.
 - Model prices and availability remain operator-maintained configuration; enabled GPT-5.4 Nano/Mini and GPT-5.6 Luna/Terra/Sol prices/source URLs were refreshed from official OpenAI model pages on 2026-08-08.

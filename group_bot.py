@@ -2514,11 +2514,24 @@ def _campaign_experiment(item, sprint=None):
     }
 
 
-async def _claim_campaign_item(item, run_id):
-    """Perform every read-only preflight before consuming one campaign run-day."""
+def _succeeded_bluesky_actions(sprint):
+    """Return the exact persisted Bluesky receipts eligible for metric reads."""
+
+    return [
+        dict(entry)
+        for entry in (sprint or {}).get("action_journal", []) or []
+        if isinstance(entry, dict)
+        and entry.get("status") == "succeeded"
+        and entry.get("action_type") == "publish"
+        and str(entry.get("target") or "").startswith("bluesky:")
+    ]
+
+
+async def _prepare_campaign_item(item, run_id, *, dry_run=False):
+    """Persist pre-action evidence only after every read-only preflight succeeds."""
 
     campaign_id = str(item.get("revenue_sprint_id") or "").strip()
-    if not campaign_id:
+    if not campaign_id or dry_run:
         return None
     state = await asyncio.to_thread(company_mode.load_state)
     sprint = company_mode.active_revenue_sprint(state, campaign_id)
@@ -2541,12 +2554,47 @@ async def _claim_campaign_item(item, run_id):
         raise company_mode.RevenueSprintError(
             "The approved Gumroad product is missing or unpublished; no campaign day was consumed."
         )
+    try:
+        engagement = await asyncio.to_thread(
+            revenue_actions.fetch_bluesky_engagement,
+            _succeeded_bluesky_actions(sprint),
+        )
+    except Exception as exc:
+        raise company_mode.RevenueSprintError(
+            "Live Bluesky engagement verification is unavailable; no campaign day was consumed."
+        ) from exc
     claim = await asyncio.to_thread(
         company_mode.claim_revenue_sprint_run,
         run_id,
         _campaign_experiment(item, sprint),
         sprint_id=campaign_id,
     )
+    try:
+        await asyncio.to_thread(
+            company_mode.record_bluesky_engagement_snapshot,
+            engagement,
+            "before",
+            run_id,
+            sprint_id=campaign_id,
+        )
+    except Exception:
+        await asyncio.to_thread(
+            company_mode.complete_revenue_sprint_run,
+            run_id,
+            "needs_human",
+            sprint_id=campaign_id,
+            progress=False,
+            result=(
+                "The required before-execution Bluesky engagement snapshot could not "
+                "be persisted."
+            ),
+        )
+        await asyncio.to_thread(
+            company_mode.stop_revenue_sprint,
+            sprint_id=campaign_id,
+            reason="before_bluesky_engagement_snapshot_failed",
+        )
+        raise
     try:
         await asyncio.to_thread(
             company_mode.record_revenue_snapshot,
@@ -2631,6 +2679,44 @@ async def _complete_campaign_item(item, run_id, result):
                 sprint_id=campaign_id,
                 reason="external_action_not_verified",
             )
+    else:
+        try:
+            engagement = await asyncio.to_thread(
+                revenue_actions.fetch_bluesky_engagement,
+                _succeeded_bluesky_actions(sprint),
+            )
+            await asyncio.to_thread(
+                company_mode.record_bluesky_engagement_snapshot,
+                engagement,
+                "after",
+                run_id,
+                sprint_id=campaign_id,
+            )
+        except Exception:
+            result = {
+                **dict(result or {}),
+                "status": "needs_human",
+                "failure_classification": "missing_access",
+                "reason": (
+                    "The required after-execution Bluesky engagement snapshot could "
+                    "not be fetched and persisted. The verified publish receipt was "
+                    "not retried."
+                ),
+                "human_action": (
+                    "Verify Bluesky public API availability and the persisted company "
+                    "post URI/CID, then queue a new owner-confirmed sprint revision."
+                ),
+            }
+            current = await asyncio.to_thread(
+                company_mode.revenue_sprint_status,
+                sprint_id=campaign_id,
+            )
+            if current.get("active"):
+                await asyncio.to_thread(
+                    company_mode.stop_revenue_sprint,
+                    sprint_id=campaign_id,
+                    reason="after_bluesky_engagement_snapshot_failed",
+                )
     products, error = await asyncio.to_thread(gumroad_helpers.list_products)
     if error:
         result = {
@@ -4316,7 +4402,7 @@ async def _execute_autonomy_item(project, item, decision, run_id):
     try:
         if campaign_id:
             try:
-                await _claim_campaign_item(item, run_id)
+                await _prepare_campaign_item(item, run_id)
                 campaign_claimed = True
             except company_mode.RevenueSprintError as exc:
                 return {

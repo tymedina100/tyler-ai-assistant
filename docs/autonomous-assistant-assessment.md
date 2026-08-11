@@ -34,7 +34,21 @@ The current working tree extends the autonomous control plane with one deliberat
 
 Campaign execution now follows draft, review, and deterministic publish stages. The worker receives propose-level authority and returns a strict campaign-draft envelope; Vera reviews that exact candidate with bounded revisions; the coordinator may publish only after atomically matching the active campaign/run/project, action target and policy revision, worker and reviewer records, final verdict, and exact approved payload digest. Model workers never receive the provider mutation tool. Revision reservations remain attributed to the campaign and must fit both the ordinary daily budget and campaign budget. A successful provider receipt is action evidence, not commercial progress, so it cannot reset the no-progress counter without a persisted sale or supported engagement signal.
 
-Activation remains a two-step owner action. Queueing previews and imports the manifest; confirmation performs read-only product/account preflight and activates the policy, but makes no OpenAI call and publishes nothing. If Railway restarts after import but before activation, re-queueing the same intact pack safely stages activation only. The 2026-08-11 full offline suite passed 537 tests with paid and provider calls mocked; the modified Python modules also passed bytecode compilation and the diff passed whitespace validation. Live Gumroad identity, Bluesky authentication/publishing, Telegram delivery, Railway-volume persistence, and the scheduled 08:00 execution remain unverified until a credentialed production smoke test is deliberately run.
+The 2026-08-11 scheduled production-readiness audit also exposed an ambiguous read-tool boundary: Patch selected the generic `GITHUB_REPO` file mirror (`patch-files`) instead of the scoped assistant code repository and correctly stopped for missing access. Enforced autonomous project work now withholds generic `github_*` mirror reads and exposes only `code_*` reads under the selected `projects.json` project scope. Manual non-autonomous GitHub behavior is unchanged.
+
+The current working tree also closes the native Bluesky measurement gap with a
+read-only public metrics adapter. Before a campaign day is claimed, the coordinator
+fetches cumulative metrics for prior successful post receipts; after claim it stores
+that result as the run's `before` snapshot. After a verified publish it fetches again
+and stores the `after` snapshot. Every response must match one exact persisted URI and
+CID. Only like, reply, repost, and quote increases above each post's persisted
+high-water counts count as day-5 meaningful
+interest. A publish receipt alone remains non-progress, and day 15 still requires a
+Gumroad sale or an explicitly supported strong-intent signal. Read/persistence failures
+fail closed; an already-verified post is not blindly retried, and dry runs do not enter
+the provider path.
+
+Activation remains a two-step owner action. Queueing previews and imports the manifest; confirmation performs read-only product/account preflight and activates the policy, but makes no OpenAI call and publishes nothing. If Railway restarts after import but before activation, re-queueing the same intact pack safely stages activation only. On 2026-08-11, the final full offline suite passed 553 tests with paid/provider traffic mocked; the modified Python modules also passed bytecode compilation and the complete diff passed whitespace validation. Live Gumroad identity, Bluesky authentication/publishing, public engagement reads, Telegram delivery, Railway-volume persistence, and the scheduled 08:00 execution remain unverified until a credentialed production smoke test is deliberately run.
 
 ## 1. What the system currently does
 
@@ -81,7 +95,7 @@ The scheduled path currently posts a morning briefing, calendar alerts, reminder
 - A default $5 daily Company Mode budget, soft task reservations, actual token-based reconciliation, cached-input pricing support, and a conservative unknown-model fallback.
 - Goal-specific work planning, sequential execution, prior-work handoff, and a final editor.
 - A three-way review verdict and a hard two-round revision ceiling.
-- Human gates for email sending, deletion, production deploys, Railway mutation, publishing, and other staged actions.
+- Human gates for email sending, deletion, production deploys, Railway mutation, publishing, and other staged actions. The current branch preserves those gates for ordinary work and adds only the narrow, separately owner-confirmed Revenue Sprint publish exception described above.
 - PR-oriented code changes rather than direct base-branch merges.
 - APScheduler, persisted reminders, timezone configuration, and existing Telegram scheduled-message delivery.
 - Project registry, active-repository routing, Linear issue creation/mirroring, and source-issue workflows.
@@ -148,7 +162,7 @@ This creates useful daily autonomy without introducing parallel execution, repla
 ## 8. Security, reliability, and runaway-cost risks
 
 - Model-generated Python runs in a constrained child process but is not a hard security sandbox; it can still read accessible local files or use the network.
-- Several helper functions can mutate external systems if called directly; authorization gates currently live mostly in `main.execute_tool`, not in the helpers themselves.
+- Several non-campaign helpers can still mutate external systems if imported directly. Revenue Sprint mutation adapters now add their own exact-target capability, durable pre-I/O claim, and receipt checks, but that narrow defense does not make every legacy helper independently authorized.
 - Company Mode auto-approves some production of files/PR artifacts. `write_file` may mirror to GitHub, so it is not always purely local.
 - Railway variable reads can return raw values to a model. This should not be used for secrets.
 - Full agent answers are printed to process stdout, which may place private project content in hosting logs.
@@ -160,4 +174,4 @@ This creates useful daily autonomy without introducing parallel execution, repla
 
 ## Scope decision
 
-The autonomous session should remain sequential and bounded: at most ten distinct roadmap items, one attempt per item, and 120 minutes. Task-local blockers should not prevent unrelated work from continuing. Controlled Lumen ideation is an idle fallback only, runs as one batch of at most three ideas, and writes `proposed` backlog records that never auto-execute. Parallel agents, automatic deployment/merge/publish, broad helper rewrites, database replacement, and a full UI are intentionally deferred.
+The autonomous session should remain sequential and bounded: at most ten distinct roadmap items, one attempt per item, and 120 minutes. Task-local blockers should not prevent unrelated work from continuing. Controlled Lumen ideation is an idle fallback only, runs as one batch of at most three ideas, and writes `proposed` backlog records that never auto-execute. Parallel agents, ordinary automatic deployment/merge/publish, broad helper rewrites, database replacement, and a full UI are intentionally deferred. The only automatic publish exception is the deterministic post-review action in an active, separately owner-confirmed Revenue Sprint; it does not grant a model general publishing authority.

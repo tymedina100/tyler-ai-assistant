@@ -4,6 +4,7 @@ import re
 import hashlib
 import tempfile
 import uuid
+from collections.abc import Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -42,7 +43,8 @@ DEFAULT_REVENUE_SPRINT_RUN_DAYS = 20
 DEFAULT_REVENUE_SPRINT_NO_PROGRESS_LIMIT = 3
 REVENUE_ACTION_TYPES = {"publish", "outreach", "purchase", "deploy"}
 REVENUE_SIGNAL_TYPES = {
-    "click", "reply", "lead", "signup", "wishlist", "checkout_started",
+    "click", "like", "reply", "repost", "quote", "lead", "signup", "wishlist",
+    "checkout_started",
     "strong_intent", "purchase_commitment", "sale", "bounce", "unsubscribe",
 }
 REVENUE_SPRINT_TERMINAL_STATUSES = {"stopped", "completed", "cancelled"}
@@ -632,6 +634,69 @@ def _normalize_action_journal_metadata(value):
     return normalized
 
 
+def _normalize_provider_receipt(value):
+    """Persist only a small, flat string receipt returned by an action provider."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise RevenueActionError("Provider receipt must be a small string mapping.")
+    if len(value) > 8:
+        raise RevenueActionError("Provider receipt may contain at most 8 fields.")
+    normalized = {}
+    for raw_key in sorted(value, key=lambda item: str(item)):
+        if not isinstance(raw_key, str) or not isinstance(value[raw_key], str):
+            raise RevenueActionError("Provider receipt keys and values must be strings.")
+        key = raw_key.strip().lower()
+        receipt_value = value[raw_key].strip()
+        if not key or not receipt_value:
+            raise RevenueActionError("Provider receipt keys and values cannot be empty.")
+        if len(key) > 64 or len(receipt_value) > 1000:
+            raise RevenueActionError("Provider receipt field exceeds its persistence limit.")
+        if key in normalized:
+            raise RevenueActionError("Provider receipt contains duplicate normalized keys.")
+        normalized[key] = receipt_value
+    return normalized
+
+
+_BLUESKY_ENGAGEMENT_FIELDS = ("like", "reply", "repost", "quote")
+
+
+def _normalize_engagement_counts(value, *, require_all=False):
+    if value is None and not require_all:
+        return {}
+    if not isinstance(value, Mapping):
+        raise RevenueSprintError("Bluesky engagement counts must be a mapping.")
+    normalized = {}
+    for signal_type in _BLUESKY_ENGAGEMENT_FIELDS:
+        candidates = (
+            signal_type,
+            f"{signal_type}_count",
+            f"{signal_type}Count",
+        )
+        supplied = [value[name] for name in candidates if name in value]
+        if not supplied:
+            if require_all:
+                raise RevenueSprintError(
+                    f"Bluesky engagement observation is missing {signal_type} count."
+                )
+            continue
+        if any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in supplied
+        ):
+            raise RevenueSprintError(
+                f"Bluesky {signal_type} count must be an exact non-negative integer."
+            )
+        if len(supplied) > 1 and any(item != supplied[0] for item in supplied[1:]):
+            raise RevenueSprintError(
+                f"Bluesky engagement observation has conflicting {signal_type} counts."
+            )
+        count = supplied[0]
+        normalized[signal_type] = count
+    return normalized
+
+
 def _normalize_action_policy(value):
     raw = value if isinstance(value, dict) else {}
     allowed_types = []
@@ -675,7 +740,8 @@ def _normalize_checkpoint_policy(value):
     interest_types = list(dict.fromkeys(
         str(signal or "").strip().lower()
         for signal in _list(raw.get("day5_interest_signal_types") or [
-            "reply", "click", "lead", "signup", "checkout_started", "wishlist", "strong_intent", "sale"
+            "like", "reply", "repost", "quote", "click", "lead", "signup",
+            "checkout_started", "wishlist", "strong_intent", "sale"
         ])
         if str(signal or "").strip()
     ))
@@ -760,8 +826,18 @@ def _normalize_revenue_sprint(value):
         "checkpoint_results",
         "pivot_history",
         "action_journal",
+        "engagement_snapshots",
     ):
         item[field] = _list(item.get(field))[-REVENUE_SPRINT_RECORD_LIMIT:]
+    for action in item["action_journal"]:
+        if not isinstance(action, dict):
+            continue
+        action["provider_receipt"] = _normalize_provider_receipt(
+            action.get("provider_receipt")
+        )
+        action["engagement_counts"] = _normalize_engagement_counts(
+            action.get("engagement_counts")
+        )
     item["pivot_required"] = bool(item.get("pivot_required", False))
     item.setdefault("phase", "validate")
     item.setdefault("stop_reason", "")
@@ -2689,6 +2765,8 @@ def claim_revenue_action(
             "reserved_purchase_usd": purchase_amount,
             "actual_purchase_usd": 0.0,
             "metadata": normalized_metadata,
+            "provider_receipt": {},
+            "engagement_counts": {},
             "result": "",
             "claimed_at": timestamp,
             "completed_at": None,
@@ -2708,10 +2786,12 @@ def complete_revenue_action(
     sprint_id=None,
     actual_purchase_usd=None,
     result="",
+    provider_receipt=None,
     at=None,
 ):
     normalized_status = str(status or "").strip().lower()
     normalized_result = str(result or "")[:1000]
+    normalized_provider_receipt = _normalize_provider_receipt(provider_receipt)
     if normalized_status not in {"succeeded", "failed", "uncertain", "cancelled"}:
         raise RevenueActionError(f"Unsupported revenue action completion status: {normalized_status!r}.")
     with _state_transaction(path) as state:
@@ -2743,6 +2823,8 @@ def complete_revenue_action(
                 entry.get("status") == normalized_status
                 and _amount(entry.get("actual_purchase_usd")) == actual
                 and entry.get("result", "") == normalized_result
+                and _normalize_provider_receipt(entry.get("provider_receipt"))
+                == normalized_provider_receipt
             ):
                 replay = deepcopy(entry)
                 replay["idempotent_replay"] = True
@@ -2752,6 +2834,7 @@ def complete_revenue_action(
         entry["status"] = normalized_status
         entry["actual_purchase_usd"] = actual
         entry["result"] = normalized_result
+        entry["provider_receipt"] = normalized_provider_receipt
         entry["completed_at"] = timestamp
         sprint["updated_at"] = timestamp
         if normalized_status == "uncertain":
@@ -2759,6 +2842,173 @@ def complete_revenue_action(
         add_event(state, "revenue_action_completed", f"Revenue action {action_id} is {normalized_status}.")
         response = deepcopy(entry)
         response["campaign_status"] = sprint["status"]
+    return response
+
+
+def record_bluesky_engagement_snapshot(
+    observations,
+    phase,
+    observed_run_id,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    at=None,
+):
+    """Record bounded cumulative engagement for exact persisted Bluesky posts.
+
+    Provider observations are aggregate counts. Only increases above each action's
+    persisted high-water counts become signals, and every signal is attributed to the
+    run during which the engagement was observed rather than to the older post's run.
+    """
+
+    normalized_phase = str(phase or "").strip().lower()
+    if normalized_phase not in {"before", "after"}:
+        raise RevenueSprintError("Bluesky engagement snapshot phase must be 'before' or 'after'.")
+    normalized_run_id = str(observed_run_id or "").strip()
+    if not normalized_run_id:
+        raise RevenueSprintError("Bluesky engagement snapshot requires an observed run ID.")
+    if not isinstance(observations, (list, tuple)):
+        raise RevenueSprintError("Bluesky engagement observations must be a list.")
+    if len(observations) > 20:
+        raise RevenueSprintError("Bluesky engagement snapshot may contain at most 20 observations.")
+
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None:
+            raise RevenueSprintError("Revenue Sprint was not found.")
+        observed_run = _find_sprint_run(sprint, normalized_run_id)
+        if observed_run is None or observed_run.get("status") not in {"claimed", "completed"}:
+            raise RevenueSprintError(
+                "Bluesky engagement snapshot requires an existing claimed or completed run."
+            )
+
+        canonical = []
+        seen_receipts = set()
+        matched_actions = []
+        for raw in observations:
+            if not isinstance(raw, Mapping):
+                raise RevenueSprintError("Each Bluesky engagement observation must be a mapping.")
+            receipt_source = (
+                raw.get("provider_receipt")
+                if isinstance(raw.get("provider_receipt"), Mapping)
+                else {"uri": raw.get("uri"), "cid": raw.get("cid")}
+            )
+            receipt = _normalize_provider_receipt(receipt_source)
+            uri = str(receipt.get("uri") or "")
+            cid = str(receipt.get("cid") or "")
+            if not uri or not cid:
+                raise RevenueSprintError(
+                    "Each Bluesky engagement observation requires exact provider uri and cid."
+                )
+            receipt_key = (uri, cid)
+            if receipt_key in seen_receipts:
+                raise RevenueSprintError("Bluesky engagement observations must be unique.")
+            seen_receipts.add(receipt_key)
+            counts_source = (
+                raw.get("engagement_counts")
+                if isinstance(raw.get("engagement_counts"), Mapping)
+                else raw
+            )
+            counts = _normalize_engagement_counts(counts_source, require_all=True)
+            matches = []
+            for action in sprint.get("action_journal", []):
+                if (
+                    not isinstance(action, dict)
+                    or action.get("status") != "succeeded"
+                    or action.get("action_type") != "publish"
+                    or not str(action.get("target") or "").startswith("bluesky:")
+                ):
+                    continue
+                action_receipt = _normalize_provider_receipt(
+                    action.get("provider_receipt")
+                )
+                if action_receipt.get("uri") == uri and action_receipt.get("cid") == cid:
+                    matches.append(action)
+            if len(matches) != 1:
+                raise RevenueSprintError(
+                    "Bluesky engagement observation does not match one exact succeeded publish receipt."
+                )
+            action = matches[0]
+            if "action_id" in raw and raw.get("action_id") != action.get("id"):
+                raise RevenueSprintError(
+                    "Bluesky engagement observation action ID does not match its exact receipt."
+                )
+            matched_actions.append((action, counts))
+            canonical.append({
+                "action_id": str(action.get("id") or ""),
+                "action_run_id": str(action.get("run_id") or ""),
+                "target": str(action.get("target") or ""),
+                "provider_receipt": {"uri": uri, "cid": cid},
+                "engagement_counts": counts,
+            })
+        canonical.sort(key=lambda item: item["action_id"])
+
+        existing = next(
+            (
+                entry for entry in sprint.get("engagement_snapshots", [])
+                if entry.get("observed_run_id") == normalized_run_id
+                and entry.get("phase") == normalized_phase
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing.get("observations", []) == canonical:
+                replay = deepcopy(existing)
+                replay["idempotent_replay"] = True
+                return replay
+            raise RevenueSprintError(
+                "Bluesky engagement snapshot run and phase already exist with different observations."
+            )
+
+        snapshot_key = hashlib.sha256(
+            f"{sprint['id']}|{normalized_run_id}|{normalized_phase}".encode("utf-8")
+        ).hexdigest()[:16]
+        snapshot_id = f"engagement_{snapshot_key}"
+        total_positive_deltas = {signal_type: 0 for signal_type in _BLUESKY_ENGAGEMENT_FIELDS}
+        for action, counts in matched_actions:
+            previous = _normalize_engagement_counts(action.get("engagement_counts"))
+            high_water_counts = {}
+            for signal_type in _BLUESKY_ENGAGEMENT_FIELDS:
+                previous_count = int(previous.get(signal_type, 0))
+                current_count = counts[signal_type]
+                delta = max(0, current_count - previous_count)
+                # Public reaction counts can fall when a user removes a reaction.
+                # Retain the high-water mark so the same reaction returning later
+                # cannot be counted twice or reset the no-progress guard.
+                high_water_counts[signal_type] = max(previous_count, current_count)
+                if not delta:
+                    continue
+                total_positive_deltas[signal_type] += delta
+                _record_revenue_signal_in_state(
+                    sprint,
+                    signal_type,
+                    run_id=normalized_run_id,
+                    count=delta,
+                    evidence=(
+                        f"Bluesky engagement snapshot {snapshot_id} for action {action.get('id')}"
+                    ),
+                    at=at,
+                    signal_id=f"signal_{snapshot_id}_{action.get('id')}_{signal_type}",
+                )
+            action["engagement_counts"] = high_water_counts
+
+        timestamp = _sprint_moment(sprint, at).isoformat()
+        snapshot = {
+            "id": snapshot_id,
+            "observed_run_id": normalized_run_id,
+            "phase": normalized_phase,
+            "observations": canonical,
+            "positive_deltas": total_positive_deltas,
+            "captured_at": timestamp,
+        }
+        sprint["engagement_snapshots"].append(snapshot)
+        sprint["updated_at"] = timestamp
+        add_event(
+            state,
+            "bluesky_engagement_snapshot_recorded",
+            f"Recorded Bluesky engagement snapshot for {normalized_run_id} ({normalized_phase}).",
+        )
+        response = deepcopy(snapshot)
     return response
 
 

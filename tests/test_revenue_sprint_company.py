@@ -162,6 +162,77 @@ class RevenueSprintCompanyTests(unittest.TestCase):
             project_id, worker["id"], payload_digest, self.path
         )
 
+    @staticmethod
+    def bluesky_policy():
+        return {
+            "revision": "bluesky-policy-r1",
+            "allowed_action_types": ["publish"],
+            "allowed_targets": {"publish": ["bluesky:company.example"]},
+            "daily_action_caps": {"publish": 1},
+            "total_action_caps": {"publish": 20},
+            "purchase_daily_cap_usd": 0.0,
+            "purchase_total_cap_usd": 0.0,
+            "approved_at": "2026-08-02T12:00:00-07:00",
+            "approved_by": "company-owner",
+        }
+
+    def succeeded_bluesky_action(self, sprint, run_id, day):
+        company_mode.claim_revenue_sprint_run(
+            run_id,
+            self.experiment(run_id, action_type="publish"),
+            self.path,
+            sprint_id=sprint["id"],
+            at=day,
+        )
+        digest = hashlib.sha256(f"reviewed {run_id}".encode()).hexdigest()
+        self.approve_action_payload(
+            sprint["id"],
+            run_id,
+            "publish",
+            "bluesky:company.example",
+            digest,
+            policy_revision="bluesky-policy-r1",
+        )
+        action = company_mode.claim_revenue_action(
+            "publish",
+            "bluesky:company.example",
+            run_id,
+            self.path,
+            sprint_id=sprint["id"],
+            policy_revision="bluesky-policy-r1",
+            approved_payload_digest=digest,
+            idempotency_key=f"publish-{run_id}",
+            metadata={"payload_digest": digest},
+            at=day,
+        )
+        receipt = {
+            "uri": f"at://did:plc:company/app.bsky.feed.post/{run_id}",
+            "cid": f"cid-{run_id}",
+        }
+        completed = company_mode.complete_revenue_action(
+            action["id"],
+            "succeeded",
+            self.path,
+            sprint_id=sprint["id"],
+            result="Company post published.",
+            provider_receipt=receipt,
+            at=day,
+        )
+        return completed, receipt
+
+    @staticmethod
+    def engagement(receipt, *, action_id=None, likes=0, replies=0, reposts=0, quotes=0):
+        observation = {
+            **receipt,
+            "like_count": likes,
+            "reply_count": replies,
+            "repost_count": reposts,
+            "quote_count": quotes,
+        }
+        if action_id is not None:
+            observation["action_id"] = action_id
+        return observation
+
     def test_start_persists_exact_scope_defaults_and_one_active_campaign(self):
         sprint = self.start(sprint_id="revenue-20-day")
         state = company_mode.load_state(self.path)
@@ -828,6 +899,212 @@ class RevenueSprintCompanyTests(unittest.TestCase):
         )
         self.assertEqual(claimed["approved_payload_digest"], payload_a)
         self.assertEqual(claimed["metadata"]["payload_digest"], payload_a)
+
+    def test_bluesky_receipt_and_engagement_deltas_are_idempotent_and_fail_closed(self):
+        sprint = self.start(automation_policy=self.bluesky_policy())
+        day1, day2 = business_days(2)
+        action, receipt = self.succeeded_bluesky_action(sprint, "bluesky-run-1", day1)
+        self.assertEqual(action["provider_receipt"], receipt)
+        replay = company_mode.complete_revenue_action(
+            action["id"],
+            "succeeded",
+            self.path,
+            sprint_id=sprint["id"],
+            result="Company post published.",
+            provider_receipt=receipt,
+            at=day1,
+        )
+        self.assertTrue(replay["idempotent_replay"])
+        with self.assertRaises(company_mode.RevenueActionError):
+            company_mode.complete_revenue_action(
+                action["id"],
+                "succeeded",
+                self.path,
+                sprint_id=sprint["id"],
+                result="Company post published.",
+                provider_receipt={**receipt, "cid": "different-cid"},
+                at=day1,
+            )
+
+        before = company_mode.record_bluesky_engagement_snapshot(
+            [self.engagement(receipt, action_id=action["id"])],
+            "before",
+            "bluesky-run-1",
+            self.path,
+            sprint_id=sprint["id"],
+            at=day1,
+        )
+        self.assertEqual(sum(before["positive_deltas"].values()), 0)
+        after = company_mode.record_bluesky_engagement_snapshot(
+            [self.engagement(
+                receipt, action_id=action["id"], likes=2, replies=1, reposts=1
+            )],
+            "after",
+            "bluesky-run-1",
+            self.path,
+            sprint_id=sprint["id"],
+            at=day1,
+        )
+        self.assertEqual(after["positive_deltas"], {
+            "like": 2, "reply": 1, "repost": 1, "quote": 0,
+        })
+        replay_snapshot = company_mode.record_bluesky_engagement_snapshot(
+            [self.engagement(
+                receipt, action_id=action["id"], likes=2, replies=1, reposts=1
+            )],
+            "after",
+            "bluesky-run-1",
+            self.path,
+            sprint_id=sprint["id"],
+            at=day1,
+        )
+        self.assertTrue(replay_snapshot["idempotent_replay"])
+        with self.assertRaises(company_mode.RevenueSprintError):
+            company_mode.record_bluesky_engagement_snapshot(
+                [self.engagement(
+                    receipt, action_id=action["id"], likes=3, replies=1, reposts=1
+                )],
+                "after",
+                "bluesky-run-1",
+                self.path,
+                sprint_id=sprint["id"],
+                at=day1,
+            )
+
+        company_mode.complete_revenue_sprint_run(
+            "bluesky-run-1", "succeeded", self.path,
+            sprint_id=sprint["id"], progress=None, at=day1,
+        )
+        company_mode.claim_revenue_sprint_run(
+            "bluesky-run-2",
+            self.experiment("bluesky-run-2", action_type="publish"),
+            self.path,
+            sprint_id=sprint["id"],
+            at=day2,
+        )
+        unchanged = company_mode.record_bluesky_engagement_snapshot(
+            [self.engagement(
+                receipt, action_id=action["id"], likes=1, replies=1, reposts=1
+            )],
+            "before",
+            "bluesky-run-2",
+            self.path,
+            sprint_id=sprint["id"],
+            at=day2,
+        )
+        self.assertEqual(sum(unchanged["positive_deltas"].values()), 0)
+        restored = company_mode.record_bluesky_engagement_snapshot(
+            [self.engagement(
+                receipt, action_id=action["id"], likes=2, replies=1, reposts=1
+            )],
+            "after",
+            "bluesky-run-2",
+            self.path,
+            sprint_id=sprint["id"],
+            at=day2,
+        )
+        self.assertEqual(sum(restored["positive_deltas"].values()), 0)
+        state_before_mismatch = company_mode.load_state(self.path)
+        with self.assertRaises(company_mode.RevenueSprintError):
+            company_mode.record_bluesky_engagement_snapshot(
+                [self.engagement(
+                    {**receipt, "cid": "unmatched-cid"},
+                    action_id=action["id"],
+                    likes=4,
+                )],
+                "after",
+                "bluesky-run-2",
+                self.path,
+                sprint_id=sprint["id"],
+                at=day2,
+            )
+        state_after_mismatch = company_mode.load_state(self.path)
+        self.assertEqual(
+            state_after_mismatch["revenue_sprints"][0]["engagement_snapshots"],
+            state_before_mismatch["revenue_sprints"][0]["engagement_snapshots"],
+        )
+        signals = state_after_mismatch["revenue_sprints"][0]["signals"]
+        self.assertEqual(
+            {signal["type"]: signal["count"] for signal in signals},
+            {"like": 2, "reply": 1, "repost": 1},
+        )
+
+    def test_prior_post_engagement_counts_as_current_observed_run_progress(self):
+        sprint = self.start(automation_policy=self.bluesky_policy())
+        day1, day2 = business_days(2)
+        action, receipt = self.succeeded_bluesky_action(sprint, "prior-post-run", day1)
+        first = company_mode.complete_revenue_sprint_run(
+            "prior-post-run", "succeeded", self.path,
+            sprint_id=sprint["id"], progress=None, at=day1,
+        )
+        self.assertFalse(first["progress"])
+        company_mode.claim_revenue_sprint_run(
+            "observation-run",
+            self.experiment("observation-run", action_type="publish"),
+            self.path,
+            sprint_id=sprint["id"],
+            at=day2,
+        )
+        company_mode.record_bluesky_engagement_snapshot(
+            [self.engagement(receipt, action_id=action["id"], likes=1)],
+            "before",
+            "observation-run",
+            self.path,
+            sprint_id=sprint["id"],
+            at=day2,
+        )
+        observed = company_mode.complete_revenue_sprint_run(
+            "observation-run", "succeeded", self.path,
+            sprint_id=sprint["id"], progress=None, at=day2,
+        )
+        self.assertTrue(observed["progress"])
+        signal = company_mode.revenue_sprint_status(
+            self.path, sprint_id=sprint["id"]
+        )["signals"][0]
+        self.assertEqual((signal["type"], signal["run_id"], signal["count"]), (
+            "like", "observation-run", 1,
+        ))
+
+    def test_likes_satisfy_day5_interest_but_not_day15_strong_intent(self):
+        sprint = self.start(automation_policy=self.bluesky_policy())
+        days = business_days(15)
+        action, receipt = self.succeeded_bluesky_action(sprint, "run-1", days[0])
+        for index, day in enumerate(days, 1):
+            run_id = f"run-{index}"
+            if index > 1:
+                company_mode.claim_revenue_sprint_run(
+                    run_id,
+                    self.experiment(index, action_type="publish"),
+                    self.path,
+                    sprint_id=sprint["id"],
+                    at=day,
+                )
+            if index == 5:
+                company_mode.record_bluesky_engagement_snapshot(
+                    [self.engagement(receipt, action_id=action["id"], likes=1)],
+                    "after",
+                    run_id,
+                    self.path,
+                    sprint_id=sprint["id"],
+                    at=day,
+                )
+            completed = company_mode.complete_revenue_sprint_run(
+                run_id,
+                "succeeded",
+                self.path,
+                sprint_id=sprint["id"],
+                progress=None if index == 5 else True,
+                at=day,
+            )
+
+        status = company_mode.revenue_sprint_status(self.path, sprint_id=sprint["id"])
+        day5 = next(entry for entry in status["checkpoint_results"] if entry["day"] == 5)
+        day15 = next(entry for entry in status["checkpoint_results"] if entry["day"] == 15)
+        self.assertEqual(day5["decision"], "continue")
+        self.assertEqual(day15["decision"], "stop")
+        self.assertEqual(completed["stop_reason"], "day15_no_sale_or_strong_intent")
+        self.assertIn("like", status["checkpoint_policy"]["day5_interest_signal_types"])
+        self.assertNotIn("like", status["checkpoint_policy"]["day15_strong_intent_signal_types"])
 
     def test_action_journal_enforces_revision_exact_targets_counts_and_purchase_caps(self):
         sprint = self.start(automation_policy=self.policy(all_actions=True))

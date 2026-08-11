@@ -28,9 +28,11 @@ no useful, complete worker-and-review unit fits safely.
 Only promotional and seller identities owned by the company may be configured.
 The Gumroad product and read-only sales token must belong to the company seller;
 there is no fallback to the owner's LinkedIn, Gmail, Bluesky, Vercel, Gumroad, or
-other personal account. The action target, company account mapping, campaign policy revision,
-run claim, daily/total action count, and provider receipt are all checked before
-or after each external action.
+other personal account. The action target, company account mapping, campaign policy
+revision, run claim, daily/total action count, provider receipt, and public
+engagement evidence are all checked before or after each external action. An
+engagement read is accepted only when every returned post matches one exact
+persisted URI and CID.
 
 Activation proves that the configured Gumroad token can read the exact linked,
 published product. Gumroad's product response does not independently prove the
@@ -115,8 +117,10 @@ conditions fail closed.
 
 ## What one live day does
 
-1. Claim the exact campaign day and roadmap experiment.
-2. Pull and persist a pre-action Gumroad revenue snapshot.
+1. Verify the exact Gumroad product and read public engagement counts for all prior
+   successful Bluesky post receipts. A failed preflight consumes no campaign day.
+2. Claim the exact campaign day and roadmap experiment, then persist the engagement
+   counts as that run's `before` snapshot and persist a pre-action Gumroad snapshot.
 3. Reserve the complete estimated AI cost inside both daily and campaign caps.
 4. Route the task to the least-expensive capable configured model.
 5. Let the assigned worker draft and self-check one bounded post without publishing.
@@ -127,9 +131,13 @@ conditions fail closed.
    idempotency key before provider I/O.
 8. Publish no more than one standalone post and persist only a safe URI/CID
    receipt, never provider credentials or session tokens.
-9. Pull and persist the post-action Gumroad snapshot, reconcile AI cost, update
-   progress/checkpoints, persist the autonomous report, and post one Telegram
-   summary.
+9. Read public like, reply, repost, and quote counts for every successful Bluesky
+   post in the campaign, match each result to its persisted URI/CID, and persist
+   the run's `after` snapshot. Only increases above each post's persisted high-water
+   counts become engagement signals.
+10. Pull and persist the post-action Gumroad snapshot, reconcile AI cost, update
+    progress/checkpoints, persist the autonomous report, and post one Telegram
+    summary.
 
 ## Stop and recovery behavior
 
@@ -139,6 +147,7 @@ The campaign stops or escalates rather than improvising around:
 - a target, account, policy revision, run ID, or action type mismatch;
 - insufficient daily or total AI budget;
 - an uncertain external-action result;
+- unavailable or mismatched public Bluesky engagement evidence;
 - repeated no progress;
 - failure to meet the day-15 continuation threshold;
 - the twentieth run-day, regardless of result.
@@ -163,15 +172,39 @@ queued and stages only the missing activation preflight; it does not duplicate t
 20 items. If the campaign has a terminal persisted record, it will not reactivate it.
 Review the audit history and queue a new manifest/policy revision instead.
 
-## Measurement limitation
+## Engagement measurement and checkpoint limits
 
-The native Bluesky adapter currently persists the publish URI/CID but does not read
-clicks, replies, likes, or strong-intent signals. Automatic checkpoints therefore
-use verified Gumroad sales/revenue plus only signals explicitly returned by a future
-approved provider adapter. With the included native Bluesky path, day 5 may pivot
-even when unmeasured Bluesky engagement exists, and day 15 continues automatically
-only when Gumroad has recorded a sale. No engagement is inferred from a publish
-receipt.
+The native adapter uses Bluesky's public read endpoint without credentials to fetch
+cumulative like, reply, repost, and quote counts for at most the campaign's exact
+successful post receipts. It requires one response per requested post and matches
+both URI and CID. Partial, duplicate, malformed, negative, or identity-mismatched
+responses fail closed. The pre-execution read happens before the day is claimed, so
+an unavailable read consumes no run-day. The coordinator then claims the day and
+persists that observation as the run's `before` snapshot. If this post-claim write
+fails, the run becomes `needs_human` and the campaign stops before worker or publish
+execution. After a verified publish,
+it fetches again and persists the `after` snapshot; if that read or persistence
+fails, the run becomes `needs_human`, the campaign stops, and the already-verified
+post is not retried.
+
+A successful Bluesky action created by a pre-upgrade build may not have the structured
+URI/CID receipt required by this collector. That state fails before claiming another
+day and is never reconstructed from free-form result text. Inspect the old receipt and
+start a new owner-confirmed campaign revision instead of editing the ledger in place.
+
+Provider counts are aggregate and may decrease when reactions are removed. The ledger
+retains a per-post high-water mark, so removing and restoring the same reaction cannot
+create a second signal or reset the no-progress guard. New likes, replies, reposts, and
+quotes above that high-water mark may satisfy the day-5 meaningful-interest checkpoint.
+The publish receipt by itself is execution evidence,
+not commercial progress, and does not reset the no-progress counter. Native Bluesky
+metrics do not measure clicks, leads, checkout intent, or sales. The day-15 checkpoint
+therefore still requires a verified Gumroad sale or an explicitly supported
+strong-intent signal such as checkout-started or purchase commitment; ordinary social
+engagement does not qualify.
+
+`/autorun dry-run` does not call Gumroad, Bluesky, OpenAI, or another external
+provider. It only selects and reports the next eligible item from persisted state.
 
 ## Offline verification
 
@@ -183,6 +216,7 @@ $env:PYTHONUTF8 = "1"
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-These checks validate local policy and orchestration. A real Railway volume,
-Telegram delivery, Gumroad token, Bluesky session, provider receipt, and scheduled
-08:00 execution still require a credentialed production smoke test.
+These checks validate local policy and orchestration with provider traffic mocked. A
+real Railway volume, Telegram delivery, Gumroad token, Bluesky session, URI/CID
+receipt, public engagement read, and scheduled 08:00 execution still require a
+credentialed production smoke test.

@@ -65,6 +65,18 @@ class AutonomyTeamTests(unittest.TestCase):
         )
         self.assertEqual(allowed, {"railway_list_vars", "railway_deploy_status"})
 
+    def test_project_autonomy_uses_scoped_code_repo_not_file_mirror(self):
+        allowed = autonomy_team.allowed_tool_names(
+            {
+                "github_list_files",
+                "github_read_file",
+                "code_list_files",
+                "code_read_file",
+            },
+            "observe",
+        )
+        self.assertEqual(allowed, {"code_list_files", "code_read_file"})
+
     def test_company_plan_adds_required_review_and_preserves_acceptance_criteria(self):
         plan = autonomy_team.build_company_plan(
             self.item(), self.worker_decision(), 5.0, router=self.router
