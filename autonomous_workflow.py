@@ -22,7 +22,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from filelock import FileLock, Timeout as FileLockTimeout
@@ -53,6 +54,19 @@ HUMAN_RESOLUTION_HISTORY_LIMIT = 50
 ROADMAP_PACK_MAX_ITEMS = 25
 ROADMAP_PACK_MAX_BYTES = 512 * 1024
 ROADMAP_PACK_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}")
+SESSION_REPORT_METADATA_MAX_BYTES = 16 * 1024
+REVENUE_SPRINT_TOTAL_AI_BUDGET_USD = 100.0
+REVENUE_SPRINT_DAILY_AI_BUDGET_USD = 5.0
+REVENUE_SPRINT_RUN_DAYS = 20
+REVENUE_SPRINT_KNOWN_ACTION_TYPES = frozenset({
+    "publish",
+    "outreach",
+    "purchase",
+    "deploy",
+})
+REVENUE_SPRINT_ACTION_TARGET_RE = re.compile(
+    r"[a-z0-9][a-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)+"
+)
 RETRY_RESET_FIELDS = {
     "blocked_reason",
     "blocker",
@@ -750,6 +764,7 @@ _ROADMAP_PACK_TOP_LEVEL_FIELDS = {
     "target_project_id",
     "goal",
     "roadmap_items",
+    "revenue_sprint",
 }
 _ROADMAP_PACK_GOAL_FIELDS = {"id", "title", "description", "status"}
 _ROADMAP_PACK_ITEM_FIELDS = {
@@ -777,7 +792,54 @@ _ROADMAP_PACK_ITEM_FIELDS = {
     "previous_models",
     "human_decision_required",
     "human_action",
+    "revenue_sprint_run_day",
+    "external_action",
 }
+_REVENUE_SPRINT_FIELDS = {
+    "id",
+    "product",
+    "channel",
+    "total_ai_budget_usd",
+    "daily_ai_budget_usd",
+    "daily_budget_includes_emergency_reserve",
+    "run_days",
+    "checkpoint_thresholds",
+    "action_policy",
+}
+_REVENUE_SPRINT_PRODUCT_FIELDS = {"id", "name", "url"}
+_REVENUE_SPRINT_CHANNEL_FIELDS = {"id"}
+_REVENUE_SPRINT_CHECKPOINT_FIELDS = {
+    "day_5_meaningful_interest",
+    "day_15_sale_or_strong_intent",
+    "day_20_unconditional_stop",
+    "max_consecutive_no_progress_days",
+    "trailing_window_days",
+    "minimum_gross_revenue_usd_per_day",
+    "minimum_trailing_gross_revenue_usd",
+    "require_nonnegative_contribution",
+}
+_REVENUE_SPRINT_DAY_5_FIELDS = {"run_day", "minimum_meaningful_interactions"}
+_REVENUE_SPRINT_DAY_15_FIELDS = {
+    "run_day",
+    "minimum_sales",
+    "minimum_strong_intent_signals",
+    "satisfy",
+}
+_REVENUE_SPRINT_DAY_20_FIELDS = {"run_day", "unconditional_stop"}
+_REVENUE_SPRINT_ACTION_POLICY_FIELDS = {
+    "revision",
+    "require_owner_confirmation",
+    "allowed_external_actions",
+    "daily_purchase_cap_usd",
+    "total_purchase_cap_usd",
+}
+_REVENUE_SPRINT_POLICY_ACTION_FIELDS = {
+    "action_type",
+    "target",
+    "daily_cap",
+    "total_cap",
+}
+_REVENUE_SPRINT_ITEM_ACTION_FIELDS = {"action_type", "target", "policy_revision"}
 _ROADMAP_RECORD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}")
 _ROADMAP_PACK_GOAL_HASH_FIELDS = ("id", "title", "description")
 _ROADMAP_PACK_ITEM_HASH_FIELDS = (
@@ -799,6 +861,14 @@ _ROADMAP_PACK_ITEM_HASH_FIELDS = (
     "estimated_output_tokens",
     "estimated_ai_cost_usd",
     "requires_recent_run_evidence",
+)
+_ROADMAP_PACK_GOAL_HASH_FIELDS_V2 = (*_ROADMAP_PACK_GOAL_HASH_FIELDS, "revenue_sprint")
+_ROADMAP_PACK_ITEM_HASH_FIELDS_V2 = (
+    *_ROADMAP_PACK_ITEM_HASH_FIELDS,
+    "revenue_sprint_id",
+    "revenue_sprint_run_day",
+    "action_policy_revision",
+    "external_action",
 )
 
 
@@ -937,6 +1007,344 @@ def _pack_string_list(
     return result
 
 
+def _pack_mapping(value: Any, field: str, allowed_fields: set[str]) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RoadmapPackError(f"Roadmap pack field {field!r} must be an object.")
+    unknown = set(value) - allowed_fields
+    if unknown:
+        raise RoadmapPackError(
+            f"Roadmap pack field {field!r} contains unsupported fields: "
+            f"{', '.join(sorted(unknown))}."
+        )
+    return value
+
+
+def _pack_positive_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise RoadmapPackError(f"Roadmap pack field {field!r} must be a positive integer.")
+    return value
+
+
+def _pack_positive_number(value: Any, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise RoadmapPackError(f"Roadmap pack field {field!r} must be a positive number.")
+    return float(value)
+
+
+def _prepare_revenue_sprint(raw: Any) -> dict[str, Any]:
+    sprint = _pack_mapping(raw, "revenue_sprint", _REVENUE_SPRINT_FIELDS)
+    missing = _REVENUE_SPRINT_FIELDS - set(sprint)
+    if missing:
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint is missing required fields: "
+            f"{', '.join(sorted(missing))}."
+        )
+
+    sprint_id = _pack_text(sprint.get("id"), "revenue_sprint.id", maximum=80)
+    if not ROADMAP_PACK_ID_RE.fullmatch(sprint_id):
+        raise RoadmapPackError("Roadmap pack revenue_sprint.id has an invalid format.")
+
+    product = _pack_mapping(
+        sprint.get("product"), "revenue_sprint.product", _REVENUE_SPRINT_PRODUCT_FIELDS
+    )
+    if set(product) != _REVENUE_SPRINT_PRODUCT_FIELDS:
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint.product must contain exactly id, name, and url."
+        )
+    product_id = _pack_text(product.get("id"), "revenue_sprint.product.id", maximum=120)
+    if not _ROADMAP_RECORD_ID_RE.fullmatch(product_id):
+        raise RoadmapPackError("Roadmap pack revenue_sprint.product.id has an invalid format.")
+    product_name = _pack_text(product.get("name"), "revenue_sprint.product.name", maximum=240)
+    product_url = _pack_text(product.get("url"), "revenue_sprint.product.url", maximum=1000)
+    parsed_url = urlsplit(product_url)
+    hostname = str(parsed_url.hostname or "").lower()
+    if (
+        parsed_url.scheme.lower() != "https"
+        or not (hostname == "gumroad.com" or hostname.endswith(".gumroad.com"))
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or not parsed_url.path.strip("/")
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint.product.url must be a specific HTTPS Gumroad product URL."
+        )
+
+    channel = _pack_mapping(
+        sprint.get("channel"), "revenue_sprint.channel", _REVENUE_SPRINT_CHANNEL_FIELDS
+    )
+    if set(channel) != _REVENUE_SPRINT_CHANNEL_FIELDS:
+        raise RoadmapPackError("Roadmap pack revenue_sprint.channel must contain exactly id.")
+    channel_id = _pack_text(channel.get("id"), "revenue_sprint.channel.id", maximum=160)
+    if not REVENUE_SPRINT_ACTION_TARGET_RE.fullmatch(channel_id) or "*" in channel_id:
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint.channel.id must name a concrete, namespaced channel."
+        )
+
+    total_budget = _pack_positive_number(
+        sprint.get("total_ai_budget_usd"), "revenue_sprint.total_ai_budget_usd"
+    )
+    daily_budget = _pack_positive_number(
+        sprint.get("daily_ai_budget_usd"), "revenue_sprint.daily_ai_budget_usd"
+    )
+    if not math.isclose(total_budget, REVENUE_SPRINT_TOTAL_AI_BUDGET_USD):
+        raise RoadmapPackError(
+            f"Roadmap pack revenue_sprint.total_ai_budget_usd must be "
+            f"{REVENUE_SPRINT_TOTAL_AI_BUDGET_USD:.2f}."
+        )
+    if not math.isclose(daily_budget, REVENUE_SPRINT_DAILY_AI_BUDGET_USD):
+        raise RoadmapPackError(
+            f"Roadmap pack revenue_sprint.daily_ai_budget_usd must be "
+            f"{REVENUE_SPRINT_DAILY_AI_BUDGET_USD:.2f}."
+        )
+    if sprint.get("daily_budget_includes_emergency_reserve") is not True:
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint.daily_budget_includes_emergency_reserve must be true."
+        )
+    run_days = _pack_positive_int(sprint.get("run_days"), "revenue_sprint.run_days")
+    if run_days != REVENUE_SPRINT_RUN_DAYS:
+        raise RoadmapPackError(
+            f"Roadmap pack revenue_sprint.run_days must be {REVENUE_SPRINT_RUN_DAYS}."
+        )
+
+    checkpoints = _pack_mapping(
+        sprint.get("checkpoint_thresholds"),
+        "revenue_sprint.checkpoint_thresholds",
+        _REVENUE_SPRINT_CHECKPOINT_FIELDS,
+    )
+    if set(checkpoints) != _REVENUE_SPRINT_CHECKPOINT_FIELDS:
+        missing_checkpoints = _REVENUE_SPRINT_CHECKPOINT_FIELDS - set(checkpoints)
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint.checkpoint_thresholds is missing required fields: "
+            f"{', '.join(sorted(missing_checkpoints))}."
+        )
+    day_5 = _pack_mapping(
+        checkpoints.get("day_5_meaningful_interest"),
+        "revenue_sprint.checkpoint_thresholds.day_5_meaningful_interest",
+        _REVENUE_SPRINT_DAY_5_FIELDS,
+    )
+    if set(day_5) != _REVENUE_SPRINT_DAY_5_FIELDS or day_5.get("run_day") != 5:
+        raise RoadmapPackError("The meaningful-interest checkpoint must be fully specified for run day 5.")
+    day_5_minimum = _pack_positive_int(
+        day_5.get("minimum_meaningful_interactions"),
+        "revenue_sprint.checkpoint_thresholds.day_5_meaningful_interest.minimum_meaningful_interactions",
+    )
+    day_15 = _pack_mapping(
+        checkpoints.get("day_15_sale_or_strong_intent"),
+        "revenue_sprint.checkpoint_thresholds.day_15_sale_or_strong_intent",
+        _REVENUE_SPRINT_DAY_15_FIELDS,
+    )
+    if set(day_15) != _REVENUE_SPRINT_DAY_15_FIELDS or day_15.get("run_day") != 15:
+        raise RoadmapPackError("The sale-or-strong-intent checkpoint must be fully specified for run day 15.")
+    day_15_sales = _pack_positive_int(
+        day_15.get("minimum_sales"),
+        "revenue_sprint.checkpoint_thresholds.day_15_sale_or_strong_intent.minimum_sales",
+    )
+    day_15_intent = _pack_positive_int(
+        day_15.get("minimum_strong_intent_signals"),
+        "revenue_sprint.checkpoint_thresholds.day_15_sale_or_strong_intent.minimum_strong_intent_signals",
+    )
+    if day_15.get("satisfy") != "any":
+        raise RoadmapPackError("The day-15 checkpoint satisfy field must be 'any'.")
+    day_20 = _pack_mapping(
+        checkpoints.get("day_20_unconditional_stop"),
+        "revenue_sprint.checkpoint_thresholds.day_20_unconditional_stop",
+        _REVENUE_SPRINT_DAY_20_FIELDS,
+    )
+    if (
+        set(day_20) != _REVENUE_SPRINT_DAY_20_FIELDS
+        or day_20.get("run_day") != 20
+        or day_20.get("unconditional_stop") is not True
+    ):
+        raise RoadmapPackError("The day-20 checkpoint must be an unconditional stop on run day 20.")
+    no_progress_days = _pack_positive_int(
+        checkpoints.get("max_consecutive_no_progress_days"),
+        "revenue_sprint.checkpoint_thresholds.max_consecutive_no_progress_days",
+    )
+    if no_progress_days != 3:
+        raise RoadmapPackError("The revenue sprint must stop after 3 consecutive no-progress days.")
+    trailing_days = _pack_positive_int(
+        checkpoints.get("trailing_window_days"),
+        "revenue_sprint.checkpoint_thresholds.trailing_window_days",
+    )
+    if trailing_days > run_days:
+        raise RoadmapPackError("The revenue sprint trailing window cannot exceed its run days.")
+    minimum_per_day = _pack_positive_number(
+        checkpoints.get("minimum_gross_revenue_usd_per_day"),
+        "revenue_sprint.checkpoint_thresholds.minimum_gross_revenue_usd_per_day",
+    )
+    minimum_trailing = _pack_positive_number(
+        checkpoints.get("minimum_trailing_gross_revenue_usd"),
+        "revenue_sprint.checkpoint_thresholds.minimum_trailing_gross_revenue_usd",
+    )
+    if not math.isclose(minimum_trailing, minimum_per_day * trailing_days):
+        raise RoadmapPackError(
+            "The trailing gross-revenue threshold must equal the per-day threshold times the trailing window."
+        )
+    if checkpoints.get("require_nonnegative_contribution") is not True:
+        raise RoadmapPackError("The revenue sprint must require nonnegative contribution.")
+
+    action_policy = _pack_mapping(
+        sprint.get("action_policy"),
+        "revenue_sprint.action_policy",
+        _REVENUE_SPRINT_ACTION_POLICY_FIELDS,
+    )
+    required_policy_fields = {
+        "revision",
+        "require_owner_confirmation",
+        "allowed_external_actions",
+    }
+    if not required_policy_fields.issubset(action_policy):
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint.action_policy must contain revision, "
+            "require_owner_confirmation, and allowed_external_actions."
+        )
+    revision = _pack_text(
+        action_policy.get("revision"), "revenue_sprint.action_policy.revision", maximum=120
+    )
+    if not _ROADMAP_RECORD_ID_RE.fullmatch(revision):
+        raise RoadmapPackError("Roadmap pack revenue_sprint.action_policy.revision has an invalid format.")
+    if action_policy.get("require_owner_confirmation") is not True:
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint.action_policy.require_owner_confirmation must be true."
+        )
+    raw_actions = action_policy.get("allowed_external_actions")
+    if not isinstance(raw_actions, list) or not 1 <= len(raw_actions) <= 8:
+        raise RoadmapPackError(
+            "Roadmap pack revenue_sprint.action_policy.allowed_external_actions must contain 1 to 8 actions."
+        )
+    clean_actions: list[dict[str, Any]] = []
+    action_pairs: set[tuple[str, str]] = set()
+    for index, raw_action in enumerate(raw_actions):
+        prefix = f"revenue_sprint.action_policy.allowed_external_actions[{index}]"
+        action = _pack_mapping(raw_action, prefix, _REVENUE_SPRINT_POLICY_ACTION_FIELDS)
+        if set(action) != _REVENUE_SPRINT_POLICY_ACTION_FIELDS:
+            raise RoadmapPackError(
+                f"Roadmap pack field {prefix!r} must contain exactly action_type, target, daily_cap, and total_cap."
+            )
+        action_type = _pack_text(action.get("action_type"), f"{prefix}.action_type", maximum=40).lower()
+        if action_type not in REVENUE_SPRINT_KNOWN_ACTION_TYPES:
+            raise RoadmapPackError(
+                f"Roadmap pack field {prefix!r} has an unsupported external action type."
+            )
+        target = _pack_text(action.get("target"), f"{prefix}.target", maximum=240)
+        if not REVENUE_SPRINT_ACTION_TARGET_RE.fullmatch(target) or "*" in target:
+            raise RoadmapPackError(
+                f"Roadmap pack field {prefix!r} must name a concrete, namespaced target."
+            )
+        if action_type in {"publish", "outreach"} and target != channel_id:
+            raise RoadmapPackError(
+                f"Roadmap pack {action_type} actions must target the configured sprint channel."
+            )
+        daily_cap = _pack_positive_int(action.get("daily_cap"), f"{prefix}.daily_cap")
+        total_cap = _pack_positive_int(action.get("total_cap"), f"{prefix}.total_cap")
+        if daily_cap > total_cap:
+            raise RoadmapPackError(f"Roadmap pack field {prefix!r} daily_cap cannot exceed total_cap.")
+        pair = (action_type, target)
+        if pair in action_pairs:
+            raise RoadmapPackError("Roadmap pack revenue_sprint action policy contains duplicate actions.")
+        action_pairs.add(pair)
+        clean_actions.append(
+            {
+                "action_type": action_type,
+                "target": target,
+                "daily_cap": daily_cap,
+                "total_cap": total_cap,
+            }
+        )
+
+    purchase_present = any(action["action_type"] == "purchase" for action in clean_actions)
+    purchase_cap_fields = {"daily_purchase_cap_usd", "total_purchase_cap_usd"}
+    purchase_caps_present = purchase_cap_fields & set(action_policy)
+    clean_policy: dict[str, Any] = {
+        "revision": revision,
+        "require_owner_confirmation": True,
+        "allowed_external_actions": clean_actions,
+    }
+    if purchase_present:
+        if purchase_caps_present != purchase_cap_fields:
+            raise RoadmapPackError(
+                "Purchase authorization requires both daily_purchase_cap_usd and total_purchase_cap_usd."
+            )
+        daily_purchase_cap = _pack_positive_number(
+            action_policy.get("daily_purchase_cap_usd"),
+            "revenue_sprint.action_policy.daily_purchase_cap_usd",
+        )
+        total_purchase_cap = _pack_positive_number(
+            action_policy.get("total_purchase_cap_usd"),
+            "revenue_sprint.action_policy.total_purchase_cap_usd",
+        )
+        if daily_purchase_cap > total_purchase_cap:
+            raise RoadmapPackError("The daily purchase cap cannot exceed the total purchase cap.")
+        clean_policy["daily_purchase_cap_usd"] = _money(daily_purchase_cap)
+        clean_policy["total_purchase_cap_usd"] = _money(total_purchase_cap)
+    elif purchase_caps_present:
+        raise RoadmapPackError("Purchase caps are not permitted when no purchase action is authorized.")
+
+    return {
+        "id": sprint_id,
+        "product": {"id": product_id, "name": product_name, "url": product_url},
+        "channel": {"id": channel_id},
+        "total_ai_budget_usd": _money(total_budget),
+        "daily_ai_budget_usd": _money(daily_budget),
+        "daily_budget_includes_emergency_reserve": True,
+        "run_days": run_days,
+        "checkpoint_thresholds": {
+            "day_5_meaningful_interest": {
+                "run_day": 5,
+                "minimum_meaningful_interactions": day_5_minimum,
+            },
+            "day_15_sale_or_strong_intent": {
+                "run_day": 15,
+                "minimum_sales": day_15_sales,
+                "minimum_strong_intent_signals": day_15_intent,
+                "satisfy": "any",
+            },
+            "day_20_unconditional_stop": {"run_day": 20, "unconditional_stop": True},
+            "max_consecutive_no_progress_days": no_progress_days,
+            "trailing_window_days": trailing_days,
+            "minimum_gross_revenue_usd_per_day": _money(minimum_per_day),
+            "minimum_trailing_gross_revenue_usd": _money(minimum_trailing),
+            "require_nonnegative_contribution": True,
+        },
+        "action_policy": clean_policy,
+    }
+
+
+def _prepare_revenue_sprint_item_action(
+    raw: Any,
+    *,
+    field: str,
+    policy_revision: str,
+    allowed_pairs: set[tuple[str, str]],
+) -> dict[str, str]:
+    action = _pack_mapping(raw, field, _REVENUE_SPRINT_ITEM_ACTION_FIELDS)
+    if set(action) != _REVENUE_SPRINT_ITEM_ACTION_FIELDS:
+        raise RoadmapPackError(
+            f"Roadmap pack field {field!r} must contain exactly action_type, target, and policy_revision."
+        )
+    action_type = _pack_text(action.get("action_type"), f"{field}.action_type", maximum=40).lower()
+    target = _pack_text(action.get("target"), f"{field}.target", maximum=240)
+    item_revision = _pack_text(
+        action.get("policy_revision"), f"{field}.policy_revision", maximum=120
+    )
+    if item_revision != policy_revision or (action_type, target) not in allowed_pairs:
+        raise RoadmapPackError(
+            f"Roadmap pack field {field!r} does not exactly match the revision-bound action policy."
+        )
+    return {
+        "action_type": action_type,
+        "target": target,
+        "policy_revision": item_revision,
+    }
+
+
 def _roadmap_pack_records_are_intact(
     state: Mapping[str, Any],
     receipt: Mapping[str, Any],
@@ -949,6 +1357,19 @@ def _roadmap_pack_records_are_intact(
 ) -> bool:
     goal_id = str(goal_record.get("id") or "")
     item_ids = [str(item.get("id") or "") for item in item_records]
+    record_hash_version = receipt.get("record_hash_version", 1)
+    if record_hash_version not in {1, 2}:
+        return False
+    goal_hash_fields = (
+        _ROADMAP_PACK_GOAL_HASH_FIELDS_V2
+        if record_hash_version == 2
+        else _ROADMAP_PACK_GOAL_HASH_FIELDS
+    )
+    item_hash_fields = (
+        _ROADMAP_PACK_ITEM_HASH_FIELDS_V2
+        if record_hash_version == 2
+        else _ROADMAP_PACK_ITEM_HASH_FIELDS
+    )
     receipt_item_ids = receipt.get("roadmap_item_ids")
     receipt_item_hashes = receipt.get("roadmap_item_hashes")
     if not isinstance(receipt_item_ids, list) or not isinstance(
@@ -956,11 +1377,11 @@ def _roadmap_pack_records_are_intact(
     ):
         return False
     goal_hash = _roadmap_pack_record_hash(
-        _roadmap_pack_record_projection(goal_record, _ROADMAP_PACK_GOAL_HASH_FIELDS)
+        _roadmap_pack_record_projection(goal_record, goal_hash_fields)
     )
     item_hashes = {
         str(item.get("id") or ""): _roadmap_pack_record_hash(
-            _roadmap_pack_record_projection(item, _ROADMAP_PACK_ITEM_HASH_FIELDS)
+            _roadmap_pack_record_projection(item, item_hash_fields)
         )
         for item in item_records
     }
@@ -973,6 +1394,16 @@ def _roadmap_pack_records_are_intact(
         or dict(receipt_item_hashes) != item_hashes
     ):
         return False
+    if record_hash_version == 2:
+        sprint = goal_record.get("revenue_sprint")
+        if not isinstance(sprint, Mapping):
+            return False
+        sprint_hash = _roadmap_pack_record_hash(sprint)
+        if (
+            receipt.get("revenue_sprint") != sprint
+            or str(receipt.get("revenue_sprint_hash") or "") != sprint_hash
+        ):
+            return False
     projects = [
         project
         for project in state.get("projects", []) or []
@@ -997,7 +1428,7 @@ def _roadmap_pack_records_are_intact(
         str(persisted_goal.get("source_manifest_record_hash") or "") != goal_hash
         or _roadmap_pack_record_hash(
             _roadmap_pack_record_projection(
-                persisted_goal, _ROADMAP_PACK_GOAL_HASH_FIELDS
+                persisted_goal, goal_hash_fields
             )
         )
         != goal_hash
@@ -1023,7 +1454,7 @@ def _roadmap_pack_records_are_intact(
             != expected_hash
             or _roadmap_pack_record_hash(
                 _roadmap_pack_record_projection(
-                    persisted_item, _ROADMAP_PACK_ITEM_HASH_FIELDS
+                    persisted_item, item_hash_fields
                 )
             )
             != expected_hash
@@ -1079,6 +1510,23 @@ def _prepare_roadmap_pack(
             f"Target project {project_id!r} is {project_status!r}; activate it before queueing."
         )
 
+    revenue_sprint = (
+        _prepare_revenue_sprint(manifest.get("revenue_sprint"))
+        if "revenue_sprint" in manifest
+        else None
+    )
+    sprint_policy_revision = (
+        str(revenue_sprint["action_policy"]["revision"]) if revenue_sprint else ""
+    )
+    sprint_allowed_action_pairs = (
+        {
+            (str(action["action_type"]), str(action["target"]))
+            for action in revenue_sprint["action_policy"]["allowed_external_actions"]
+        }
+        if revenue_sprint
+        else set()
+    )
+
     raw_goal = manifest.get("goal")
     if not isinstance(raw_goal, Mapping):
         raise RoadmapPackError("Roadmap pack goal must be an object.")
@@ -1103,15 +1551,22 @@ def _prepare_roadmap_pack(
         "description": goal_description,
         "status": "active",
     }
+    if revenue_sprint is not None:
+        clean_goal_record["revenue_sprint"] = deepcopy(revenue_sprint)
 
     raw_items = manifest.get("roadmap_items")
     if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= ROADMAP_PACK_MAX_ITEMS:
         raise RoadmapPackError(
             f"Roadmap pack roadmap_items must contain 1 to {ROADMAP_PACK_MAX_ITEMS} items."
         )
+    if revenue_sprint is not None and len(raw_items) != REVENUE_SPRINT_RUN_DAYS:
+        raise RoadmapPackError(
+            f"A revenue sprint roadmap pack must contain exactly {REVENUE_SPRINT_RUN_DAYS} items."
+        )
     clean_items: list[dict[str, Any]] = []
     item_ids: list[str] = []
     authorization_levels: set[str] = set()
+    sprint_run_days: set[int] = set()
     for index, raw_item in enumerate(raw_items):
         prefix = f"roadmap_items[{index}]"
         if not isinstance(raw_item, Mapping):
@@ -1138,13 +1593,54 @@ def _prepare_roadmap_pack(
                 f"Roadmap pack item {item_id!r} must begin with status 'ready'."
             )
         authorization = str(raw_item.get("authorization_level") or "").strip().lower()
-        if authorization not in {
+        allowed_authorizations = {
             AuthorizationLevel.OBSERVE.value,
             AuthorizationLevel.PROPOSE.value,
-        }:
+        }
+        if revenue_sprint is not None:
+            allowed_authorizations.add(AuthorizationLevel.EXTERNAL_ACTION.value)
+        if authorization not in allowed_authorizations:
+            if revenue_sprint is None:
+                raise RoadmapPackError(
+                    f"Roadmap pack item {item_id!r} exceeds the observe/propose authorization limit."
+                )
             raise RoadmapPackError(
-                f"Roadmap pack item {item_id!r} exceeds the observe/propose authorization limit."
+                f"Roadmap pack item {item_id!r} exceeds the revenue-sprint authorization policy."
             )
+        sprint_run_day: Optional[int] = None
+        clean_external_action: Optional[dict[str, str]] = None
+        if revenue_sprint is None:
+            if "revenue_sprint_run_day" in raw_item or "external_action" in raw_item:
+                raise RoadmapPackError(
+                    f"Non-sprint roadmap item {item_id!r} cannot contain revenue-sprint fields."
+                )
+        else:
+            sprint_run_day = _pack_positive_int(
+                raw_item.get("revenue_sprint_run_day"),
+                f"{prefix}.revenue_sprint_run_day",
+            )
+            if sprint_run_day > REVENUE_SPRINT_RUN_DAYS:
+                raise RoadmapPackError(
+                    f"Roadmap pack item {item_id!r} has a revenue_sprint_run_day outside 1..{REVENUE_SPRINT_RUN_DAYS}."
+                )
+            if sprint_run_day in sprint_run_days:
+                raise RoadmapPackError("Revenue sprint roadmap run days must be unique.")
+            sprint_run_days.add(sprint_run_day)
+            if authorization == AuthorizationLevel.EXTERNAL_ACTION.value:
+                if "external_action" not in raw_item:
+                    raise RoadmapPackError(
+                        f"External-action roadmap item {item_id!r} must declare an exact external_action."
+                    )
+                clean_external_action = _prepare_revenue_sprint_item_action(
+                    raw_item.get("external_action"),
+                    field=f"{prefix}.external_action",
+                    policy_revision=sprint_policy_revision,
+                    allowed_pairs=sprint_allowed_action_pairs,
+                )
+            elif "external_action" in raw_item:
+                raise RoadmapPackError(
+                    f"Observe/propose roadmap item {item_id!r} cannot declare an external_action."
+                )
         if raw_item.get("blockers") != []:
             raise RoadmapPackError(
                 f"Roadmap pack item {item_id!r} must not begin with blockers."
@@ -1260,12 +1756,28 @@ def _prepare_roadmap_pack(
             "human_action": "",
             "requires_recent_run_evidence": requires_evidence,
         }
+        if revenue_sprint is not None:
+            clean_item.update(
+                {
+                    "revenue_sprint_id": revenue_sprint["id"],
+                    "revenue_sprint_run_day": sprint_run_day,
+                    "action_policy_revision": sprint_policy_revision,
+                }
+            )
+            if clean_external_action is not None:
+                clean_item["external_action"] = clean_external_action
         clean_items.append(clean_item)
         item_ids.append(item_id)
         authorization_levels.add(authorization)
 
     if len(item_ids) != len(set(item_ids)):
         raise RoadmapPackError("Roadmap pack roadmap item IDs must be unique.")
+    if revenue_sprint is not None and sprint_run_days != set(
+        range(1, REVENUE_SPRINT_RUN_DAYS + 1)
+    ):
+        raise RoadmapPackError(
+            f"Revenue sprint roadmap items must cover every run day from 1 through {REVENUE_SPRINT_RUN_DAYS}."
+        )
     existing_item_counts: dict[str, int] = {}
     for candidate_project in state.get("projects", []) or []:
         if not isinstance(candidate_project, Mapping):
@@ -1313,6 +1825,8 @@ def _prepare_roadmap_pack(
         "authorization_levels": sorted(authorization_levels),
         "already_queued": False,
     }
+    if revenue_sprint is not None:
+        preview["revenue_sprint"] = deepcopy(revenue_sprint)
     if receipts:
         if len(receipts) != 1 or not _roadmap_pack_records_are_intact(
             state,
@@ -1406,15 +1920,25 @@ def _prepare_roadmap_pack(
     candidate_project = candidate_projects[0]
     timestamp = _aware_utc(queued_at).isoformat()
     source = _redact_text(str(approval_source or "owner_confirmation")).strip()[:200]
+    goal_hash_fields = (
+        _ROADMAP_PACK_GOAL_HASH_FIELDS_V2
+        if revenue_sprint is not None
+        else _ROADMAP_PACK_GOAL_HASH_FIELDS
+    )
+    item_hash_fields = (
+        _ROADMAP_PACK_ITEM_HASH_FIELDS_V2
+        if revenue_sprint is not None
+        else _ROADMAP_PACK_ITEM_HASH_FIELDS
+    )
     goal_record_hash = _roadmap_pack_record_hash(
         _roadmap_pack_record_projection(
-            clean_goal_record, _ROADMAP_PACK_GOAL_HASH_FIELDS
+            clean_goal_record, goal_hash_fields
         )
     )
     item_record_hashes = {
         clean_item["id"]: _roadmap_pack_record_hash(
             _roadmap_pack_record_projection(
-                clean_item, _ROADMAP_PACK_ITEM_HASH_FIELDS
+                clean_item, item_hash_fields
             )
         )
         for clean_item in clean_items
@@ -1452,6 +1976,14 @@ def _prepare_roadmap_pack(
         "queued_at": timestamp,
         "approval_source": source,
     }
+    if revenue_sprint is not None:
+        receipt.update(
+            {
+                "record_hash_version": 2,
+                "revenue_sprint": deepcopy(revenue_sprint),
+                "revenue_sprint_hash": _roadmap_pack_record_hash(revenue_sprint),
+            }
+        )
     if backup_filename:
         receipt["backup_filename"] = str(backup_filename)
     candidate.setdefault("roadmap_pack_history", []).append(receipt)
@@ -1889,8 +2421,14 @@ def _requires_recent_run_evidence(item: Mapping[str, Any]) -> bool:
 def _select_project_and_item(
     state: Mapping[str, Any],
     excluded_item_ids: Optional[set[str]] = None,
+    eligible_item_ids: Optional[set[str]] = None,
 ) -> Optional[tuple[dict[str, Any], dict[str, Any]]]:
     excluded = {str(value) for value in (excluded_item_ids or set())}
+    eligible = (
+        None
+        if eligible_item_ids is None
+        else {str(value) for value in eligible_item_ids}
+    )
     all_items = {
         str(item.get("id")): item
         for _, _, _, item in _iter_project_items(state)
@@ -1898,7 +2436,8 @@ def _select_project_and_item(
     }
     candidates = []
     for project_index, item_index, project, item in _iter_project_items(state):
-        if str(item.get("id")) in excluded:
+        item_id = str(item.get("id"))
+        if item_id in excluded or (eligible is not None and item_id not in eligible):
             continue
         status = str(item.get("status", "planned")).strip().lower()
         if status not in ACTIONABLE_TASK_STATUSES:
@@ -3551,6 +4090,8 @@ class AutonomousWorkflow:
         self,
         report: dict[str, Any],
         excluded_item_ids: Optional[set[str]] = None,
+        eligible_item_ids: Optional[set[str]] = None,
+        allow_ideation: bool = True,
     ) -> dict[str, Any]:
         try:
             state = self.store.load()
@@ -3613,7 +4154,11 @@ class AutonomousWorkflow:
         self.store.save(state)
 
         try:
-            selected = _select_project_and_item(state, excluded_item_ids)
+            selected = _select_project_and_item(
+                state,
+                excluded_item_ids,
+                eligible_item_ids,
+            )
             if selected is None:
                 report["daily_plan"].append(
                     "No actionable roadmap work; consider one controlled Lumen idea batch."
@@ -3621,6 +4166,9 @@ class AutonomousWorkflow:
                 if report["dry_run"]:
                     report["deferred"].append("Creative callback skipped because this is a dry run.")
                     self._finish_report(report, "dry_run", "idle_dry_run")
+                elif not allow_ideation:
+                    report["deferred"].append("Creative work was disabled by the session policy.")
+                    self._finish_report(report, "completed", "idle")
                 elif remaining_budget <= 0:
                     report["deferred"].append("Creative work was deferred because no ordinary daily budget remains.")
                     self._finish_report(report, "deferred", "budget_deferred")
@@ -3935,7 +4483,14 @@ class AutonomousWorkflow:
         self._persist_report(report)
         return redact_secrets(report)
 
-    def _run_session_locked(self, report: dict[str, Any]) -> dict[str, Any]:
+    def _run_session_locked(
+        self,
+        report: dict[str, Any],
+        *,
+        eligible_item_ids: Optional[set[str]],
+        max_selected_items: int,
+        allow_ideation: bool,
+    ) -> dict[str, Any]:
         attempted_item_ids: set[str] = set()
         task_attempts = 0
         creative_attempted = False
@@ -3944,8 +4499,12 @@ class AutonomousWorkflow:
         stop_reason = "no_actionable_work"
 
         while True:
-            if task_attempts >= self.config.max_tasks_per_run:
-                stop_reason = "max_tasks_reached"
+            if task_attempts >= max_selected_items:
+                stop_reason = (
+                    "session_policy_item_cap"
+                    if max_selected_items < self.config.max_tasks_per_run
+                    else "max_tasks_reached"
+                )
                 break
             if time.monotonic() - started_monotonic >= self.config.max_session_minutes * 60:
                 stop_reason = "max_session_time_reached"
@@ -3961,7 +4520,11 @@ class AutonomousWorkflow:
 
             try:
                 current_state = self.store.load()
-                next_selected = _select_project_and_item(current_state, attempted_item_ids)
+                next_selected = _select_project_and_item(
+                    current_state,
+                    attempted_item_ids,
+                    eligible_item_ids,
+                )
             except CorruptAutonomyStateError:
                 next_selected = None
             if next_selected is None:
@@ -3977,12 +4540,20 @@ class AutonomousWorkflow:
                 bool(report["dry_run"]),
                 report.get("scheduled_date") if not report["cycle_reports"] else None,
             )
+            cycle["session_parent_run_id"] = report["run_id"]
+            cycle["session_policy"] = deepcopy(report.get("session_policy", {}))
+            cycle["report_metadata"] = deepcopy(report.get("report_metadata", {}))
             if not report["cycle_reports"]:
                 cycle["run_id"] = report["run_id"]
                 cycle["start_time"] = report["start_time"]
                 cycle["started_at"] = report["started_at"]
                 cycle["report_path"] = report["report_path"]
-            cycle = self._run_locked(cycle, attempted_item_ids)
+            cycle = self._run_locked(
+                cycle,
+                attempted_item_ids,
+                eligible_item_ids,
+                allow_ideation,
+            )
             cycle["cycle_index"] = len(report["cycle_reports"]) + 1
             self._merge_session_cycle(report, cycle)
 
@@ -4052,8 +4623,61 @@ class AutonomousWorkflow:
         *,
         dry_run: Optional[bool] = None,
         scheduled_date: Optional[str] = None,
+        eligible_item_ids: Optional[Iterable[str]] = None,
+        max_selected_items: Optional[int] = None,
+        allow_ideation: bool = True,
+        report_metadata: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         """Run a bounded multi-item session under one persistent overlap lock."""
+
+        if eligible_item_ids is None:
+            normalized_eligible_ids: Optional[set[str]] = None
+        else:
+            if isinstance(eligible_item_ids, (str, bytes)):
+                raise ValueError("eligible_item_ids must be an iterable of non-empty text IDs.")
+            normalized_eligible_ids = set()
+            for raw_item_id in eligible_item_ids:
+                if not isinstance(raw_item_id, str) or not raw_item_id.strip():
+                    raise ValueError("eligible_item_ids must contain only non-empty text IDs.")
+                normalized_eligible_ids.add(raw_item_id.strip())
+        if max_selected_items is None:
+            effective_max_selected_items = self.config.max_tasks_per_run
+        else:
+            if (
+                isinstance(max_selected_items, bool)
+                or not isinstance(max_selected_items, int)
+                or max_selected_items <= 0
+            ):
+                raise ValueError("max_selected_items must be a positive integer.")
+            effective_max_selected_items = min(
+                max_selected_items,
+                self.config.max_tasks_per_run,
+            )
+        if not isinstance(allow_ideation, bool):
+            raise ValueError("allow_ideation must be a boolean.")
+        if report_metadata is None:
+            normalized_report_metadata: dict[str, Any] = {}
+        else:
+            if not isinstance(report_metadata, Mapping):
+                raise ValueError("report_metadata must be a JSON-serializable object.")
+            try:
+                redacted_metadata = redact_secrets(deepcopy(dict(report_metadata)))
+                encoded_metadata = json.dumps(
+                    redacted_metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                if len(encoded_metadata) > SESSION_REPORT_METADATA_MAX_BYTES:
+                    raise ValueError(
+                        f"report_metadata exceeds the {SESSION_REPORT_METADATA_MAX_BYTES}-byte limit."
+                    )
+                normalized_report_metadata = json.loads(encoded_metadata.decode("utf-8"))
+            except (TypeError, ValueError) as exc:
+                if isinstance(exc, ValueError) and str(exc).startswith("report_metadata exceeds"):
+                    raise
+                raise ValueError("report_metadata must contain only finite JSON values.") from exc
 
         effective_dry_run = self.config.dry_run if dry_run is None else bool(dry_run)
         normalized_trigger = str(trigger_source or "manual").strip().lower()
@@ -4066,6 +4690,17 @@ class AutonomousWorkflow:
             cycle_reports=[],
             max_tasks_per_run=self.config.max_tasks_per_run,
             max_session_minutes=self.config.max_session_minutes,
+            session_policy={
+                "eligible_item_ids": (
+                    None
+                    if normalized_eligible_ids is None
+                    else sorted(normalized_eligible_ids)
+                ),
+                "requested_max_selected_items": max_selected_items,
+                "effective_max_selected_items": effective_max_selected_items,
+                "allow_ideation": allow_ideation,
+            },
+            report_metadata=normalized_report_metadata,
         )
         if normalized_trigger in {"scheduled", "scheduler", "daily"} and not self.config.enabled:
             report["deferred"].append("Scheduled autonomy is disabled by configuration.")
@@ -4074,7 +4709,12 @@ class AutonomousWorkflow:
         run_lock = FileLock(str(self.run_lock_path), timeout=self.config.lock_timeout_seconds)
         try:
             with run_lock:
-                return self._run_session_locked(report)
+                return self._run_session_locked(
+                    report,
+                    eligible_item_ids=normalized_eligible_ids,
+                    max_selected_items=effective_max_selected_items,
+                    allow_ideation=allow_ideation,
+                )
         except FileLockTimeout:
             report["blockers"].append("Another autonomous run holds the persistent run lock.")
             return self._finish_session(report, "overlap_prevented")

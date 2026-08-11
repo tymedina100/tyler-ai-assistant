@@ -8,6 +8,7 @@ import threading
 import time
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -783,6 +784,82 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("model-estimated reading time as a proxy", evidence)
         self.assertIn("Never claim an empirical human test", evidence)
 
+    def test_revenue_sprint_evidence_is_bounded_redacted_and_causally_scoped(self):
+        sprint = {
+            "id": "sprint-1",
+            "status": "active",
+            "experiments": [{
+                "id": "exp-1",
+                "hypothesis": "Try angle one with TOKEN=do-not-leak",
+                "result": "One receipt; no verified engagement.",
+            }],
+            "run_days": [{
+                "ordinal": 1,
+                "date": "2026-08-11",
+                "outcome": "succeeded",
+                "progress": True,
+                "experiment_id": "exp-1",
+            }],
+            "revenue_snapshots": [{
+                "run_id": "run-1",
+                "phase": "after",
+                "sales_count": 1,
+                "revenue_usd": 5.0,
+                "sales_delta": 1,
+                "revenue_delta_usd": 5.0,
+            }],
+            "signals": [{"type": "sale", "count": 1, "value_usd": 5.0}],
+            "checkpoint_results": [],
+            "pivot_history": [],
+            "action_journal": [{
+                "run_id": "run-1",
+                "action_type": "publish",
+                "target": "bluesky:company.example",
+                "status": "succeeded",
+                "payload_digest": "must-not-be-in-context",
+            }],
+        }
+        with patch.object(
+            self.group.company_mode,
+            "revenue_sprint_budget_snapshot",
+            return_value={"run_days_used": 1, "remaining_total_usd": 95.0},
+        ):
+            snapshot = self.group._revenue_sprint_evidence_snapshot({}, sprint)
+
+        rendered = json.dumps(snapshot, sort_keys=True)
+        self.assertNotIn("do-not-leak", rendered)
+        self.assertNotIn("must-not-be-in-context", rendered)
+        self.assertNotIn("payload_digest", rendered)
+        self.assertEqual(snapshot["signal_totals"]["sale"]["count"], 1)
+        evidence = self.group._autonomy_execution_evidence({
+            "revenue_sprint_evidence": snapshot,
+        })
+        self.assertIn("Bounded Revenue Sprint evidence", evidence)
+        self.assertIn("receipt proves an action, not engagement or a sale", evidence)
+        self.assertIn("may not identify the exact causal post", evidence)
+
+    def test_day_six_experiment_persists_one_checkpoint_driven_variable(self):
+        item = {
+            "id": "D06",
+            "title": "Pivot",
+            "description": "Change one evidenced variable.",
+            "revenue_sprint_run_day": 6,
+            "external_action": {"action_type": "publish"},
+        }
+        sprint = {
+            "checkpoint_results": [{
+                "day": 5,
+                "decision": "pivot",
+                "evidence": {"meaningful_interest_count": 0},
+            }],
+        }
+
+        experiment = self.group._campaign_experiment(item, sprint)
+
+        self.assertEqual(experiment["changed_variable"], "call_to_action")
+        self.assertIn("Day-5 decision=pivot", experiment["evidence_basis"])
+        self.assertIn("meaningful_interest_count", experiment["evidence_basis"])
+
     def test_structured_worker_block_preserves_specific_failure_category(self):
         self.assertEqual(
             self.group._answer_failure_classification(
@@ -1072,6 +1149,115 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Already queued: yes", rendered)
         self.assertIn("No approval was staged", rendered)
 
+    async def test_already_queued_revenue_pack_can_restage_missing_activation(self):
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        sprint = {
+            "id": "sprint-1",
+            "product": {"name": "Kit", "url": "https://example.test/kit"},
+            "channel": {"id": "bluesky:company.example"},
+            "total_ai_budget_usd": 100.0,
+            "daily_ai_budget_usd": 5.0,
+            "run_days": 20,
+            "action_policy": {
+                "revision": "policy-1",
+                "allowed_external_actions": [{
+                    "action_type": "publish",
+                    "target": "bluesky:company.example",
+                    "daily_cap": 1,
+                    "total_cap": 20,
+                }],
+            },
+        }
+        preview = {
+            "manifest_id": "revenue-pack-v1",
+            "manifest_revision": "revision-pack-1",
+            "project_id": "assistant",
+            "project_name": "Assistant",
+            "goal_id": "revenue-goal",
+            "goal_title": "Validate revenue",
+            "item_count": 20,
+            "roadmap_item_ids": ["D01"],
+            "authorization_levels": ["external_action"],
+            "already_queued": True,
+            "revenue_sprint": sprint,
+        }
+        workflow = types.SimpleNamespace(
+            preview_roadmap_pack=Mock(return_value=(True, preview)),
+            queue_roadmap_pack=Mock(),
+        )
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(
+            self.group.company_mode, "load_state", return_value={"revenue_sprints": []}
+        ), patch.object(
+            self.group.company_mode, "active_revenue_sprint", return_value=None
+        ), patch.object(
+            self.group, "reply_chunks", new=AsyncMock()
+        ) as reply:
+            await self.group.handle_autorun_command(
+                update, "/autorun queue revenue-pack-v1", allow_live=True
+            )
+
+        pending = self.fake_main.pending_actions["group"]
+        self.assertTrue(pending["activation_only"])
+        self.assertEqual(pending["revenue_sprint_id"], "sprint-1")
+        self.assertIn("activation staged", reply.await_args.args[1].lower())
+        self.assertIn("Reply /confirm", reply.await_args.args[1])
+        workflow.queue_roadmap_pack.assert_not_called()
+
+    async def test_confirmed_activation_recovery_runs_preflight_without_reimport(self):
+        sprint = {
+            "id": "sprint-1",
+            "product": {"name": "Kit", "url": "https://example.test/kit"},
+            "channel": {"id": "bluesky:company.example"},
+            "action_policy": {"revision": "policy-1", "allowed_external_actions": []},
+        }
+        self.fake_main.pending_actions["group"] = {
+            "type": "autonomy_roadmap_pack",
+            "manifest_id": "revenue-pack-v1",
+            "expected_revision": "revision-pack-1",
+            "revenue_sprint_id": "sprint-1",
+            "activation_only": True,
+            "requested_by_user_id": 42,
+        }
+        workflow = types.SimpleNamespace(
+            preview_roadmap_pack=Mock(return_value=(True, {
+                "manifest_id": "revenue-pack-v1",
+                "manifest_revision": "revision-pack-1",
+                "already_queued": True,
+                "revenue_sprint": sprint,
+            })),
+            queue_roadmap_pack=Mock(return_value=(
+                True,
+                "Roadmap pack was already queued; no duplicate items were created.",
+            )),
+        )
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=42),
+            message=types.SimpleNamespace(reply_text=AsyncMock()),
+        )
+        with patch.object(
+            self.group, "_get_autonomy_workflow", return_value=workflow
+        ), patch.object(
+            self.group,
+            "_activate_revenue_sprint",
+            new=AsyncMock(return_value={"id": "sprint-1"}),
+        ) as activate, patch.object(
+            self.group, "reply_chunks", new=AsyncMock()
+        ) as reply:
+            handled = await self.group._handle_pending_confirmation(update, "/confirm")
+
+        self.assertTrue(handled)
+        activate.assert_awaited_once_with(
+            sprint,
+            approval_source="telegram_owner:42",
+        )
+        self.assertNotIn("group", self.fake_main.pending_actions)
+        self.assertIn("Activated Revenue Sprint sprint-1", reply.await_args.args[1])
+
     async def test_autorun_queue_requires_manifest_group_and_idle_runners(self):
         update = types.SimpleNamespace(
             effective_user=types.SimpleNamespace(id=42),
@@ -1124,6 +1310,10 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             "requested_by_user_id": 42,
         }
         workflow = types.SimpleNamespace(
+            preview_roadmap_pack=Mock(return_value=(True, {
+                "manifest_id": "assistant-production-v1",
+                "manifest_revision": "revision-pack-1",
+            })),
             queue_roadmap_pack=Mock(return_value=(
                 True,
                 "Queued 3 ready roadmap items. No autonomous run was started.",
@@ -1186,6 +1376,10 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             "requested_by_user_id": 42,
         }
         workflow = types.SimpleNamespace(
+            preview_roadmap_pack=Mock(return_value=(True, {
+                "manifest_id": "assistant-production-v1",
+                "manifest_revision": "revision-pack-1",
+            })),
             queue_roadmap_pack=Mock(return_value=(
                 False,
                 "Another autonomous run holds the lock.",
@@ -1641,14 +1835,128 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_autonomy_session_calls_bounded_workflow_api(self):
         report = {"cycle_reports": [], "telegram_summary": "Session complete"}
         workflow = types.SimpleNamespace(run_session=Mock(return_value=report))
-        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow):
+        options = {
+            "eligible_item_ids": ["AUTO-1"],
+            "max_selected_items": None,
+            "allow_ideation": True,
+            "report_metadata": None,
+            "campaign_id": None,
+        }
+        with patch.object(self.group, "_get_autonomy_workflow", return_value=workflow), patch.object(
+            self.group,
+            "_revenue_sprint_session_options",
+            new=AsyncMock(return_value=options),
+        ):
             returned = await self.group._run_autonomy_session("scheduled", dry_run=False)
 
         self.assertIs(returned, report)
         workflow.run_session.assert_called_once_with(
             trigger_source="scheduled",
             dry_run=False,
+            eligible_item_ids=["AUTO-1"],
+            max_selected_items=None,
+            allow_ideation=True,
+            report_metadata=None,
         )
+
+    def test_revenue_sprint_manifest_maps_only_the_exact_company_bluesky_account(self):
+        manifest = {
+            "id": "sprint-company-bluesky",
+            "product": {
+                "id": "kit",
+                "name": "Freelancer Cold-Email Starter Pack",
+                "url": "https://tymedina.gumroad.com/l/freelancer-cold-email",
+            },
+            "channel": {"id": "bluesky:freelanceremailkit.bsky.social"},
+            "total_ai_budget_usd": 100.0,
+            "daily_ai_budget_usd": 5.0,
+            "run_days": 20,
+            "checkpoint_thresholds": {
+                "day_5_meaningful_interest": {"minimum_meaningful_interactions": 1},
+                "day_15_sale_or_strong_intent": {
+                    "minimum_sales": 1,
+                    "minimum_strong_intent_signals": 1,
+                },
+                "max_consecutive_no_progress_days": 3,
+                "trailing_window_days": 7,
+                "minimum_gross_revenue_usd_per_day": 5.0,
+                "minimum_trailing_gross_revenue_usd": 35.0,
+                "require_nonnegative_contribution": True,
+            },
+            "action_policy": {
+                "revision": "bluesky-publish-v1",
+                "allowed_external_actions": [{
+                    "action_type": "publish",
+                    "target": "bluesky:freelanceremailkit.bsky.social",
+                    "daily_cap": 1,
+                    "total_cap": 20,
+                }],
+            },
+        }
+        product = {
+            "project_id": "proj-product",
+            "gumroad_product_id": "gumroad-1",
+        }
+
+        payload = self.group._revenue_sprint_manifest_payload(
+            manifest,
+            approval_source="telegram_owner:42",
+            product=product,
+        )
+
+        self.assertEqual(payload["channel"]["type"], "bluesky")
+        self.assertEqual(
+            payload["channel"]["account_id"], "freelanceremailkit.bsky.social"
+        )
+        self.assertEqual(
+            payload["automation_policy"]["allowed_targets"]["publish"],
+            ["bluesky:freelanceremailkit.bsky.social"],
+        )
+        self.assertEqual(payload["automation_policy"]["daily_action_caps"]["publish"], 1)
+        self.assertEqual(payload["automation_policy"]["total_action_caps"]["publish"], 20)
+        self.assertEqual(payload["automation_policy"]["approved_by"], "telegram_owner:42")
+        self.assertEqual(payload["product"]["ownership"], "company_owned")
+        self.assertFalse(payload["product"]["personal_fallback_allowed"])
+
+    async def test_campaign_session_selects_one_day_and_weekend_live_is_zero_action(self):
+        item = {
+            "id": "SPRINT-D01",
+            "revenue_sprint_id": "sprint-1",
+            "revenue_sprint_run_day": 1,
+        }
+        workflow = types.SimpleNamespace(load_state=Mock(return_value={
+            "projects": [{"roadmap_items": [item]}],
+        }))
+        sprint = {
+            "id": "sprint-1",
+            "status": "active",
+            "timezone": "America/Phoenix",
+            "run_days": [],
+            "channel": {"destination_scope": "bluesky:freelanceremailkit.bsky.social"},
+            "product": {"gumroad_url": "https://example.test/product"},
+            "pivot_required": False,
+        }
+        company_state = {"company": {"active_revenue_sprint_id": "sprint-1"}}
+        budget = {"run_days_used": 0, "max_run_days": 20}
+
+        class SaturdayDateTime:
+            @classmethod
+            def now(cls, zone):
+                return datetime(2026, 8, 8, 9, 0, tzinfo=zone)
+
+        with patch.object(self.group.company_mode, "load_state", return_value=company_state), patch.object(
+            self.group.company_mode, "active_revenue_sprint", return_value=sprint
+        ), patch.object(
+            self.group.company_mode, "revenue_sprint_budget_snapshot", return_value=budget
+        ), patch.object(self.group, "datetime", SaturdayDateTime):
+            preview = await self.group._revenue_sprint_session_options(workflow, dry_run=True)
+            live = await self.group._revenue_sprint_session_options(workflow, dry_run=False)
+
+        self.assertEqual(preview["eligible_item_ids"], ["SPRINT-D01"])
+        self.assertEqual(preview["max_selected_items"], 1)
+        self.assertFalse(preview["allow_ideation"])
+        self.assertEqual(live["eligible_item_ids"], [])
+        self.assertFalse(live["report_metadata"]["weekday_eligible"])
 
     async def test_scheduled_live_session_deduplicates_escalations_and_posts_one_summary(self):
         report = {
@@ -1942,6 +2250,227 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["allowed_tool_names"], {"read_file"})
         self.assertFalse(kwargs["include_memories"])
         self.assertFalse(any(call.args == (True,) for call in fake_main.set_company_execution.call_args_list))
+
+    async def test_model_campaign_worker_is_blocked_before_tool_or_context(self):
+        target = "bluesky:company.example"
+        capability = {
+            "allowed": True,
+            "reason": "allowed",
+            "campaign_id": "sprint-1",
+            "campaign_status": "active",
+            "action_type": "publish",
+            "target": target,
+            "policy_revision": "policy-1",
+            "requested_policy_revision": "policy-1",
+        }
+        task = {
+            "id": "campaign-worker-1",
+            "owner": "marketing",
+            "title": "Publish one bounded company post",
+            "model": "gpt-5.4-mini",
+            "model_reason": "Standard campaign copy and one exact tool call.",
+            "estimate_usd": 0.10,
+            "execution_attempts": 0,
+            "attempt_history": [],
+            "authorization_level": "external_action",
+            "enforce_authorization": True,
+        }
+        project = {
+            "id": "project-1",
+            "title": "Campaign",
+            "goal": "Validate one channel",
+            "campaign_id": "sprint-1",
+            "revenue_sprint_run_id": "run-1",
+            "external_action": {
+                "action_type": "publish",
+                "target": target,
+                "policy_revision": "policy-1",
+            },
+        }
+        sink = {
+            "cost_usd": 0.0,
+            "artifacts": [],
+            "usage_records": [],
+            "context": "test",
+            "campaign_id": "sprint-1",
+            "revenue_sprint_run_id": "run-1",
+            "campaign_action_type": "publish",
+            "campaign_action_target": target,
+            "campaign_policy_revision": "policy-1",
+            "dry_run": False,
+        }
+        observed = []
+
+        def ask_specialist(_key, _prompt, **kwargs):
+            context = self.group.revenue_actions.current_campaign_action_context()
+            observed.append(context)
+            self.assertEqual(
+                kwargs["allowed_tool_names"],
+                {"read_file", "campaign_publish_bluesky"},
+            )
+            return "Published one verified company-owned campaign post."
+
+        self.fake_main.ask_specialist = Mock(side_effect=ask_specialist)
+        state = {"projects": [project], "tasks": [{**task, "status": "done"}], "company": {}}
+        with patch.dict(
+            self.fake_main.SPECIALISTS["marketing"],
+            {"tool_names": ["read_file", "campaign_publish_bluesky", "send_email"]},
+        ), patch.object(
+            self.group.company_mode,
+            "revenue_action_capability",
+            return_value=capability,
+        ) as capability_call, patch.object(
+            self.group.company_mode, "update_task_status", return_value="ok"
+        ), patch.object(
+            self.group.company_mode, "load_state", return_value=state
+        ), patch.object(
+            self.group.company_mode, "next_planned_task", return_value=None
+        ), patch.object(
+            self.group.company_mode, "render_money", return_value="Budget ok"
+        ), patch.object(
+            self.group, "post_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_agent_answer_to_group", new=AsyncMock()
+        ), patch.object(
+            self.group, "post_team_handoff", new=AsyncMock()
+        ):
+            outcome = await self.group._execute_routed_task(
+                project, task, "marketing", "prompt", sink
+            )
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(observed, [])
+        self.assertIsNone(
+            self.group.revenue_actions.current_campaign_action_context()
+        )
+        capability_call.assert_not_called()
+        self.fake_main.ask_specialist.assert_not_called()
+
+    async def test_campaign_missing_company_account_stops_before_budget_or_model(self):
+        target = "bluesky:company.example"
+        item = {
+            "id": "CAMPAIGN-D01",
+            "title": "Publish",
+            "authorization_level": "external_action",
+            "revenue_sprint_id": "sprint-1",
+            "external_action": {
+                "action_type": "publish",
+                "target": target,
+                "policy_revision": "policy-1",
+            },
+        }
+        sprint = {
+            "id": "sprint-1",
+            "status": "active",
+            "automation_policy": {
+                "revision": "policy-1",
+                "allowed_action_types": ["publish"],
+                "allowed_targets": {"publish": [target]},
+            },
+        }
+        with patch.object(
+            self.group.company_mode,
+            "load_state",
+            return_value={"revenue_sprints": [sprint]},
+        ), patch.object(
+            self.group.company_mode,
+            "active_revenue_sprint",
+            return_value=sprint,
+        ), patch.object(
+            self.group, "_autonomy_runtime_deferral", new=AsyncMock(return_value=None)
+        ), patch.object(
+            self.group.revenue_actions,
+            "revenue_action_target_readiness",
+            return_value={
+                "ready": False,
+                "needs_human": True,
+                "reason": "NEEDS HUMAN: configure the dedicated company account.",
+            },
+        ) as readiness, patch.object(
+            self.group, "_company_budget_snapshot"
+        ) as budget:
+            result = await self.group._execute_autonomy_item(
+                {"id": "assistant"},
+                item,
+                types.SimpleNamespace(model_id="should-not-run"),
+                "run-1",
+            )
+
+        self.assertEqual(result["status"], "needs_human")
+        self.assertEqual(result["failure_classification"], "missing_access")
+        self.assertFalse(result["model_invoked"])
+        self.assertIn("company account", result["reason"])
+        readiness.assert_called_once_with(
+            "publish", target, verify_identity=True
+        )
+        budget.assert_not_called()
+
+    async def test_campaign_completion_derives_progress_from_commercial_evidence(self):
+        target = "bluesky:company.example"
+        payload_digest = "a" * 64
+        item = {
+            "id": "CAMPAIGN-D01",
+            "revenue_sprint_id": "sprint-1",
+            "external_action": {
+                "action_type": "publish",
+                "target": target,
+                "policy_revision": "policy-1",
+            },
+        }
+        sprint = {
+            "id": "sprint-1",
+            "status": "active",
+            "action_journal": [{
+                "run_id": "run-1",
+                "action_type": "publish",
+                "target": target,
+                "status": "succeeded",
+                "metadata": {"payload_digest": payload_digest},
+            }],
+        }
+        project = {
+            "campaign_id": "sprint-1",
+            "revenue_sprint_run_id": "run-1",
+            "approved_revenue_action": {
+                "payload_digest": payload_digest,
+                "action_type": "publish",
+                "target": target,
+                "policy_revision": "policy-1",
+            },
+        }
+        products = [{
+            "id": "gumroad-1",
+            "short_url": "https://company.gumroad.com/l/kit",
+            "sales_count": 0,
+            "sales_usd_cents": 0,
+            "published": True,
+        }]
+        complete = Mock(return_value={"status": "completed", "progress": False})
+
+        with patch.object(
+            self.group.company_mode,
+            "load_state",
+            return_value={"revenue_sprints": [sprint], "projects": [project]},
+        ), patch.object(
+            self.group.company_mode, "active_revenue_sprint", return_value=sprint
+        ), patch.object(
+            self.group.gumroad_helpers, "list_products", return_value=(products, None)
+        ), patch.object(
+            self.group.company_mode, "record_revenue_snapshot", return_value={"sales_delta": 0}
+        ), patch.object(
+            self.group.company_mode, "sync_revenue", return_value=None
+        ), patch.object(
+            self.group.company_mode, "complete_revenue_sprint_run", complete
+        ):
+            returned = await self.group._complete_campaign_item(
+                item,
+                "run-1",
+                {"status": "completed", "result_text": "Provider receipt persisted."},
+            )
+
+        self.assertEqual(returned["status"], "completed")
+        complete.assert_called_once()
+        self.assertIsNone(complete.call_args.kwargs["progress"])
 
     async def test_autonomous_worker_posts_assignment_then_reviewer_handoff(self):
         task = {

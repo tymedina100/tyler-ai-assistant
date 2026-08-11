@@ -84,6 +84,45 @@ class AutonomyTeamTests(unittest.TestCase):
             ["Report the configured timezone", "Expose no secrets"],
         )
 
+    def test_campaign_plan_is_draft_then_review_with_exact_metadata(self):
+        action = {
+            "action_type": "publish",
+            "target": "bluesky:company.example",
+            "policy_revision": "owner-policy-r1",
+        }
+        plan = autonomy_team.build_company_plan(
+            self.item(
+                agent_owner="marketing",
+                authorization_level="external_action",
+                revenue_sprint_id="sprint-1",
+                external_action=action,
+                campaign_product_url="https://company.example/product",
+                campaign_changed_variable="call_to_action",
+                campaign_evidence_basis="Day-5 decision=pivot",
+            ),
+            self.worker_decision(),
+            5.0,
+            router=self.router,
+        )
+
+        self.assertFalse(plan["deferred"])
+        worker, editor = plan["tasks"]
+        self.assertEqual((worker["owner"], worker["authorization_level"]), ("marketing", "propose"))
+        self.assertEqual((editor["owner"], editor["authorization_level"]), ("editor", "observe"))
+        self.assertEqual(worker["campaign_external_action"], action)
+        self.assertEqual(editor["campaign_external_action"], action)
+        self.assertEqual(worker["campaign_product_url"], "https://company.example/product")
+        self.assertEqual(editor["campaign_product_url"], "https://company.example/product")
+        self.assertEqual(worker["campaign_changed_variable"], "call_to_action")
+        self.assertEqual(editor["campaign_evidence_basis"], "Day-5 decision=pivot")
+        self.assertNotIn(
+            "campaign_publish_bluesky",
+            autonomy_team.allowed_tool_names(
+                {"read_file", "campaign_publish_bluesky"},
+                worker["authorization_level"],
+            ),
+        )
+
     def test_company_plan_requires_explicit_acceptance_criteria(self):
         plan = autonomy_team.build_company_plan(
             self.item(acceptance_criteria=[]), self.worker_decision(), 5.0, router=self.router

@@ -819,6 +819,17 @@ MAX_TOOL_ITERATIONS = 10
 # give it more headroom than ask_ai/ask_specialist's unchanged default.
 MAX_MANAGER_TOOL_ITERATIONS = 8
 
+# Revenue-campaign actions are never advertised to ordinary reactive chats.  They
+# become visible only when the autonomous runtime supplies an explicit allowlist
+# produced from a verified, action-specific campaign capability.
+CAMPAIGN_EXTERNAL_TOOL_NAMES = frozenset({
+    "campaign_send_outreach_email",
+    "campaign_deploy_vercel",
+    "campaign_publish_webhook",
+    "campaign_publish_bluesky",
+    "campaign_purchase_webhook",
+})
+
 TOOLS = [
     {"type": "function", "name": "read_file", "strict": False,
      "description": "Read the contents of a file from the sandboxed files/ folder.",
@@ -964,6 +975,21 @@ TOOLS = [
     {"type": "function", "name": "railway_redeploy", "strict": False,
      "description": "Trigger a redeploy of a Railway service in an environment. Changes live infrastructure, so it requires the user's /confirm before applying.",
      "parameters": {"type": "object", "properties": {"service_id": {"type": "string"}, "environment_id": {"type": "string"}}, "required": ["service_id", "environment_id"]}},
+    {"type": "function", "name": "campaign_send_outreach_email", "strict": False,
+     "description": "Send one Gmail outreach message only when an active owner-approved revenue campaign capability exactly allowlists the recipient. The action is persistently claimed before sending and is never blindly retried.",
+     "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, "required": ["to", "subject", "body"]}},
+    {"type": "function", "name": "campaign_deploy_vercel", "strict": False,
+     "description": "Deploy one exact logical target using the company-owned Vercel project/ref pinned in operator configuration. This tool is unavailable outside a verified campaign capability and never falls back to a personal account.",
+     "parameters": {"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]}},
+    {"type": "function", "name": "campaign_publish_webhook", "strict": False,
+     "description": "Invoke the configured HMAC-signed publishing adapter for one exact campaign target. Credentials and secrets must never be included in payload.",
+     "parameters": {"type": "object", "properties": {"target": {"type": "string"}, "payload": {"type": "object"}}, "required": ["target", "payload"]}},
+    {"type": "function", "name": "campaign_publish_bluesky", "strict": False,
+     "description": "Create one standalone post on the exact company-owned Bluesky account authorized by the active revenue campaign. It cannot reply, like, follow, message, or create an account.",
+     "parameters": {"type": "object", "properties": {"target": {"type": "string"}, "text": {"type": "string"}, "url": {"type": "string"}}, "required": ["target", "text"]}},
+    {"type": "function", "name": "campaign_purchase_webhook", "strict": False,
+     "description": "Invoke the configured HMAC-signed fixed-target purchase adapter inside the campaign purchase cap and a separate operator hard cap. Purchasing defaults disabled at $0.",
+     "parameters": {"type": "object", "properties": {"target": {"type": "string"}, "amount_usd": {"type": "number"}, "payload": {"type": "object"}}, "required": ["target", "amount_usd", "payload"]}},
 ]
 
 DELEGATION_TOOLS = [
@@ -1317,7 +1343,10 @@ def _allowed_tools(tools, allowed_tool_names=None):
     grant itself a tool merely by asking for one.
     """
     if allowed_tool_names is None:
-        return tools
+        return [
+            tool for tool in tools
+            if tool.get("name") not in CAMPAIGN_EXTERNAL_TOOL_NAMES
+        ]
     allowed = {str(name) for name in allowed_tool_names}
     return [tool for tool in tools if tool.get("name") in allowed]
 
@@ -2146,7 +2175,11 @@ SENSITIVE_TOOL_ARGUMENT_KEYS = {
     "content",
     "new_snippet",
     "old_snippet",
+    "payload",
     "subject",
+    "text",
+    "to",
+    "url",
     "value",  # railway_set_var - a variable value may be a secret
 }
 
@@ -2695,6 +2728,36 @@ def execute_tool(name, arguments):
         if name == "get_revenue_report":
             return get_revenue_report()
 
+        # These five tools are absent from every ordinary reactive tool set.  The
+        # autonomous runtime may explicitly advertise one only after Company Mode
+        # returns a verified, exact-target campaign capability.  revenue_actions
+        # rechecks that policy and persists a claim before any provider I/O.
+        if name in CAMPAIGN_EXTERNAL_TOOL_NAMES:
+            import revenue_actions
+
+            try:
+                if name == "campaign_send_outreach_email":
+                    return revenue_actions.send_outreach_email(
+                        arguments["to"], arguments["subject"], arguments["body"]
+                    )
+                if name == "campaign_deploy_vercel":
+                    return revenue_actions.deploy_vercel(arguments["target"])
+                if name == "campaign_publish_webhook":
+                    return revenue_actions.publish_webhook(
+                        arguments["target"], arguments.get("payload", {})
+                    )
+                if name == "campaign_publish_bluesky":
+                    return revenue_actions.publish_bluesky(
+                        arguments["target"], arguments["text"], arguments.get("url")
+                    )
+                if name == "campaign_purchase_webhook":
+                    return revenue_actions.purchase_webhook(
+                        arguments["target"], arguments["amount_usd"],
+                        arguments.get("payload", {}),
+                    )
+            except revenue_actions.RevenueActionDenied as exc:
+                return f"Campaign action denied: {exc}"
+
         if name == "list_deploy_projects":
             projects_list, err = deploy_helpers.list_projects()
             return err if err else format_deploy_projects(projects_list)
@@ -3151,7 +3214,8 @@ def execute_tool(name, arguments):
 
     except Exception as e:
         error_message = f"Tool error: something went wrong while running {name}."
-        logger.error(f"{error_message} ({e})")
+        safe_error = str(autonomous_workflow.redact_secrets(str(e))).strip()[:300]
+        logger.error(f"{error_message} ({type(e).__name__}: {safe_error})")
         return error_message
 
 
@@ -3177,7 +3241,8 @@ SPECIALISTS = {
                        "linear_get_issue", "linear_search_issues", "linear_list_issues",
                        "list_deploy_projects", "deploy_site", "check_deploy",
                        "railway_list_projects", "railway_get_project", "railway_list_vars",
-                       "railway_get_var", "railway_deploy_status", "railway_set_var", "railway_redeploy"],
+                       "railway_get_var", "railway_deploy_status", "railway_set_var", "railway_redeploy",
+                       "campaign_deploy_vercel"],
         "role": """
 You are a careful coding assistant. Help the user write, read, and debug code.
 Use write_file to save code you're asked to create or change, and read_file to
@@ -3235,6 +3300,8 @@ dump every variable value. railway_set_var and railway_redeploy change LIVE infr
 will ask the user to /confirm - only propose them when clearly needed. When a task asks
 you to verify Railway env/deploy config, actually read it with these tools instead of
 saying you lack access.
+If campaign_deploy_vercel is explicitly present, it represents one revision-bound,
+company-owned target. Use only that target; ordinary deploy confirmation is unchanged.
 """,
         "persona": """
 You are Patch, the team's coding specialist. Voice: blunt, pragmatic senior
@@ -3278,12 +3345,16 @@ what's "verified" versus "unconfirmed". Sign off with "- Scout".
         "name": "Quill",
         "label": "Quill (Content Lead)",
         "model": PREMIUM_MODEL,
-        "tool_names": ["read_file", "write_file", "recall_memories"],
+        "tool_names": ["read_file", "write_file", "recall_memories",
+                       "campaign_publish_bluesky"],
         "role": """
 You are a skilled writing assistant. Help the user draft, edit, and improve
 written content. Use read_file to review an existing draft before editing it,
 and write_file to save a finished draft when asked. Match the tone the user
-requests and keep writing clear.
+requests and keep writing clear. A campaign-only Bluesky tool, when explicitly
+present, is an exact-target grant for one standalone company post. Never use a
+personal account, change targets, interact with other accounts, or create an
+account. If the configured company identity is unavailable, stop with NEEDS HUMAN.
 """,
         "persona": """
 You are Quill, the team's writer. Voice: warm, thoughtful wordsmith who cares about
@@ -3336,13 +3407,16 @@ and precise; you keep everyone on time without nagging. Sign off with "- Cadence
         "name": "Piper",
         "label": "Piper (Communications & Support Lead)",
         "model": FAST_MODEL,
-        "tool_names": ["search_emails", "read_email", "draft_email", "send_email", "recall_memories"],
+        "tool_names": ["search_emails", "read_email", "draft_email", "send_email", "recall_memories",
+                       "campaign_send_outreach_email"],
         "role": """
 You manage the user's Gmail. Use search_emails to find messages, read_email to read
 one in full, draft_email to prepare a reply or new message (it just waits in Drafts),
 and send_email to send. Sending is sensitive: prefer drafting unless the user clearly
 asks to send, and note that sending will ask them to confirm first. Summarize emails
 crisply and never invent contents you haven't actually read.
+If campaign_send_outreach_email is explicitly present, it is a separate campaign-only
+grant for one exact company account and recipient, never a general send bypass.
 
 You also handle customer support for the company's products. When triaging an
 inbound customer email, identify what the customer needs, how urgent it is, and
@@ -3362,7 +3436,9 @@ heard. Sign off with "- Piper".
         "label": "Sway (Head of Marketing & Growth)",
         "model": PREMIUM_MODEL,
         "tool_names": ["search_the_web", "read_file", "write_file", "recall_memories", "remember_fact",
-                       "list_deploy_projects", "deploy_site", "check_deploy"],
+                       "list_deploy_projects", "deploy_site", "check_deploy",
+                       "campaign_deploy_vercel", "campaign_publish_webhook",
+                       "campaign_publish_bluesky"],
         "role": """
 You own the company's marketing: positioning, landing-page copy, SEO and keyword
 research, launch posts, and content calendars. Use search_the_web for keyword and
@@ -3375,6 +3451,10 @@ product actually does - never invent features or results.
 To get a landing page live for a launch, use deploy_site (Vercel): a "preview" deploy
 gives a shareable throwaway URL immediately; a "production" deploy goes to the live
 domain and asks the user to /confirm. Use list_deploy_projects to find the project name.
+Campaign-only publish/deploy tools, when explicitly present, are exact-target grants.
+For Bluesky, create only a standalone feed post; never reply, like, follow, message,
+or create an account. If the company-owned account or credentials are not already
+configured and verified, stop and report NEEDS HUMAN; never automate provider signup.
 """,
         "persona": """
 You are Sway, the team's head of marketing and growth. Voice: sharp and benefit-led,
@@ -3423,7 +3503,8 @@ with "- Vera".
         "name": "Ledger",
         "label": "Ledger (CFO)",
         "model": FAST_MODEL,
-        "tool_names": ["get_company_status", "get_revenue_report", "recall_memories", "remember_fact"],
+        "tool_names": ["get_company_status", "get_revenue_report", "recall_memories", "remember_fact",
+                       "campaign_purchase_webhook"],
         "role": """
 You own the company's money picture: the daily budget, spend, and revenue. Use
 get_company_status for today's budget ledger and the active project's open work,
@@ -3432,6 +3513,8 @@ isn't configured). Report numbers exactly as the tools return them - never estim
 or round beyond what they show. Flag plainly when a product is unprofitable or when
 today's spend is close to the budget cap. Use remember_fact to record financial
 decisions worth keeping and recall_memories to check them.
+If campaign_purchase_webhook is explicitly present, use it only for its fixed target
+and amount. Never include credentials or payment-card data in its payload.
 """,
         "persona": """
 You are Ledger, the team's CFO. Voice: dry, numerate, unhurried. Lead with the
@@ -3443,7 +3526,7 @@ number, then the one-sentence takeaway. Sign off with "- Ledger".
         "label": "Dash (Sales Lead)",
         "model": PREMIUM_MODEL,
         "tool_names": ["search_the_web", "read_file", "write_file", "recall_memories",
-                       "remember_fact", "get_revenue_report"],
+                       "remember_fact", "get_revenue_report", "campaign_send_outreach_email"],
         "role": """
 You own outbound sales for the company's products: outreach, leads, and follow-ups.
 Your three jobs:
@@ -3460,8 +3543,9 @@ Your three jobs:
 3. KNOW THE PRODUCT - use get_revenue_report to see what's actually selling before
    recommending what to pitch. Never invent product claims, prices, or checkout
    links; if there is no live link, say so plainly.
-You draft messages; you never send anything yourself. Hand finished drafts back so
-the user (or Piper, for email) can send them.
+You draft messages by default and never use ordinary sending as a shortcut. Only when
+campaign_send_outreach_email is explicitly present may you send to its exact,
+company-owned campaign target; otherwise hand drafts back to the user or Piper.
 """,
         "persona": """
 You are Dash, the team's Sales Lead. Voice: energetic but honest - a closer who
@@ -3474,7 +3558,7 @@ you'd do next. Sign off with "- Dash".
         "label": "Vega (Analytics Lead)",
         "model": FAST_MODEL,
         "tool_names": ["get_revenue_report", "get_company_status", "linear_list_issues",
-                       "recall_memories", "remember_fact"],
+                       "recall_memories", "remember_fact", "campaign_publish_bluesky"],
         "role": """
 You turn the company's numbers into decisions. Pull real data - get_revenue_report
 for sales and per-product P&L, get_company_status for today's budget and open work,
@@ -3488,6 +3572,10 @@ linear_list_issues for what's shipping - and compress it into a short digest:
   recall_memories to fetch the previous ones for trend lines.
 - One recommendation, not five. The user is a solo founder; pick the single
   highest-leverage next move the numbers support.
+When an owner-confirmed campaign exposes the Bluesky tool, it authorizes one
+standalone post to the exact company-owned target only. Publish only claims
+supported by the supplied campaign evidence. Never use a personal account,
+interact with other accounts, or create an account; missing access is NEEDS HUMAN.
 """,
         "persona": """
 You are Vega, the team's Analytics Lead. Voice: crisp, curious, zero fluff -
