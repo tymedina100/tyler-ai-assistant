@@ -12,6 +12,7 @@ import os
 from typing import Any, Iterable, Mapping
 
 import model_router
+import revenue_actions
 
 
 READ_ONLY_TOOLS = frozenset({
@@ -51,7 +52,11 @@ def normalize_authorization(value: Any) -> str:
     return {"modify_locally": "modify_local"}.get(normalized, normalized)
 
 
-def allowed_tool_names(profile_tool_names: Iterable[str], authorization_level: Any) -> set[str]:
+def allowed_tool_names(
+    profile_tool_names: Iterable[str],
+    authorization_level: Any,
+    external_action_capability: Mapping[str, Any] | None = None,
+) -> set[str]:
     """Intersect an agent's least-privilege profile with roadmap authorization."""
 
     profile = {str(name) for name in profile_tool_names}
@@ -59,8 +64,13 @@ def allowed_tool_names(profile_tool_names: Iterable[str], authorization_level: A
     allowed = set(READ_ONLY_TOOLS)
     if authorization == "modify_local":
         allowed.update(LOCAL_MODIFICATION_TOOLS)
-    # External actions never become automatic merely because a roadmap item says
-    # external_action.  The runtime escalates those tasks before invoking a model.
+    elif authorization == "external_action":
+        # A roadmap label or raised global ceiling is not a grant.  Company Mode
+        # must first return one active, revision-bound, exact-target capability;
+        # the provider layer rechecks it and atomically claims the action before I/O.
+        allowed.update(
+            revenue_actions.tool_names_for_capability(external_action_capability)
+        )
     return profile & allowed
 
 
@@ -136,6 +146,12 @@ def build_company_plan(
             "decisions": [worker_route],
         }
     authorization = normalize_authorization(item.get("authorization_level"))
+    campaign_external_action = (
+        dict(item.get("external_action") or {})
+        if authorization == "external_action"
+        and str(item.get("revenue_sprint_id") or "").strip()
+        else {}
+    )
     requested_owner = str(item.get("agent_owner") or "manager")
     # Miles owns selection and prioritization, but he is not a worker persona in
     # main.SPECIALISTS. Delegate a manager-owned roadmap item to Robin's general
@@ -153,11 +169,26 @@ def build_company_plan(
         "estimated_input_tokens": int(item.get("estimated_input_tokens", 2000) or 2000),
         "estimated_output_tokens": int(item.get("estimated_output_tokens", 600) or 600),
     }
+    if campaign_external_action:
+        common.update({
+            "campaign_external_action": campaign_external_action,
+            "campaign_product_url": str(item.get("campaign_product_url") or "").strip(),
+            "campaign_changed_variable": str(
+                item.get("campaign_changed_variable") or ""
+            ).strip(),
+            "campaign_evidence_basis": str(
+                item.get("campaign_evidence_basis") or ""
+            ).strip(),
+        })
     worker_estimate = reservation_estimate(worker_decision)
     worker_task = {
         **common,
         "owner": owner,
         "title": str(item.get("title") or item.get("id") or "Complete roadmap item"),
+        # An owner-confirmed campaign still separates content generation from
+        # provider I/O. The worker drafts; Vera reviews; the coordinator alone
+        # receives the exact action capability after approval.
+        "authorization_level": "propose" if campaign_external_action else authorization,
         "estimate_usd": worker_estimate,
         "model": worker_route["model"],
         "model_reason": worker_route["reason"],

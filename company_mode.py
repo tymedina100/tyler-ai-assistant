@@ -36,6 +36,18 @@ DEFAULT_TASK_ESTIMATE_USD = 1.0
 DEFAULT_EMERGENCY_RESERVE_USD = 0.25
 ACCOUNTING_PLACES = Decimal("0.000001")
 LOCK_TIMEOUT_SECONDS = 30
+DEFAULT_REVENUE_SPRINT_TOTAL_AI_BUDGET_USD = 100.0
+DEFAULT_REVENUE_SPRINT_DAILY_AI_BUDGET_USD = 5.0
+DEFAULT_REVENUE_SPRINT_RUN_DAYS = 20
+DEFAULT_REVENUE_SPRINT_NO_PROGRESS_LIMIT = 3
+REVENUE_ACTION_TYPES = {"publish", "outreach", "purchase", "deploy"}
+REVENUE_SIGNAL_TYPES = {
+    "click", "reply", "lead", "signup", "wishlist", "checkout_started",
+    "strong_intent", "purchase_commitment", "sale", "bounce", "unsubscribe",
+}
+REVENUE_SPRINT_TERMINAL_STATUSES = {"stopped", "completed", "cancelled"}
+REVENUE_SPRINT_ACTIVE_STATUSES = {"active"}
+REVENUE_SPRINT_RECORD_LIMIT = 500
 DEFAULT_ASSIGN_TASKS = [
     ("research", "Validate demand, competitors, and buyer pain for this goal."),
     ("code", "Identify the smallest buildable asset or PR that moves this goal forward."),
@@ -94,6 +106,14 @@ class StateCorruptionError(RuntimeError):
 
 class BudgetExceededError(ValueError):
     """A reservation would consume money unavailable to its authorization context."""
+
+
+class RevenueSprintError(ValueError):
+    """A persisted Revenue Sprint invariant or transition would be violated."""
+
+
+class RevenueActionError(RevenueSprintError):
+    """A Revenue Sprint external action is outside its exact persisted grant."""
 
 
 def _fire(hook, *args):
@@ -186,6 +206,7 @@ def new_state():
             "reserved_today_usd": 0.0,
             "spent_today_usd": 0.0,
             "active_project_id": None,
+            "active_revenue_sprint_id": None,
         },
         "projects": [],
         "tasks": [],
@@ -193,6 +214,7 @@ def new_state():
         "products": [],
         "budget_reservations": [],
         "cost_entries": [],
+        "revenue_sprints": [],
     }
 
 
@@ -383,6 +405,29 @@ def _normalize_project(project):
     item["editor_feedback_history_truncated"] = bool(
         item.get("editor_feedback_history_truncated")
     ) or history_was_truncated
+    run_id, _run_id_truncated = _bounded_text(
+        item.get("revenue_sprint_run_id"), 160, strip=True
+    )
+    item["revenue_sprint_run_id"] = run_id
+    item["external_action"] = _normalize_external_action_metadata(
+        item.get("external_action")
+    )
+    approved = item.get("approved_revenue_action")
+    if isinstance(approved, dict):
+        item["approved_revenue_action"] = {
+            "worker_task_id": str(approved.get("worker_task_id") or "")[:160],
+            "reviewer_task_id": str(approved.get("reviewer_task_id") or "")[:160],
+            "payload_digest": str(approved.get("payload_digest") or "")[:64],
+            "candidate_result_digest": str(
+                approved.get("candidate_result_digest") or ""
+            )[:64],
+            "action_type": str(approved.get("action_type") or "")[:40],
+            "target": str(approved.get("target") or "")[:500],
+            "policy_revision": str(approved.get("policy_revision") or "")[:160],
+            "approved_at": str(approved.get("approved_at") or "")[:100],
+        }
+    else:
+        item["approved_revenue_action"] = {}
     return item
 
 
@@ -439,6 +484,7 @@ def _normalize_task(task):
     item["output_tokens"] = int(item.get("output_tokens", 0) or 0)
     item["total_tokens"] = int(item.get("total_tokens", 0) or 0)
     item.setdefault("budget_reservation_id", "")
+    item["campaign_id"] = str(item.get("campaign_id") or "")
     item.setdefault("linear_issue_id", "")
     item.setdefault("linear_identifier", "")
     item.setdefault("linear_url", "")
@@ -464,6 +510,8 @@ def _normalize_reservation(entry):
     item.setdefault("created_at", _now().isoformat())
     item.setdefault("updated_at", item["created_at"])
     item["uses_emergency_reserve"] = bool(item.get("uses_emergency_reserve", False))
+    item["campaign_id"] = str(item.get("campaign_id") or "")
+    item["campaign_date"] = str(item.get("campaign_date") or item["budget_date"])
     return item
 
 
@@ -495,6 +543,232 @@ def _normalize_cost_entry(entry):
         item.get("total_tokens", item["input_tokens"] + item["output_tokens"]) or 0
     )
     item.setdefault("created_at", _now().isoformat())
+    item["campaign_id"] = str(item.get("campaign_id") or "")
+    item["campaign_date"] = str(item.get("campaign_date") or item["budget_date"])
+    return item
+
+
+def _normalize_sprint_product(value):
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "project_id": str(raw.get("project_id") or "").strip(),
+        "gumroad_product_id": str(raw.get("gumroad_product_id") or "").strip(),
+        "gumroad_url": str(raw.get("gumroad_url") or "").strip().rstrip("/"),
+        "title": str(raw.get("title") or "").strip(),
+        "ownership": str(raw.get("ownership") or "").strip().lower(),
+        "personal_fallback_allowed": bool(raw.get("personal_fallback_allowed", False)),
+    }
+
+
+def _normalize_sprint_channel(value):
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "type": str(raw.get("type") or "").strip().lower(),
+        "account_id": str(raw.get("account_id") or "").strip(),
+        "destination_scope": str(raw.get("destination_scope") or "").strip(),
+        "name": str(raw.get("name") or raw.get("type") or "").strip(),
+        "ownership": str(raw.get("ownership") or "").strip().lower(),
+        "personal_fallback_allowed": bool(raw.get("personal_fallback_allowed", False)),
+    }
+
+
+def _normalize_external_action_metadata(value):
+    """Normalize the only external-action fields allowed onto a project.
+
+    This is execution control data, not arbitrary provider metadata. Rejecting
+    extra keys keeps later sinks from accidentally trusting an unreviewed action
+    parameter copied through project state.
+    """
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise RevenueSprintError("Revenue Sprint external_action metadata must be an object.")
+    if not value:
+        return {}
+    allowed_fields = {"action_type", "target", "policy_revision"}
+    unexpected = sorted(set(value) - allowed_fields)
+    if unexpected:
+        raise RevenueSprintError(
+            f"Unsupported Revenue Sprint external_action fields: {unexpected}"
+        )
+    action_type = str(value.get("action_type") or "").strip().lower()
+    target = str(value.get("target") or "").strip()
+    policy_revision = str(value.get("policy_revision") or "").strip()
+    if action_type not in REVENUE_ACTION_TYPES:
+        raise RevenueSprintError(
+            f"Unsupported Revenue Sprint action type: {action_type!r}."
+        )
+    if not target or "*" in target:
+        raise RevenueSprintError(
+            "Revenue Sprint external_action target must be exact and cannot contain a wildcard."
+        )
+    if not policy_revision:
+        raise RevenueSprintError(
+            "Revenue Sprint external_action requires an exact policy_revision."
+        )
+    return {
+        "action_type": action_type[:64],
+        "target": target[:512],
+        "policy_revision": policy_revision[:160],
+    }
+
+
+def _normalize_action_journal_metadata(value):
+    """Bound untrusted adapter metadata before it reaches persistent state."""
+    if not isinstance(value, dict):
+        return {}
+    normalized = {}
+    for raw_key in sorted(value, key=lambda item: str(item))[:20]:
+        key = str(raw_key or "").strip()[:64]
+        if not key or key in normalized:
+            continue
+        raw_value = value[raw_key]
+        if isinstance(raw_value, bool) or raw_value is None:
+            normalized[key] = raw_value
+        elif isinstance(raw_value, (int, float)):
+            normalized[key] = raw_value
+        else:
+            normalized[key] = str(raw_value or "")[:512]
+    return normalized
+
+
+def _normalize_action_policy(value):
+    raw = value if isinstance(value, dict) else {}
+    allowed_types = []
+    for action_type in _list(raw.get("allowed_action_types")):
+        normalized = str(action_type or "").strip().lower()
+        if normalized in REVENUE_ACTION_TYPES and normalized not in allowed_types:
+            allowed_types.append(normalized)
+
+    raw_targets = raw.get("allowed_targets") if isinstance(raw.get("allowed_targets"), dict) else {}
+    raw_daily = raw.get("daily_action_caps") if isinstance(raw.get("daily_action_caps"), dict) else {}
+    raw_total = raw.get("total_action_caps") if isinstance(raw.get("total_action_caps"), dict) else {}
+    targets = {}
+    daily_caps = {}
+    total_caps = {}
+    for action_type in allowed_types:
+        targets[action_type] = list(dict.fromkeys(
+            str(target or "").strip()
+            for target in _list(raw_targets.get(action_type))
+            if str(target or "").strip()
+        ))
+        try:
+            daily_caps[action_type] = max(0, int(raw_daily.get(action_type, 0) or 0))
+            total_caps[action_type] = max(0, int(raw_total.get(action_type, 0) or 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Revenue action caps for {action_type!r} must be integers.") from exc
+    return {
+        "revision": str(raw.get("revision") or "").strip(),
+        "allowed_action_types": allowed_types,
+        "allowed_targets": targets,
+        "daily_action_caps": daily_caps,
+        "total_action_caps": total_caps,
+        "purchase_daily_cap_usd": _amount(raw.get("purchase_daily_cap_usd", 0.0)),
+        "purchase_total_cap_usd": _amount(raw.get("purchase_total_cap_usd", 0.0)),
+        "approved_at": str(raw.get("approved_at") or "").strip(),
+        "approved_by": str(raw.get("approved_by") or "").strip(),
+    }
+
+
+def _normalize_checkpoint_policy(value):
+    raw = value if isinstance(value, dict) else {}
+    interest_types = list(dict.fromkeys(
+        str(signal or "").strip().lower()
+        for signal in _list(raw.get("day5_interest_signal_types") or [
+            "reply", "click", "lead", "signup", "checkout_started", "wishlist", "strong_intent", "sale"
+        ])
+        if str(signal or "").strip()
+    ))
+    intent_types = list(dict.fromkeys(
+        str(signal or "").strip().lower()
+        for signal in _list(raw.get("day15_strong_intent_signal_types") or [
+            "strong_intent", "checkout_started", "purchase_commitment"
+        ])
+        if str(signal or "").strip()
+    ))
+    unknown = (set(interest_types) | set(intent_types)) - REVENUE_SIGNAL_TYPES
+    if unknown:
+        raise ValueError(f"Unsupported Revenue Sprint signal types: {sorted(unknown)}")
+    try:
+        interest_minimum = max(1, int(raw.get("day5_min_interest_count", 1) or 1))
+        intent_minimum = max(1, int(raw.get("day15_min_strong_intent_count", 1) or 1))
+        sales_minimum = max(1, int(raw.get("day15_min_sales", 1) or 1))
+        trailing_window_days = max(1, int(raw.get("trailing_window_days", 7) or 7))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Revenue checkpoint thresholds must be positive integers.") from exc
+    gross_per_day = _amount(raw.get("minimum_gross_revenue_usd_per_day", 5.0))
+    minimum_trailing_gross = _amount(raw.get("minimum_trailing_gross_revenue_usd", 35.0))
+    if gross_per_day < 0 or minimum_trailing_gross < 0:
+        raise ValueError("Revenue checkpoint economic thresholds cannot be negative.")
+    raw_contribution = raw.get("require_nonnegative_contribution", True)
+    require_contribution = (
+        raw_contribution.strip().lower() not in {"false", "0", "no", "off"}
+        if isinstance(raw_contribution, str)
+        else bool(raw_contribution)
+    )
+    return {
+        "day5_interest_signal_types": interest_types,
+        "day5_min_interest_count": interest_minimum,
+        "day15_strong_intent_signal_types": intent_types,
+        "day15_min_strong_intent_count": intent_minimum,
+        "day15_min_sales": sales_minimum,
+        "trailing_window_days": trailing_window_days,
+        "minimum_gross_revenue_usd_per_day": gross_per_day,
+        "minimum_trailing_gross_revenue_usd": minimum_trailing_gross,
+        "require_nonnegative_contribution": require_contribution,
+    }
+
+
+def _normalize_revenue_sprint(value):
+    if not isinstance(value, dict):
+        return None
+    item = deepcopy(value)
+    item.setdefault("id", f"sprint_{uuid.uuid4().hex[:12]}")
+    item["id"] = str(item["id"] or "").strip()
+    item["status"] = str(item.get("status") or "active").strip().lower()
+    item["timezone"] = str(item.get("timezone") or budget_timezone_name()).strip()
+    try:
+        ZoneInfo(item["timezone"])
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Invalid Revenue Sprint timezone {item['timezone']!r}.") from exc
+    item["total_ai_budget_usd"] = _amount(
+        item.get("total_ai_budget_usd", DEFAULT_REVENUE_SPRINT_TOTAL_AI_BUDGET_USD)
+    )
+    item["daily_ai_budget_usd"] = _amount(
+        item.get("daily_ai_budget_usd", DEFAULT_REVENUE_SPRINT_DAILY_AI_BUDGET_USD)
+    )
+    try:
+        item["max_run_days"] = max(1, int(item.get("max_run_days", DEFAULT_REVENUE_SPRINT_RUN_DAYS)))
+        item["max_consecutive_no_progress_days"] = max(
+            1,
+            int(item.get("max_consecutive_no_progress_days", DEFAULT_REVENUE_SPRINT_NO_PROGRESS_LIMIT)),
+        )
+        item["consecutive_no_progress_days"] = max(
+            0, int(item.get("consecutive_no_progress_days", 0) or 0)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Revenue Sprint run limits must be positive integers.") from exc
+    item["product"] = _normalize_sprint_product(item.get("product"))
+    item["channel"] = _normalize_sprint_channel(item.get("channel"))
+    item["automation_policy"] = _normalize_action_policy(item.get("automation_policy"))
+    item["checkpoint_policy"] = _normalize_checkpoint_policy(item.get("checkpoint_policy"))
+    for field in (
+        "run_days",
+        "revenue_snapshots",
+        "signals",
+        "experiments",
+        "checkpoint_results",
+        "pivot_history",
+        "action_journal",
+    ):
+        item[field] = _list(item.get(field))[-REVENUE_SPRINT_RECORD_LIMIT:]
+    item["pivot_required"] = bool(item.get("pivot_required", False))
+    item.setdefault("phase", "validate")
+    item.setdefault("stop_reason", "")
+    item.setdefault("created_at", _now().isoformat())
+    item.setdefault("started_at", item["created_at"])
+    item.setdefault("updated_at", item["created_at"])
+    item.setdefault("finished_at", None)
     return item
 
 
@@ -524,6 +798,11 @@ def normalize_state(state):
         for entry in (_normalize_cost_entry(raw) for raw in _list(state.get("cost_entries")))
         if entry is not None
     ]
+    normalized["revenue_sprints"] = [
+        entry
+        for entry in (_normalize_revenue_sprint(raw) for raw in _list(state.get("revenue_sprints")))
+        if entry is not None
+    ]
     company = state.get("company", {}) if isinstance(state.get("company", {}), dict) else {}
     normalized["company"].update(company)
     normalized["company"]["daily_budget_usd"] = _amount(normalized["company"].get("daily_budget_usd"))
@@ -537,6 +816,27 @@ def normalize_state(state):
         normalized["company"].get("reserved_today_usd")
     )
     normalized["company"]["spent_today_usd"] = _amount(normalized["company"].get("spent_today_usd"))
+    normalized["company"]["active_revenue_sprint_id"] = (
+        str(normalized["company"].get("active_revenue_sprint_id") or "").strip() or None
+    )
+    sprint_ids = [str(item.get("id") or "") for item in normalized["revenue_sprints"]]
+    if len(sprint_ids) != len(set(sprint_ids)):
+        raise ValueError("Revenue Sprint IDs must be unique.")
+    active_sprints = [
+        item for item in normalized["revenue_sprints"]
+        if item.get("status") in REVENUE_SPRINT_ACTIVE_STATUSES
+    ]
+    if len(active_sprints) > 1:
+        raise ValueError("Only one Revenue Sprint may be active.")
+    active_id = normalized["company"].get("active_revenue_sprint_id")
+    if active_sprints:
+        if active_id and active_id != active_sprints[0]["id"]:
+            raise ValueError("Active Revenue Sprint pointer does not match the active campaign.")
+        normalized["company"]["active_revenue_sprint_id"] = active_sprints[0]["id"]
+    elif active_id:
+        if active_id not in sprint_ids:
+            raise ValueError("Active Revenue Sprint pointer references a missing campaign.")
+        normalized["company"]["active_revenue_sprint_id"] = None
 
     if normalized["company"].get("budget_date") != today_key():
         normalized["company"]["budget_date"] = today_key()
@@ -634,6 +934,143 @@ def remaining_budget(state, include_emergency=False):
     ))
 
 
+def _sprint_moment(sprint, at=None):
+    zone = ZoneInfo(str(sprint.get("timezone") or budget_timezone_name()))
+    moment = at or datetime.now(zone)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=zone)
+    else:
+        moment = moment.astimezone(zone)
+    return moment
+
+
+def _sprint_date(sprint, at=None):
+    return _sprint_moment(sprint, at).date().isoformat()
+
+
+def active_revenue_sprint(state, sprint_id=None):
+    """Return one exact persisted sprint, defaulting to the company's active ID."""
+
+    target = str(sprint_id or state.get("company", {}).get("active_revenue_sprint_id") or "").strip()
+    if not target:
+        return None
+    return next(
+        (item for item in state.get("revenue_sprints", []) if str(item.get("id") or "") == target),
+        None,
+    )
+
+
+def _campaign_commitments(state, sprint_id, campaign_date=None):
+    costs = [
+        entry
+        for entry in state.get("cost_entries", [])
+        if str(entry.get("campaign_id") or "") == str(sprint_id)
+        and (campaign_date is None or str(entry.get("campaign_date") or entry.get("budget_date")) == campaign_date)
+    ]
+    reservations = [
+        entry
+        for entry in state.get("budget_reservations", [])
+        if str(entry.get("campaign_id") or "") == str(sprint_id)
+        and entry.get("status") == "reserved"
+        and (campaign_date is None or str(entry.get("campaign_date") or entry.get("budget_date")) == campaign_date)
+    ]
+    return {
+        "spent_usd": _amount(sum(_amount(entry.get("amount_usd")) for entry in costs)),
+        "reserved_usd": _amount(sum(_amount(entry.get("remaining_usd")) for entry in reservations)),
+    }
+
+
+def revenue_sprint_budget_snapshot(state, sprint_id=None, at=None):
+    sprint = active_revenue_sprint(state, sprint_id)
+    if sprint is None:
+        return {
+            "active": False,
+            "campaign_id": None,
+            "status": "inactive",
+            "campaign_date": None,
+            "total_ai_budget_usd": 0.0,
+            "daily_ai_budget_usd": 0.0,
+            "spent_total_usd": 0.0,
+            "reserved_total_usd": 0.0,
+            "remaining_total_usd": 0.0,
+            "spent_today_usd": 0.0,
+            "reserved_today_usd": 0.0,
+            "remaining_today_usd": 0.0,
+            "ordinary_remaining_today_usd": 0.0,
+            "emergency_reserve_usd": 0.0,
+            "run_days_used": 0,
+            "max_run_days": 0,
+            "pivot_required": False,
+            "stop_reason": "",
+        }
+    campaign_date = _sprint_date(sprint, at)
+    total = _campaign_commitments(state, sprint["id"])
+    daily = _campaign_commitments(state, sprint["id"], campaign_date)
+    total_cap = _amount(sprint.get("total_ai_budget_usd"))
+    daily_cap = _amount(sprint.get("daily_ai_budget_usd"))
+    # The campaign's daily ceiling includes the Company's emergency reserve.  In
+    # particular, a $5 campaign running inside a $10 Company day may spend at
+    # most $4.75 on ordinary work when the reserve is $0.25; summaries and
+    # escalations can use the final $0.25 but can never push the campaign above
+    # its raw $5 ceiling.
+    campaign_emergency_reserve = _amount(min(
+        daily_cap,
+        state.get("company", {}).get("emergency_reserve_usd", 0.0),
+    ))
+    remaining_today = _amount(
+        max(0.0, daily_cap - daily["spent_usd"] - daily["reserved_usd"])
+    )
+    ordinary_remaining_today = _amount(max(
+        0.0,
+        daily_cap
+        - campaign_emergency_reserve
+        - daily["spent_usd"]
+        - daily["reserved_usd"],
+    ))
+    run_days = [entry for entry in sprint.get("run_days", []) if isinstance(entry, dict)]
+    return {
+        "active": sprint.get("status") in REVENUE_SPRINT_ACTIVE_STATUSES,
+        "campaign_id": sprint["id"],
+        "status": sprint.get("status"),
+        "campaign_date": campaign_date,
+        "total_ai_budget_usd": total_cap,
+        "daily_ai_budget_usd": daily_cap,
+        "spent_total_usd": total["spent_usd"],
+        "reserved_total_usd": total["reserved_usd"],
+        "remaining_total_usd": _amount(max(0.0, total_cap - total["spent_usd"] - total["reserved_usd"])),
+        "spent_today_usd": daily["spent_usd"],
+        "reserved_today_usd": daily["reserved_usd"],
+        "remaining_today_usd": remaining_today,
+        "ordinary_remaining_today_usd": ordinary_remaining_today,
+        "emergency_reserve_usd": campaign_emergency_reserve,
+        "run_days_used": len(run_days),
+        "max_run_days": int(sprint.get("max_run_days", DEFAULT_REVENUE_SPRINT_RUN_DAYS)),
+        "pivot_required": bool(sprint.get("pivot_required")),
+        "stop_reason": str(sprint.get("stop_reason") or ""),
+    }
+
+
+def _campaign_admission_available(state, campaign_id, *, allow_emergency=False):
+    sprint = active_revenue_sprint(state, campaign_id)
+    if sprint is None:
+        raise RevenueSprintError(f"Revenue Sprint {campaign_id!r} was not found.")
+    if sprint.get("status") not in REVENUE_SPRINT_ACTIVE_STATUSES:
+        raise BudgetExceededError(
+            f"Revenue Sprint {campaign_id!r} is {sprint.get('status')!r}; no new AI spend is allowed."
+        )
+    snapshot = revenue_sprint_budget_snapshot(state, campaign_id)
+    daily_available = (
+        snapshot["remaining_today_usd"]
+        if allow_emergency
+        else snapshot["ordinary_remaining_today_usd"]
+    )
+    return _amount(min(
+        remaining_budget(state, include_emergency=allow_emergency),
+        snapshot["remaining_total_usd"],
+        daily_available,
+    )), snapshot
+
+
 def set_daily_budget(amount_usd, path=COMPANY_STATE_FILE):
     amount = _amount(amount_usd)
     if amount < 0:
@@ -645,7 +1082,7 @@ def set_daily_budget(amount_usd, path=COMPANY_STATE_FILE):
     return f"Company budget set to ${amount:.2f} for today. Remaining: ${remaining_budget(state):.2f}."
 
 
-def _attribution(context, project_id, task_id, agent, model, reason):
+def _attribution(context, project_id, task_id, agent, model, reason, campaign_id=None):
     if isinstance(context, dict):
         values = context
         context = values.get("context", values.get("kind", "task"))
@@ -654,6 +1091,7 @@ def _attribution(context, project_id, task_id, agent, model, reason):
         agent = agent or values.get("agent") or values.get("owner")
         model = model or values.get("model")
         reason = reason or values.get("reason")
+        campaign_id = campaign_id or values.get("campaign_id") or values.get("sprint_id")
     return {
         "context": str(context or "task"),
         "project_id": project_id,
@@ -661,6 +1099,7 @@ def _attribution(context, project_id, task_id, agent, model, reason):
         "agent": str(agent or ""),
         "model": str(model or ""),
         "reason": str(reason or ""),
+        "campaign_id": str(campaign_id or ""),
     }
 
 
@@ -683,25 +1122,53 @@ def _reserve_budget_in_state(
     reason="",
     reservation_id=None,
     allow_emergency=False,
+    campaign_id=None,
 ):
     amount = _amount(amount_usd)
     if amount <= 0:
         raise ValueError("A budget reservation must be greater than zero.")
-    attribution = _attribution(context, project_id, task_id, agent, model, reason)
+    attribution = _attribution(
+        context, project_id, task_id, agent, model, reason, campaign_id
+    )
     reservation_id = reservation_id or f"res_{uuid.uuid4().hex[:12]}"
     existing = _find_reservation(state, reservation_id)
     if existing:
-        if existing["status"] == "reserved" and existing["amount_usd"] == amount:
+        idempotency_fields = (
+            "context", "project_id", "task_id", "agent", "model", "campaign_id"
+        )
+        if (
+            existing["status"] == "reserved"
+            and existing["amount_usd"] == amount
+            and all(existing.get(field) == attribution.get(field) for field in idempotency_fields)
+        ):
             return existing
         raise ValueError(f"Budget reservation id already exists: {reservation_id}")
 
     emergency_context = attribution["context"].lower() in {"emergency", "escalation", "summary"}
     may_use_emergency = bool(allow_emergency or emergency_context)
     available = remaining_budget(state, include_emergency=may_use_emergency)
+    campaign_snapshot = None
+    if attribution["campaign_id"]:
+        campaign_available, campaign_snapshot = _campaign_admission_available(
+            state, attribution["campaign_id"], allow_emergency=may_use_emergency
+        )
+        available = min(available, campaign_available)
     if amount > available:
         reserve_note = " including emergency reserve" if may_use_emergency else " (emergency reserve excluded)"
+        campaign_daily_available = (
+            campaign_snapshot["remaining_today_usd"]
+            if may_use_emergency
+            else campaign_snapshot["ordinary_remaining_today_usd"]
+        ) if campaign_snapshot is not None else 0.0
+        campaign_note = (
+            f"; Revenue Sprint {attribution['campaign_id']} has "
+            f"${campaign_daily_available:.2f} available for this context today and "
+            f"${campaign_snapshot['remaining_total_usd']:.2f} total"
+            if campaign_snapshot is not None
+            else ""
+        )
         raise BudgetExceededError(
-            f"Cannot reserve ${amount:.2f}; only ${available:.2f} remains{reserve_note}."
+            f"Cannot reserve ${amount:.2f}; only ${available:.2f} remains{reserve_note}{campaign_note}."
         )
 
     ordinary_available = remaining_budget(state)
@@ -714,7 +1181,19 @@ def _reserve_budget_in_state(
         "remaining_usd": amount,
         "reconciled_usd": 0.0,
         **attribution,
-        "uses_emergency_reserve": amount > ordinary_available,
+        "uses_emergency_reserve": bool(
+            amount > ordinary_available
+            or (
+                campaign_snapshot is not None
+                and may_use_emergency
+                and amount > campaign_snapshot["ordinary_remaining_today_usd"]
+            )
+        ),
+        "campaign_date": (
+            campaign_snapshot["campaign_date"]
+            if campaign_snapshot is not None
+            else state["company"]["budget_date"]
+        ),
         "created_at": now,
         "updated_at": now,
     }
@@ -745,6 +1224,7 @@ def reserve_budget(
     reason="",
     reservation_id=None,
     allow_emergency=False,
+    campaign_id=None,
 ):
     """Atomically hold estimated spend so concurrent workers cannot oversubscribe."""
     with _state_transaction(path) as state:
@@ -759,6 +1239,7 @@ def reserve_budget(
             reason=reason,
             reservation_id=reservation_id,
             allow_emergency=allow_emergency,
+            campaign_id=campaign_id,
         )
         result = deepcopy(reservation)
     return result
@@ -804,6 +1285,12 @@ def expand_task_budget_reservation(
         minimum = max(current, minimum)
         preferred = max(minimum, preferred)
         available = remaining_budget(state)
+        campaign_id = str(reservation.get("campaign_id") or "")
+        if campaign_id:
+            campaign_available, _campaign_snapshot = _campaign_admission_available(
+                state, campaign_id, allow_emergency=False
+            )
+            available = min(available, campaign_available)
         maximum = _amount(current + available)
         if maximum < minimum:
             result = {
@@ -813,6 +1300,7 @@ def expand_task_budget_reservation(
                 "amount_usd": current,
                 "added_usd": 0.0,
                 "ordinary_remaining_usd": available,
+                "campaign_id": campaign_id,
             }
         else:
             target = _amount(min(preferred, maximum))
@@ -841,6 +1329,7 @@ def expand_task_budget_reservation(
                 "amount_usd": target,
                 "added_usd": added,
                 "ordinary_remaining_usd": remaining_budget(state),
+                "campaign_id": campaign_id,
             }
         response = deepcopy(result)
     return response
@@ -860,9 +1349,13 @@ def _record_cost_entry_in_state(
     agent=None,
     model=None,
     reason="",
+    campaign_id=None,
+    campaign_date=None,
 ):
     amount = _amount(amount_usd)
-    attribution = _attribution(context, project_id, task_id, agent, model, reason)
+    attribution = _attribution(
+        context, project_id, task_id, agent, model, reason, campaign_id
+    )
     usage = _normalize_usage_records(usage_records)
     route_decisions, route_decisions_truncated = _normalize_model_route_decisions(
         model_route_decisions
@@ -873,6 +1366,7 @@ def _record_cost_entry_in_state(
     entry = {
         "id": f"cost_{uuid.uuid4().hex[:12]}",
         "budget_date": state["company"]["budget_date"],
+        "campaign_date": str(campaign_date or state["company"]["budget_date"]),
         "amount_usd": amount,
         "cost_basis": "estimated" if estimated else "actual",
         "is_estimated": bool(estimated),
@@ -907,6 +1401,7 @@ def _reconcile_budget_in_state(
     agent=None,
     model=None,
     reason="",
+    campaign_id=None,
 ):
     reservation = _find_reservation(state, reservation_id)
     if reservation is None:
@@ -931,6 +1426,15 @@ def _reconcile_budget_in_state(
     if actual < 0:
         raise ValueError("Reconciled cost must be zero or greater.")
 
+    reserved_campaign_id = str(reservation.get("campaign_id") or "")
+    supplied_campaign_id = str(campaign_id or "")
+    if supplied_campaign_id and reserved_campaign_id and supplied_campaign_id != reserved_campaign_id:
+        raise ValueError(
+            f"Reservation {reservation_id} belongs to Revenue Sprint {reserved_campaign_id!r}, "
+            f"not {supplied_campaign_id!r}."
+        )
+    effective_campaign_id = reserved_campaign_id or supplied_campaign_id
+
     state["company"]["reserved_today_usd"] = _amount(
         max(0.0, state["company"].get("reserved_today_usd", 0.0) - held)
     )
@@ -941,6 +1445,7 @@ def _reconcile_budget_in_state(
         agent or reservation.get("agent"),
         model or reservation.get("model"),
         reason or reservation.get("reason"),
+        effective_campaign_id,
     )
     entry = _record_cost_entry_in_state(
         state,
@@ -949,6 +1454,7 @@ def _reconcile_budget_in_state(
         usage_records=usage_records,
         model_route_decisions=model_route_decisions,
         estimated=estimated,
+        campaign_date=reservation.get("campaign_date") or reservation.get("budget_date"),
         **attribution,
     )
     reservation["status"] = "reconciled"
@@ -965,6 +1471,20 @@ def _reconcile_budget_in_state(
         task_id=attribution["task_id"],
         amount_usd=actual,
     )
+    if effective_campaign_id:
+        sprint = active_revenue_sprint(state, effective_campaign_id)
+        if sprint is not None:
+            snapshot = revenue_sprint_budget_snapshot(state, effective_campaign_id)
+            if actual > held + 0.000001:
+                sprint["status"] = "stopped"
+                sprint["stop_reason"] = "ai_budget_reconciliation_breach"
+                sprint["finished_at"] = _now().isoformat()
+                sprint["updated_at"] = sprint["finished_at"]
+            elif snapshot["remaining_total_usd"] <= 0:
+                sprint["status"] = "stopped"
+                sprint["stop_reason"] = "campaign_ai_budget_exhausted"
+                sprint["finished_at"] = _now().isoformat()
+                sprint["updated_at"] = sprint["finished_at"]
     return entry
 
 
@@ -982,6 +1502,7 @@ def reconcile_budget(
     agent=None,
     model=None,
     reason="",
+    campaign_id=None,
 ):
     """Atomically replace a reservation with measured (or labelled estimated) cost."""
     with _state_transaction(path) as state:
@@ -998,6 +1519,7 @@ def reconcile_budget(
             agent=agent,
             model=model,
             reason=reason,
+            campaign_id=campaign_id,
         )
         result = deepcopy(entry)
     return result
@@ -1034,6 +1556,1210 @@ def release_budget(reservation_id, path=COMPANY_STATE_FILE, *, reason=""):
         reservation = _release_budget_in_state(state, reservation_id, reason)
         result = deepcopy(reservation)
     return result
+
+
+def _validate_revenue_sprint_product(state, product):
+    requested = _normalize_sprint_product(product)
+    if not requested["project_id"] or not requested["gumroad_url"] or not requested["title"]:
+        raise RevenueSprintError(
+            "Revenue Sprint product requires exact project_id, gumroad_url, and title values."
+        )
+    matches = []
+    for registered in state.get("products", []):
+        registered_id = str(registered.get("gumroad_product_id") or "").strip()
+        registered_url = str(registered.get("gumroad_url") or "").strip().rstrip("/")
+        if (
+            requested["gumroad_product_id"]
+            and registered_id == requested["gumroad_product_id"]
+        ) or (registered_url and registered_url == requested["gumroad_url"]):
+            matches.append(registered)
+    if len(matches) != 1:
+        raise RevenueSprintError(
+            "Revenue Sprint product must match exactly one existing Company Mode Gumroad product."
+        )
+    registered = matches[0]
+    if str(registered.get("project_id") or "") != requested["project_id"]:
+        raise RevenueSprintError("Revenue Sprint product project_id does not match the product registry.")
+    if str(registered.get("title") or "").strip() != requested["title"]:
+        raise RevenueSprintError("Revenue Sprint product title does not match the product registry.")
+    registered_id = str(registered.get("gumroad_product_id") or "").strip()
+    registered_url = str(registered.get("gumroad_url") or "").strip().rstrip("/")
+    if requested["gumroad_url"] != registered_url:
+        raise RevenueSprintError("Revenue Sprint Gumroad URL does not match the product registry.")
+    if requested["gumroad_product_id"] and requested["gumroad_product_id"] != registered_id:
+        raise RevenueSprintError("Revenue Sprint Gumroad product ID does not match the product registry.")
+    requested["gumroad_product_id"] = requested["gumroad_product_id"] or registered_id
+    if requested["ownership"] != "company_owned":
+        raise RevenueSprintError(
+            "Revenue Sprint product requires an explicitly confirmed company-owned Gumroad seller; personal sellers cannot be used as fallback."
+        )
+    if requested["personal_fallback_allowed"]:
+        raise RevenueSprintError(
+            "Revenue Sprint products cannot authorize fallback to a personal seller account."
+        )
+    return requested
+
+
+def _validate_revenue_sprint_channel(channel):
+    normalized = _normalize_sprint_channel(channel)
+    if not all(normalized[field] for field in ("type", "account_id", "destination_scope")):
+        raise RevenueSprintError(
+            "Revenue Sprint channel requires exact type, account_id, and destination_scope values."
+        )
+    if "*" in normalized["destination_scope"]:
+        raise RevenueSprintError("Revenue Sprint destination_scope cannot contain a wildcard.")
+    if normalized["ownership"] != "company_owned":
+        raise RevenueSprintError(
+            "Revenue Sprint channel requires an explicitly confirmed company-owned promotional account; "
+            "personal accounts cannot be used as fallback."
+        )
+    if normalized["personal_fallback_allowed"]:
+        raise RevenueSprintError(
+            "Revenue Sprint channels cannot authorize fallback to a personal account."
+        )
+    return normalized
+
+
+def _validate_revenue_action_policy(policy):
+    raw = policy if isinstance(policy, dict) else {}
+    requested_types = [
+        str(action_type or "").strip().lower()
+        for action_type in _list(raw.get("allowed_action_types"))
+    ]
+    unsupported_types = sorted({
+        action_type for action_type in requested_types
+        if action_type not in REVENUE_ACTION_TYPES
+    })
+    if unsupported_types:
+        raise RevenueSprintError(
+            f"Unsupported Revenue Sprint action types: {unsupported_types}"
+        )
+    normalized = _normalize_action_policy(policy)
+    if not normalized["revision"]:
+        raise RevenueSprintError("Revenue Sprint automation policy requires an exact non-empty revision.")
+    if not normalized["approved_at"] or not normalized["approved_by"]:
+        raise RevenueSprintError(
+            "Revenue Sprint automation policy requires approved_at and approved_by evidence."
+        )
+    if not normalized["allowed_action_types"]:
+        raise RevenueSprintError("Revenue Sprint automation policy must allow at least one exact action type.")
+    for action_type in normalized["allowed_action_types"]:
+        targets = normalized["allowed_targets"].get(action_type, [])
+        if not targets or any("*" in target for target in targets):
+            raise RevenueSprintError(
+                f"Revenue action {action_type!r} requires one or more exact non-wildcard targets."
+            )
+        daily_cap = normalized["daily_action_caps"].get(action_type, 0)
+        total_cap = normalized["total_action_caps"].get(action_type, 0)
+        if daily_cap <= 0 or total_cap <= 0 or daily_cap > total_cap:
+            raise RevenueSprintError(
+                f"Revenue action {action_type!r} requires positive daily/total count caps with daily <= total."
+            )
+    if "purchase" in normalized["allowed_action_types"]:
+        if (
+            normalized["purchase_daily_cap_usd"] <= 0
+            or normalized["purchase_total_cap_usd"] <= 0
+            or normalized["purchase_daily_cap_usd"] > normalized["purchase_total_cap_usd"]
+        ):
+            raise RevenueSprintError(
+                "Automated purchases require separate positive daily and total USD caps."
+            )
+    elif normalized["purchase_daily_cap_usd"] or normalized["purchase_total_cap_usd"]:
+        raise RevenueSprintError(
+            "Purchase caps must be zero unless purchase is explicitly allowlisted."
+        )
+    return normalized
+
+
+def start_revenue_sprint(
+    product,
+    channel,
+    automation_policy,
+    path=COMPANY_STATE_FILE,
+    *,
+    total_ai_budget_usd=DEFAULT_REVENUE_SPRINT_TOTAL_AI_BUDGET_USD,
+    daily_ai_budget_usd=DEFAULT_REVENUE_SPRINT_DAILY_AI_BUDGET_USD,
+    max_run_days=DEFAULT_REVENUE_SPRINT_RUN_DAYS,
+    max_consecutive_no_progress_days=DEFAULT_REVENUE_SPRINT_NO_PROGRESS_LIMIT,
+    checkpoint_policy=None,
+    sprint_id=None,
+    timezone_name=None,
+):
+    """Create the one active, owner-preauthorized Revenue Sprint."""
+
+    total_cap = _amount(total_ai_budget_usd)
+    daily_cap = _amount(daily_ai_budget_usd)
+    try:
+        run_limit = int(max_run_days)
+        no_progress_limit = int(max_consecutive_no_progress_days)
+    except (TypeError, ValueError) as exc:
+        raise RevenueSprintError("Revenue Sprint run limits must be positive integers.") from exc
+    if total_cap <= 0 or daily_cap <= 0 or daily_cap > total_cap:
+        raise RevenueSprintError("Revenue Sprint AI budgets must be positive and daily cannot exceed total.")
+    if run_limit <= 0 or no_progress_limit <= 0:
+        raise RevenueSprintError("Revenue Sprint run limits must be positive integers.")
+    zone_name = str(timezone_name or budget_timezone_name()).strip()
+    try:
+        ZoneInfo(zone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise RevenueSprintError(f"Invalid Revenue Sprint timezone {zone_name!r}.") from exc
+
+    with _state_transaction(path) as state:
+        active = [
+            item
+            for item in state.get("revenue_sprints", [])
+            if item.get("status") in REVENUE_SPRINT_ACTIVE_STATUSES
+        ]
+        if active:
+            raise RevenueSprintError(f"Revenue Sprint {active[0]['id']!r} is already active.")
+        normalized_product = _validate_revenue_sprint_product(state, product)
+        normalized_channel = _validate_revenue_sprint_channel(channel)
+        normalized_policy = _validate_revenue_action_policy(automation_policy)
+        candidate_id = str(sprint_id or f"sprint_{uuid.uuid4().hex[:12]}").strip()
+        if not candidate_id:
+            raise RevenueSprintError("Revenue Sprint ID cannot be empty.")
+        if any(str(item.get("id") or "") == candidate_id for item in state.get("revenue_sprints", [])):
+            raise RevenueSprintError(f"Revenue Sprint ID already exists: {candidate_id}")
+        now = _now().isoformat()
+        sprint = _normalize_revenue_sprint({
+            "id": candidate_id,
+            "status": "active",
+            "timezone": zone_name,
+            "total_ai_budget_usd": total_cap,
+            "daily_ai_budget_usd": daily_cap,
+            "max_run_days": run_limit,
+            "max_consecutive_no_progress_days": no_progress_limit,
+            "product": normalized_product,
+            "channel": normalized_channel,
+            "automation_policy": normalized_policy,
+            "checkpoint_policy": checkpoint_policy or {},
+            "created_at": now,
+            "started_at": now,
+            "updated_at": now,
+        })
+        state.setdefault("revenue_sprints", []).append(sprint)
+        state["company"]["active_revenue_sprint_id"] = sprint["id"]
+        add_event(state, "revenue_sprint_started", f"Started Revenue Sprint {sprint['id']}.")
+        result = deepcopy(sprint)
+    return result
+
+
+def stop_revenue_sprint(path=COMPANY_STATE_FILE, *, sprint_id=None, reason="owner_stopped"):
+    bounded_reason = str(reason or "owner_stopped").strip()[:240]
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None:
+            raise RevenueSprintError("Revenue Sprint was not found.")
+        if sprint.get("status") not in REVENUE_SPRINT_TERMINAL_STATUSES:
+            now = _now().isoformat()
+            sprint["status"] = "stopped"
+            sprint["stop_reason"] = bounded_reason
+            sprint["finished_at"] = now
+            sprint["updated_at"] = now
+            add_event(state, "revenue_sprint_stopped", f"Stopped Revenue Sprint {sprint['id']}: {bounded_reason}")
+        if state["company"].get("active_revenue_sprint_id") == sprint["id"]:
+            state["company"]["active_revenue_sprint_id"] = None
+        result = deepcopy(sprint)
+    return result
+
+
+def revenue_sprint_status(path=COMPANY_STATE_FILE, *, sprint_id=None, at=None):
+    state = load_state(path)
+    sprint = active_revenue_sprint(state, sprint_id)
+    if sprint is None:
+        return {"active": False, "campaign_id": None, "status": "inactive", "budget": revenue_sprint_budget_snapshot(state)}
+    result = deepcopy(sprint)
+    result["active"] = sprint.get("status") in REVENUE_SPRINT_ACTIVE_STATUSES
+    result["campaign_id"] = sprint["id"]
+    result["budget"] = revenue_sprint_budget_snapshot(state, sprint["id"], at)
+    result["economic_verdict"] = _revenue_sprint_economic_verdict(state, sprint, at)
+    return result
+
+
+def _stop_sprint_in_state(state, sprint, reason, at=None):
+    finished = _sprint_moment(sprint, at).isoformat()
+    sprint["status"] = "stopped"
+    sprint["stop_reason"] = str(reason or "stopped")[:240]
+    sprint["finished_at"] = finished
+    sprint["updated_at"] = finished
+    if state["company"].get("active_revenue_sprint_id") == sprint["id"]:
+        state["company"]["active_revenue_sprint_id"] = None
+
+
+def _normalize_experiment(experiment):
+    if not isinstance(experiment, dict):
+        raise RevenueSprintError("A run claim requires one structured measurable experiment.")
+    normalized = {
+        "id": str(experiment.get("id") or "").strip(),
+        "hypothesis": str(experiment.get("hypothesis") or "").strip(),
+        "metric": str(experiment.get("metric") or "").strip(),
+        "success_threshold": str(experiment.get("success_threshold") or "").strip(),
+        "action_type": str(experiment.get("action_type") or "").strip().lower(),
+    }
+    if not all(normalized.values()):
+        raise RevenueSprintError(
+            "Experiment requires exact id, hypothesis, metric, success_threshold, and action_type."
+        )
+    if normalized["action_type"] not in REVENUE_ACTION_TYPES:
+        raise RevenueSprintError(f"Unsupported experiment action type: {normalized['action_type']!r}.")
+    changed_variable = str(experiment.get("changed_variable") or "").strip().lower()
+    if changed_variable:
+        if changed_variable not in {"target_pain", "proof_format", "call_to_action"}:
+            raise RevenueSprintError(
+                "Experiment changed_variable must be target_pain, proof_format, or call_to_action."
+            )
+        normalized["changed_variable"] = changed_variable
+    evidence_basis = str(experiment.get("evidence_basis") or "").strip()[:1000]
+    if evidence_basis:
+        normalized["evidence_basis"] = evidence_basis
+    return normalized
+
+
+def _find_sprint_run(sprint, run_id):
+    return next(
+        (entry for entry in sprint.get("run_days", []) if str(entry.get("run_id") or "") == str(run_id)),
+        None,
+    )
+
+
+def claim_revenue_sprint_run(
+    run_id,
+    experiment,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    at=None,
+):
+    """Claim one date-unique Monday-Friday experiment run, idempotently."""
+
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        raise RevenueSprintError("Revenue Sprint run ID cannot be empty.")
+    normalized_experiment = _normalize_experiment(experiment)
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None or sprint.get("status") not in REVENUE_SPRINT_ACTIVE_STATUSES:
+            raise RevenueSprintError("No active Revenue Sprint can claim this run.")
+        if normalized_experiment["action_type"] not in sprint["automation_policy"]["allowed_action_types"]:
+            raise RevenueSprintError(
+                f"Experiment action {normalized_experiment['action_type']!r} is not allowlisted."
+            )
+        moment = _sprint_moment(sprint, at)
+        if moment.weekday() >= 5:
+            raise RevenueSprintError("Revenue Sprint run days are Monday through Friday only.")
+        campaign_date = moment.date().isoformat()
+        prior_run = _find_sprint_run(sprint, normalized_run_id)
+        if prior_run is not None:
+            prior_experiment = next(
+                (
+                    entry for entry in sprint.get("experiments", [])
+                    if entry.get("id") == prior_run.get("experiment_id")
+                ),
+                None,
+            )
+            same_experiment = bool(prior_experiment) and all(
+                prior_experiment.get(field) == value
+                for field, value in normalized_experiment.items()
+            )
+            if (
+                prior_run.get("date") == campaign_date
+                and same_experiment
+            ):
+                result = deepcopy(prior_run)
+                result["idempotent_replay"] = True
+                return result
+            raise RevenueSprintError(f"Revenue Sprint run ID already exists: {normalized_run_id}")
+        same_date = next(
+            (entry for entry in sprint["run_days"] if entry.get("date") == campaign_date),
+            None,
+        )
+        if same_date is not None:
+            raise RevenueSprintError(
+                f"Revenue Sprint date {campaign_date} is already claimed by {same_date.get('run_id')}."
+            )
+        if sprint.get("pivot_required"):
+            raise RevenueSprintError("The day-5 pivot must be recorded before another experiment can start.")
+        if len(sprint["run_days"]) >= int(sprint["max_run_days"]):
+            _stop_sprint_in_state(state, sprint, "run_day_limit_reached", at)
+            raise RevenueSprintError("Revenue Sprint run-day limit has been reached.")
+        budget = revenue_sprint_budget_snapshot(state, sprint["id"], at)
+        if budget["remaining_total_usd"] <= 0:
+            _stop_sprint_in_state(state, sprint, "campaign_ai_budget_exhausted", at)
+            raise RevenueSprintError("Revenue Sprint AI budget is exhausted.")
+        if budget["ordinary_remaining_today_usd"] <= 0:
+            raise RevenueSprintError(
+                "Revenue Sprint ordinary daily AI budget is exhausted; the emergency reserve is preserved."
+            )
+        if any(entry.get("id") == normalized_experiment["id"] for entry in sprint["experiments"]):
+            raise RevenueSprintError(
+                f"Revenue Sprint experiment ID already exists: {normalized_experiment['id']}"
+            )
+        ordinal = len(sprint["run_days"]) + 1
+        timestamp = moment.isoformat()
+        experiment_record = {
+            **normalized_experiment,
+            "run_id": normalized_run_id,
+            "date": campaign_date,
+            "ordinal": ordinal,
+            "status": "claimed",
+            "result": "",
+            "created_at": timestamp,
+            "completed_at": None,
+        }
+        run_record = {
+            "date": campaign_date,
+            "ordinal": ordinal,
+            "run_id": normalized_run_id,
+            "experiment_id": normalized_experiment["id"],
+            "status": "claimed",
+            "outcome": "",
+            "progress": None,
+            "claimed_at": timestamp,
+            "completed_at": None,
+            "before_snapshot_id": None,
+            "after_snapshot_id": None,
+        }
+        sprint["experiments"].append(experiment_record)
+        sprint["run_days"].append(run_record)
+        sprint["updated_at"] = timestamp
+        add_event(state, "revenue_sprint_run_claimed", f"Claimed Revenue Sprint day {ordinal}.")
+        result = deepcopy(run_record)
+    return result
+
+
+def _signal_count(sprint, signal_types):
+    allowed = {str(value).lower() for value in signal_types}
+    return sum(
+        max(0, int(entry.get("count", 0) or 0))
+        for entry in sprint.get("signals", [])
+        if str(entry.get("type") or "").lower() in allowed
+    )
+
+
+def _campaign_sales_delta(sprint):
+    snapshots = [entry for entry in sprint.get("revenue_snapshots", []) if isinstance(entry, dict)]
+    if len(snapshots) < 2:
+        return 0
+    return max(0, int(snapshots[-1].get("sales_count", 0) or 0) - int(snapshots[0].get("sales_count", 0) or 0))
+
+
+def _revenue_sprint_economic_verdict(state, sprint, at=None):
+    policy = sprint["checkpoint_policy"]
+    window_days = int(policy["trailing_window_days"])
+    run_dates = list(dict.fromkeys(
+        str(entry.get("date") or "")
+        for entry in sprint.get("run_days", [])
+        if str(entry.get("date") or "")
+    ))
+    observed_dates = run_dates[-window_days:]
+    snapshots = [
+        entry for entry in sprint.get("revenue_snapshots", [])
+        if isinstance(entry, dict)
+    ]
+    trailing_gross = 0.0
+    campaign_gross = 0.0
+    if snapshots:
+        latest = snapshots[-1]
+        campaign_gross = _amount(
+            _amount(latest.get("revenue_usd")) - _amount(snapshots[0].get("revenue_usd"))
+        )
+        if observed_dates:
+            start_date = observed_dates[0]
+            baselines = [
+                entry for entry in snapshots
+                if str(entry.get("campaign_date") or "") < start_date
+                or (
+                    str(entry.get("campaign_date") or "") == start_date
+                    and entry.get("phase") == "before"
+                )
+            ]
+            baseline = baselines[-1] if baselines else snapshots[0]
+            trailing_gross = _amount(
+                _amount(latest.get("revenue_usd")) - _amount(baseline.get("revenue_usd"))
+            )
+    trailing_gross = max(0.0, trailing_gross)
+    campaign_gross = max(0.0, campaign_gross)
+    gross_per_day = _amount(trailing_gross / window_days)
+    campaign_spend = _campaign_commitments(state, sprint["id"])["spent_usd"]
+    campaign_purchase_spend = _amount(sum(
+        _purchase_commitment(entry)
+        for entry in sprint.get("action_journal", [])
+        if isinstance(entry, dict)
+    ))
+    observed_costs = _amount(campaign_spend + campaign_purchase_spend)
+    observed_contribution = _amount(campaign_gross - observed_costs)
+    meets_contribution = (
+        observed_contribution >= 0
+        if policy["require_nonnegative_contribution"]
+        else True
+    )
+    target_demonstrated = bool(
+        len(observed_dates) >= window_days
+        and trailing_gross >= policy["minimum_trailing_gross_revenue_usd"]
+        and gross_per_day >= policy["minimum_gross_revenue_usd_per_day"]
+        and meets_contribution
+    )
+    return {
+        "trailing_window_days": window_days,
+        "observed_run_days": len(observed_dates),
+        "trailing_gross_revenue_usd": trailing_gross,
+        "trailing_gross_revenue_usd_per_day": gross_per_day,
+        "minimum_gross_revenue_usd_per_day": policy["minimum_gross_revenue_usd_per_day"],
+        "minimum_trailing_gross_revenue_usd": policy["minimum_trailing_gross_revenue_usd"],
+        "campaign_gross_revenue_usd": campaign_gross,
+        "campaign_ai_spend_usd": campaign_spend,
+        "campaign_purchase_spend_usd": campaign_purchase_spend,
+        "observed_costs_before_fees_usd": observed_costs,
+        "observed_contribution_before_fees_usd": observed_contribution,
+        "require_nonnegative_contribution": policy["require_nonnegative_contribution"],
+        "target_demonstrated": target_demonstrated,
+        "self_sustaining_verified": False,
+        "fee_data_available": False,
+        "scope": "before_unavailable_gumroad_and_infrastructure_fees",
+        "evaluated_at": _sprint_moment(sprint, at).isoformat(),
+    }
+
+
+def _record_checkpoint_once(sprint, day, decision, evidence, at=None):
+    existing = next(
+        (entry for entry in sprint["checkpoint_results"] if int(entry.get("day", 0) or 0) == day),
+        None,
+    )
+    if existing is not None:
+        return existing
+    entry = {
+        "day": day,
+        "decision": decision,
+        "evidence": deepcopy(evidence),
+        "evaluated_at": _sprint_moment(sprint, at).isoformat(),
+    }
+    sprint["checkpoint_results"].append(entry)
+    return entry
+
+
+def _evaluate_sprint_after_run(state, sprint, run_record, at=None):
+    ordinal = int(run_record["ordinal"])
+    policy = sprint["checkpoint_policy"]
+    if ordinal >= 5:
+        interest_count = _signal_count(sprint, policy["day5_interest_signal_types"])
+        if not any(int(entry.get("day", 0) or 0) == 5 for entry in sprint["checkpoint_results"]):
+            if interest_count >= int(policy["day5_min_interest_count"]):
+                _record_checkpoint_once(sprint, 5, "continue", {"meaningful_interest_count": interest_count}, at)
+            else:
+                _record_checkpoint_once(sprint, 5, "pivot", {"meaningful_interest_count": interest_count}, at)
+                sprint["pivot_required"] = True
+                sprint["phase"] = "pivot"
+
+    if ordinal >= 15 and not any(
+        int(entry.get("day", 0) or 0) == 15 for entry in sprint["checkpoint_results"]
+    ):
+        sales = _campaign_sales_delta(sprint)
+        strong_intent = _signal_count(sprint, policy["day15_strong_intent_signal_types"])
+        evidence = {"campaign_sales": sales, "strong_intent_count": strong_intent}
+        if sales >= int(policy["day15_min_sales"]) or strong_intent >= int(policy["day15_min_strong_intent_count"]):
+            _record_checkpoint_once(sprint, 15, "continue", evidence, at)
+        else:
+            _record_checkpoint_once(sprint, 15, "stop", evidence, at)
+            _stop_sprint_in_state(state, sprint, "day15_no_sale_or_strong_intent", at)
+
+    if ordinal >= int(sprint["max_run_days"]):
+        day = int(sprint["max_run_days"])
+        _record_checkpoint_once(
+            sprint,
+            day,
+            "stop",
+            {
+                "run_days_used": ordinal,
+                "economic_verdict": _revenue_sprint_economic_verdict(state, sprint, at),
+            },
+            at,
+        )
+        _stop_sprint_in_state(
+            state,
+            sprint,
+            "day20_limit_reached" if day == 20 else "run_day_limit_reached",
+            at,
+        )
+    elif sprint["consecutive_no_progress_days"] >= int(sprint["max_consecutive_no_progress_days"]):
+        _stop_sprint_in_state(state, sprint, "repeated_no_progress", at)
+
+
+def complete_revenue_sprint_run(
+    run_id,
+    outcome,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    progress=None,
+    result="",
+    at=None,
+):
+    normalized_outcome = str(outcome or "").strip().lower()
+    normalized_result = str(result or "")[:1000]
+    progress_source = "automatic" if progress is None else "explicit"
+    if normalized_outcome not in {"succeeded", "failed", "deferred", "needs_human", "cancelled"}:
+        raise RevenueSprintError(f"Unsupported Revenue Sprint run outcome: {normalized_outcome!r}.")
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None:
+            raise RevenueSprintError("Revenue Sprint was not found.")
+        run_record = _find_sprint_run(sprint, run_id)
+        if run_record is None:
+            raise RevenueSprintError(f"Revenue Sprint run was not found: {run_id}")
+        if run_record.get("status") == "completed":
+            stored_source = run_record.get("progress_source")
+            same_progress_request = (
+                stored_source is None
+                or (
+                    stored_source == progress_source
+                    and (progress is None or run_record.get("progress") == bool(progress))
+                )
+            )
+            same_result = (
+                "result" not in run_record
+                or run_record.get("result") == normalized_result
+            )
+            if (
+                run_record.get("outcome") == normalized_outcome
+                and same_progress_request
+                and same_result
+            ):
+                replay = deepcopy(run_record)
+                replay["idempotent_replay"] = True
+                return replay
+            raise RevenueSprintError(f"Revenue Sprint run {run_id!r} is already complete.")
+        automatic_progress = any(
+            str(entry.get("run_id") or "") == str(run_id)
+            and (int(entry.get("count", 0) or 0) > 0 or _amount(entry.get("value_usd")) > 0)
+            for entry in sprint.get("signals", [])
+        ) or any(
+            str(entry.get("run_id") or "") == str(run_id)
+            and (
+                int(entry.get("sales_delta", 0) or 0) > 0
+                or _amount(entry.get("revenue_delta_usd")) > 0
+            )
+            for entry in sprint.get("revenue_snapshots", [])
+        )
+        made_progress = automatic_progress if progress is None else bool(progress)
+        timestamp = _sprint_moment(sprint, at).isoformat()
+        run_record.update(
+            status="completed",
+            outcome=normalized_outcome,
+            progress=made_progress,
+            progress_source=progress_source,
+            result=normalized_result,
+            completed_at=timestamp,
+        )
+        experiment = next(
+            (entry for entry in sprint["experiments"] if entry.get("id") == run_record.get("experiment_id")),
+            None,
+        )
+        if experiment is not None:
+            experiment["status"] = normalized_outcome
+            experiment["result"] = normalized_result
+            experiment["completed_at"] = timestamp
+        sprint["consecutive_no_progress_days"] = (
+            0 if made_progress else int(sprint.get("consecutive_no_progress_days", 0)) + 1
+        )
+        sprint["updated_at"] = timestamp
+        _evaluate_sprint_after_run(state, sprint, run_record, at)
+        add_event(state, "revenue_sprint_run_completed", f"Completed Revenue Sprint day {run_record['ordinal']}.")
+        response = deepcopy(run_record)
+        response["campaign_status"] = sprint["status"]
+        response["stop_reason"] = sprint.get("stop_reason", "")
+        response["pivot_required"] = bool(sprint.get("pivot_required"))
+    return response
+
+
+def record_revenue_sprint_pivot(
+    description,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    run_id="",
+    at=None,
+):
+    bounded = str(description or "").strip()[:1000]
+    if not bounded:
+        raise RevenueSprintError("A Revenue Sprint pivot requires a non-empty description.")
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None or sprint.get("status") not in REVENUE_SPRINT_ACTIVE_STATUSES:
+            raise RevenueSprintError("No active Revenue Sprint can record a pivot.")
+        if not sprint.get("pivot_required"):
+            raise RevenueSprintError("Revenue Sprint does not currently require a pivot.")
+        entry = {
+            "run_id": str(run_id or ""),
+            "description": bounded,
+            "recorded_at": _sprint_moment(sprint, at).isoformat(),
+        }
+        sprint["pivot_history"].append(entry)
+        sprint["pivot_required"] = False
+        sprint["phase"] = "iterate"
+        sprint["updated_at"] = entry["recorded_at"]
+        result = deepcopy(entry)
+    return result
+
+
+def _record_revenue_signal_in_state(
+    sprint,
+    signal_type,
+    *,
+    run_id="",
+    count=1,
+    value_usd=0.0,
+    evidence="",
+    at=None,
+    signal_id=None,
+):
+    normalized_type = str(signal_type or "").strip().lower()
+    if normalized_type not in REVENUE_SIGNAL_TYPES:
+        raise RevenueSprintError(f"Unsupported Revenue Sprint signal type: {normalized_type!r}.")
+    try:
+        normalized_count = int(count)
+    except (TypeError, ValueError) as exc:
+        raise RevenueSprintError("Revenue Sprint signal count must be a positive integer.") from exc
+    normalized_value = _amount(value_usd)
+    if normalized_count <= 0 or normalized_value < 0:
+        raise RevenueSprintError("Revenue Sprint signal count must be positive and value cannot be negative.")
+    target_id = str(signal_id or f"signal_{uuid.uuid4().hex[:12]}")
+    existing = next((entry for entry in sprint["signals"] if entry.get("id") == target_id), None)
+    if existing is not None:
+        return existing
+    entry = {
+        "id": target_id,
+        "type": normalized_type,
+        "run_id": str(run_id or ""),
+        "count": normalized_count,
+        "value_usd": normalized_value,
+        "evidence": str(evidence or "")[:600],
+        "observed_at": _sprint_moment(sprint, at).isoformat(),
+    }
+    sprint["signals"].append(entry)
+    return entry
+
+
+def record_revenue_signal(
+    signal_type,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    run_id="",
+    count=1,
+    value_usd=0.0,
+    evidence="",
+    at=None,
+):
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None:
+            raise RevenueSprintError("Revenue Sprint was not found.")
+        if run_id and _find_sprint_run(sprint, run_id) is None:
+            raise RevenueSprintError(f"Revenue Sprint run was not found: {run_id}")
+        entry = _record_revenue_signal_in_state(
+            sprint,
+            signal_type,
+            run_id=run_id,
+            count=count,
+            value_usd=value_usd,
+            evidence=evidence,
+            at=at,
+        )
+        sprint["updated_at"] = entry["observed_at"]
+        result = deepcopy(entry)
+    return result
+
+
+def record_revenue_snapshot(
+    gumroad_products,
+    phase,
+    run_id,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    at=None,
+):
+    """Persist one exact cumulative Gumroad before/after snapshot and deltas."""
+
+    normalized_phase = str(phase or "").strip().lower()
+    if normalized_phase not in {"before", "after"}:
+        raise RevenueSprintError("Revenue snapshot phase must be 'before' or 'after'.")
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None:
+            raise RevenueSprintError("Revenue Sprint was not found.")
+        run_record = _find_sprint_run(sprint, run_id)
+        if run_record is None:
+            raise RevenueSprintError(f"Revenue Sprint run was not found: {run_id}")
+        campaign_date = _sprint_date(sprint, at)
+        if run_record.get("date") != campaign_date:
+            raise RevenueSprintError(
+                "Revenue snapshot must use the exact date of its claimed Revenue Sprint run."
+            )
+        if normalized_phase == "after" and not run_record.get("before_snapshot_id"):
+            raise RevenueSprintError(
+                "Revenue Sprint after snapshot requires the run's before snapshot first."
+            )
+        expected = sprint["product"]
+        matches = []
+        for product in gumroad_products or []:
+            product_id = str(product.get("id") or product.get("gumroad_product_id") or "").strip()
+            product_url = str(product.get("short_url") or product.get("gumroad_url") or "").strip().rstrip("/")
+            if (
+                expected.get("gumroad_product_id")
+                and product_id == expected["gumroad_product_id"]
+            ) or (product_url and product_url == expected.get("gumroad_url")):
+                matches.append(product)
+        if len(matches) != 1:
+            raise RevenueSprintError(
+                "Live revenue snapshot must match exactly one configured Gumroad product."
+            )
+        product = matches[0]
+        product_id = str(product.get("id") or product.get("gumroad_product_id") or "").strip()
+        product_url = str(product.get("short_url") or product.get("gumroad_url") or "").strip().rstrip("/")
+        if expected.get("gumroad_product_id") and product_id != expected["gumroad_product_id"]:
+            raise RevenueSprintError(
+                "Live revenue snapshot Gumroad product ID does not match the configured product."
+            )
+        if product_url != expected.get("gumroad_url"):
+            raise RevenueSprintError(
+                "Live revenue snapshot Gumroad URL does not match the configured product."
+            )
+        try:
+            sales_count = max(0, int(product.get("sales_count", 0) or 0))
+        except (TypeError, ValueError) as exc:
+            raise RevenueSprintError("Gumroad sales_count must be a non-negative integer.") from exc
+        if product.get("sales_usd_cents") is not None:
+            revenue_usd = _amount(_amount(product.get("sales_usd_cents")) / 100.0)
+        else:
+            revenue_usd = _amount(product.get("revenue_usd", 0.0))
+        if revenue_usd < 0:
+            raise RevenueSprintError("Gumroad cumulative revenue cannot be negative.")
+        duplicate = next(
+            (
+                entry
+                for entry in sprint["revenue_snapshots"]
+                if entry.get("run_id") == str(run_id) and entry.get("phase") == normalized_phase
+            ),
+            None,
+        )
+        if duplicate is not None:
+            if duplicate.get("sales_count") == sales_count and duplicate.get("revenue_usd") == revenue_usd:
+                result = deepcopy(duplicate)
+                result["idempotent_replay"] = True
+                return result
+            raise RevenueSprintError(
+                f"Revenue snapshot {normalized_phase!r} for run {run_id!r} already exists with different totals."
+            )
+        previous = sprint["revenue_snapshots"][-1] if sprint["revenue_snapshots"] else None
+        sales_delta = sales_count - int(previous.get("sales_count", 0) or 0) if previous else 0
+        revenue_delta = _amount(revenue_usd - _amount(previous.get("revenue_usd"))) if previous else 0.0
+        snapshot = {
+            "id": f"snapshot_{uuid.uuid4().hex[:12]}",
+            "run_id": str(run_id),
+            "phase": normalized_phase,
+            "campaign_date": _sprint_date(sprint, at),
+            "gumroad_product_id": str(product.get("id") or product.get("gumroad_product_id") or ""),
+            "gumroad_url": str(product.get("short_url") or product.get("gumroad_url") or "").rstrip("/"),
+            "sales_count": sales_count,
+            "revenue_usd": revenue_usd,
+            "sales_delta": sales_delta,
+            "revenue_delta_usd": revenue_delta,
+            "captured_at": _sprint_moment(sprint, at).isoformat(),
+        }
+        sprint["revenue_snapshots"].append(snapshot)
+        run_record[f"{normalized_phase}_snapshot_id"] = snapshot["id"]
+        if sales_delta > 0:
+            # A sale first observed in the next run's pre-action snapshot happened
+            # after the prior run's last snapshot, so attribute it to that earlier
+            # measurement window instead of claiming the new post caused it.
+            signal_run_id = str(run_id)
+            if normalized_phase == "before" and previous is not None:
+                signal_run_id = str(previous.get("run_id") or "")
+            _record_revenue_signal_in_state(
+                sprint,
+                "sale",
+                run_id=signal_run_id,
+                count=sales_delta,
+                value_usd=max(0.0, revenue_delta),
+                evidence=f"Gumroad cumulative snapshot {snapshot['id']}",
+                at=at,
+                signal_id=f"signal_{snapshot['id']}",
+            )
+        sprint["updated_at"] = snapshot["captured_at"]
+        result = deepcopy(snapshot)
+    return result
+
+
+def _action_counts(sprint, action_type, campaign_date):
+    counted_statuses = {"claimed", "succeeded", "failed", "uncertain"}
+    entries = [
+        entry
+        for entry in sprint.get("action_journal", [])
+        if entry.get("action_type") == action_type and entry.get("status") in counted_statuses
+    ]
+    return len(entries), sum(entry.get("budget_date") == campaign_date for entry in entries)
+
+
+def _purchase_commitment(entry):
+    if entry.get("action_type") != "purchase" or entry.get("status") == "cancelled":
+        return 0.0
+    if entry.get("status") == "claimed":
+        return _amount(entry.get("reserved_purchase_usd"))
+    return _amount(entry.get("actual_purchase_usd"))
+
+
+def _revenue_action_capability_in_state(
+    state,
+    action_type,
+    target,
+    *,
+    sprint_id=None,
+    purchase_amount_usd=0.0,
+    policy_revision=None,
+    at=None,
+):
+    normalized_type = str(action_type or "").strip().lower()
+    normalized_target = str(target or "").strip()
+    try:
+        requested_purchase = _amount(purchase_amount_usd)
+    except ValueError:
+        requested_purchase = -1.0
+    sprint = active_revenue_sprint(state, sprint_id)
+    campaign_date = _sprint_date(sprint, at) if sprint is not None else None
+    policy = sprint.get("automation_policy", {}) if sprint is not None else {}
+    persisted_revision = str(policy.get("revision") or "")
+    requested_revision = str(policy_revision or "")
+    total_cap = int((policy.get("total_action_caps") or {}).get(normalized_type, 0) or 0)
+    daily_cap = int((policy.get("daily_action_caps") or {}).get(normalized_type, 0) or 0)
+    total_count, daily_count = (
+        _action_counts(sprint, normalized_type, campaign_date) if sprint is not None else (0, 0)
+    )
+    purchase_total_cap = _amount(policy.get("purchase_total_cap_usd", 0.0))
+    purchase_daily_cap = _amount(policy.get("purchase_daily_cap_usd", 0.0))
+    purchase_total = _amount(sum(_purchase_commitment(entry) for entry in sprint.get("action_journal", []))) if sprint else 0.0
+    purchase_daily = _amount(sum(
+        _purchase_commitment(entry)
+        for entry in sprint.get("action_journal", [])
+        if entry.get("budget_date") == campaign_date
+    )) if sprint else 0.0
+    result = {
+        "allowed": False,
+        "reason": "",
+        "campaign_id": sprint.get("id") if sprint else None,
+        "campaign_status": sprint.get("status") if sprint else "inactive",
+        "campaign_date": campaign_date,
+        "action_type": normalized_type,
+        "target": normalized_target,
+        "policy_revision": persisted_revision,
+        "requested_policy_revision": requested_revision,
+        "daily_count": daily_count,
+        "daily_cap": daily_cap,
+        "total_count": total_count,
+        "total_cap": total_cap,
+        "purchase_requested_usd": requested_purchase,
+        "purchase_committed_today_usd": purchase_daily,
+        "purchase_daily_cap_usd": purchase_daily_cap,
+        "purchase_committed_total_usd": purchase_total,
+        "purchase_total_cap_usd": purchase_total_cap,
+    }
+    if sprint is None:
+        result["reason"] = "No Revenue Sprint is configured."
+    elif sprint.get("status") not in REVENUE_SPRINT_ACTIVE_STATUSES:
+        result["reason"] = f"Revenue Sprint is {sprint.get('status')!r}."
+    elif not requested_revision or requested_revision != persisted_revision:
+        result["reason"] = "Revenue action policy revision does not match the owner-confirmed grant."
+    elif normalized_type not in REVENUE_ACTION_TYPES:
+        result["reason"] = f"Unsupported Revenue Sprint action type: {normalized_type!r}."
+    elif normalized_type not in policy.get("allowed_action_types", []):
+        result["reason"] = f"Action type {normalized_type!r} is not allowlisted."
+    elif not normalized_target or normalized_target not in (policy.get("allowed_targets") or {}).get(normalized_type, []):
+        result["reason"] = f"Target {normalized_target!r} is not exactly allowlisted for {normalized_type}."
+    elif daily_cap <= 0 or daily_count >= daily_cap:
+        result["reason"] = f"Daily {normalized_type} action-count cap is exhausted."
+    elif total_cap <= 0 or total_count >= total_cap:
+        result["reason"] = f"Total {normalized_type} action-count cap is exhausted."
+    elif requested_purchase < 0:
+        result["reason"] = "Purchase amount must be a non-negative USD value."
+    elif normalized_type != "purchase" and requested_purchase != 0:
+        result["reason"] = "Only purchase actions may claim purchase spend."
+    elif normalized_type == "purchase" and requested_purchase <= 0:
+        result["reason"] = "Purchase actions require a positive amount claimed before execution."
+    elif normalized_type == "purchase" and purchase_daily + requested_purchase > purchase_daily_cap:
+        result["reason"] = "Daily automated-purchase cap would be exceeded."
+    elif normalized_type == "purchase" and purchase_total + requested_purchase > purchase_total_cap:
+        result["reason"] = "Total automated-purchase cap would be exceeded."
+    else:
+        result["allowed"] = True
+        result["reason"] = "Exact action type, target, count caps, and purchase caps allow this claim."
+    return result
+
+
+def revenue_action_capability(
+    action_type,
+    target,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    purchase_amount_usd=0.0,
+    policy_revision=None,
+    at=None,
+):
+    state = load_state(path)
+    return _revenue_action_capability_in_state(
+        state,
+        action_type,
+        target,
+        sprint_id=sprint_id,
+        purchase_amount_usd=purchase_amount_usd,
+        policy_revision=policy_revision,
+        at=at,
+    )
+
+
+def claim_revenue_action(
+    action_type,
+    target,
+    run_id,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    purchase_amount_usd=0.0,
+    policy_revision=None,
+    approved_payload_digest=None,
+    idempotency_key=None,
+    metadata=None,
+    at=None,
+):
+    normalized_type = str(action_type or "").strip().lower()
+    normalized_target = str(target or "").strip()
+    normalized_run_id = str(run_id or "").strip()
+    purchase_amount = _amount(purchase_amount_usd)
+    requested_revision = str(policy_revision or "")
+    normalized_approved_digest = str(approved_payload_digest or "").strip().lower()
+    normalized_metadata = _normalize_action_journal_metadata(metadata)
+    raw_key = str(idempotency_key or "").strip()
+    if not raw_key:
+        raw_key = hashlib.sha256(
+            f"{sprint_id or ''}|{normalized_run_id}|{normalized_type}|{normalized_target}|{purchase_amount:.6f}".encode()
+        ).hexdigest()
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None:
+            raise RevenueActionError("No Revenue Sprint is configured.")
+        approval_projects = [
+            project
+            for project in state.get("projects", [])
+            if project.get("status") == "active"
+            and str(project.get("campaign_id") or "") == str(sprint.get("id") or "")
+            and str(project.get("revenue_sprint_run_id") or "") == normalized_run_id
+        ]
+        if len(approval_projects) != 1:
+            raise RevenueActionError(
+                "Revenue action requires one exact active project for this campaign run."
+            )
+        project = approval_projects[0]
+        project_action = project.get("external_action") or {}
+        approval = project.get("approved_revenue_action") or {}
+        payload_digest = str(normalized_metadata.get("payload_digest") or "").strip().lower()
+        if project.get("editor_verdict") != "approved":
+            raise RevenueActionError("The campaign project's final editor verdict is not approved.")
+        if (
+            str(project_action.get("action_type") or "") != normalized_type
+            or str(project_action.get("target") or "") != normalized_target
+            or str(project_action.get("policy_revision") or "") != requested_revision
+        ):
+            raise RevenueActionError(
+                "The claimed action does not match the active project's exact action binding."
+            )
+        if (
+            str(approval.get("action_type") or "") != normalized_type
+            or str(approval.get("target") or "") != normalized_target
+            or str(approval.get("policy_revision") or "") != requested_revision
+            or not str(approval.get("worker_task_id") or "")
+            or not str(approval.get("reviewer_task_id") or "")
+        ):
+            raise RevenueActionError(
+                "The claimed action does not match the persisted final-review approval."
+            )
+        worker_task = next(
+            (
+                task
+                for task in state.get("tasks", [])
+                if task.get("id") == approval.get("worker_task_id")
+                and task.get("project_id") == project.get("id")
+            ),
+            None,
+        )
+        reviewer_task = next(
+            (
+                task
+                for task in state.get("tasks", [])
+                if task.get("id") == approval.get("reviewer_task_id")
+                and task.get("project_id") == project.get("id")
+            ),
+            None,
+        )
+        candidate_digest = hashlib.sha256(
+            str((worker_task or {}).get("result") or "").encode("utf-8")
+        ).hexdigest()
+        if (
+            worker_task is None
+            or reviewer_task is None
+            or worker_task.get("owner") == "editor"
+            or reviewer_task.get("owner") != "editor"
+            or worker_task.get("status") not in {"done", "shipped"}
+            or reviewer_task.get("status") not in {"done", "shipped"}
+            or classify_editor_verdict(reviewer_task.get("result")) != "approved"
+            or candidate_digest != str(approval.get("candidate_result_digest") or "")
+        ):
+            raise RevenueActionError(
+                "The persisted campaign approval no longer matches its exact worker and reviewer."
+            )
+        persisted_digest = str(approval.get("payload_digest") or "").strip().lower()
+        if (
+            not re.fullmatch(r"[a-f0-9]{64}", normalized_approved_digest)
+            or not re.fullmatch(r"[a-f0-9]{64}", payload_digest)
+            or not re.fullmatch(r"[a-f0-9]{64}", persisted_digest)
+            or normalized_approved_digest != payload_digest
+            or normalized_approved_digest != persisted_digest
+        ):
+            raise RevenueActionError(
+                "The claimed payload digest does not match the persisted final approval."
+            )
+        duplicate = next(
+            (entry for entry in sprint["action_journal"] if entry.get("idempotency_key") == raw_key),
+            None,
+        )
+        if duplicate is not None:
+            exact = (
+                duplicate.get("run_id") == normalized_run_id
+                and duplicate.get("action_type") == normalized_type
+                and duplicate.get("target") == normalized_target
+                and _amount(duplicate.get("reserved_purchase_usd")) == purchase_amount
+                and duplicate.get("policy_revision") == requested_revision
+                and duplicate.get("approved_payload_digest") == normalized_approved_digest
+                and duplicate.get("metadata", {}) == normalized_metadata
+            )
+            if not exact:
+                raise RevenueActionError("Revenue action idempotency key was reused with different parameters.")
+            result = deepcopy(duplicate)
+            result["idempotent_replay"] = True
+            return result
+        run_record = _find_sprint_run(sprint, normalized_run_id)
+        if run_record is None or run_record.get("status") != "claimed":
+            raise RevenueActionError("Revenue action requires the exact currently claimed sprint run.")
+        experiment = next(
+            (
+                entry
+                for entry in sprint.get("experiments", [])
+                if entry.get("id") == run_record.get("experiment_id")
+            ),
+            None,
+        )
+        if experiment is None or experiment.get("action_type") != normalized_type:
+            raise RevenueActionError(
+                "Revenue action type does not match the exact claimed sprint experiment."
+            )
+        capability = _revenue_action_capability_in_state(
+            state,
+            normalized_type,
+            normalized_target,
+            sprint_id=sprint["id"],
+            purchase_amount_usd=purchase_amount,
+            policy_revision=requested_revision,
+            at=at,
+        )
+        if not capability["allowed"]:
+            raise RevenueActionError(capability["reason"])
+        if run_record.get("date") != capability["campaign_date"]:
+            raise RevenueActionError("Revenue action run claim belongs to a different campaign date.")
+        timestamp = _sprint_moment(sprint, at).isoformat()
+        entry = {
+            "id": f"action_{uuid.uuid4().hex[:12]}",
+            "campaign_id": sprint["id"],
+            "run_id": normalized_run_id,
+            "budget_date": capability["campaign_date"],
+            "action_type": normalized_type,
+            "target": normalized_target,
+            "status": "claimed",
+            "idempotency_key": raw_key,
+            "policy_revision": requested_revision,
+            "approved_payload_digest": normalized_approved_digest,
+            "reserved_purchase_usd": purchase_amount,
+            "actual_purchase_usd": 0.0,
+            "metadata": normalized_metadata,
+            "result": "",
+            "claimed_at": timestamp,
+            "completed_at": None,
+        }
+        sprint["action_journal"].append(entry)
+        sprint["updated_at"] = timestamp
+        add_event(state, "revenue_action_claimed", f"Claimed {normalized_type} Revenue Sprint action.")
+        result = deepcopy(entry)
+    return result
+
+
+def complete_revenue_action(
+    action_id,
+    status,
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    actual_purchase_usd=None,
+    result="",
+    at=None,
+):
+    normalized_status = str(status or "").strip().lower()
+    normalized_result = str(result or "")[:1000]
+    if normalized_status not in {"succeeded", "failed", "uncertain", "cancelled"}:
+        raise RevenueActionError(f"Unsupported revenue action completion status: {normalized_status!r}.")
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None:
+            raise RevenueActionError("Revenue Sprint was not found.")
+        entry = next(
+            (item for item in sprint["action_journal"] if item.get("id") == str(action_id)),
+            None,
+        )
+        if entry is None:
+            raise RevenueActionError(f"Revenue action was not found: {action_id}")
+        reserved = _amount(entry.get("reserved_purchase_usd"))
+        if entry.get("action_type") == "purchase":
+            if actual_purchase_usd is None:
+                actual = reserved if normalized_status in {"succeeded", "uncertain"} else 0.0
+            else:
+                actual = _amount(actual_purchase_usd)
+            if actual < 0 or actual > reserved:
+                raise RevenueActionError(
+                    "Actual purchase spend must be between zero and the amount claimed before execution."
+                )
+        else:
+            actual = _amount(actual_purchase_usd or 0.0)
+            if actual:
+                raise RevenueActionError("Non-purchase actions cannot record purchase spend.")
+        if entry.get("status") != "claimed":
+            if (
+                entry.get("status") == normalized_status
+                and _amount(entry.get("actual_purchase_usd")) == actual
+                and entry.get("result", "") == normalized_result
+            ):
+                replay = deepcopy(entry)
+                replay["idempotent_replay"] = True
+                return replay
+            raise RevenueActionError(f"Revenue action {action_id!r} is already {entry.get('status')!r}.")
+        timestamp = _sprint_moment(sprint, at).isoformat()
+        entry["status"] = normalized_status
+        entry["actual_purchase_usd"] = actual
+        entry["result"] = normalized_result
+        entry["completed_at"] = timestamp
+        sprint["updated_at"] = timestamp
+        if normalized_status == "uncertain":
+            _stop_sprint_in_state(state, sprint, "external_action_outcome_uncertain", at)
+        add_event(state, "revenue_action_completed", f"Revenue action {action_id} is {normalized_status}.")
+        response = deepcopy(entry)
+        response["campaign_status"] = sprint["status"]
+    return response
 
 
 def pause_company(path=COMPANY_STATE_FILE):
@@ -1192,6 +2918,26 @@ def assign_goal(
         tasks_to_create.append((owner, delivery, str(title), estimate, metadata))
         total_estimate = _amount(total_estimate + estimate)
 
+    requested_campaign_id = (
+        str(project_metadata.get("campaign_id") or "").strip()
+        if isinstance(project_metadata, dict)
+        else ""
+    )
+    requested_sprint_run_id = (
+        str(project_metadata.get("revenue_sprint_run_id") or "").strip()[:160]
+        if isinstance(project_metadata, dict)
+        else ""
+    )
+    requested_external_action = _normalize_external_action_metadata(
+        project_metadata.get("external_action")
+        if isinstance(project_metadata, dict)
+        else None
+    )
+    if (requested_sprint_run_id or requested_external_action) and not requested_campaign_id:
+        raise RevenueSprintError(
+            "Revenue Sprint run/action metadata requires an exact campaign_id."
+        )
+
     with _state_transaction(path) as state:
         if state["company"]["mode"] == "paused":
             return "Company Mode is paused. Use /resumecompany before assigning new work."
@@ -1203,10 +2949,57 @@ def assign_goal(
                 f"/approve or /cancel it before assigning something new - otherwise its reserved "
                 f"budget would be orphaned."
             )
-        if remaining_budget(state) < total_estimate:
+        available = remaining_budget(state)
+        if requested_campaign_id:
+            campaign_available, _campaign_snapshot = _campaign_admission_available(
+                state, requested_campaign_id, allow_emergency=False
+            )
+            available = min(available, campaign_available)
+            sprint = active_revenue_sprint(state, requested_campaign_id)
+            if requested_sprint_run_id:
+                run_record = _find_sprint_run(sprint, requested_sprint_run_id)
+                if run_record is None:
+                    raise RevenueSprintError(
+                        f"Revenue Sprint run {requested_sprint_run_id!r} was not claimed."
+                    )
+            if requested_external_action:
+                if not requested_sprint_run_id:
+                    raise RevenueSprintError(
+                        "Revenue Sprint external_action requires an exact claimed run ID."
+                    )
+                policy = sprint.get("automation_policy", {})
+                action_type = requested_external_action["action_type"]
+                target = requested_external_action["target"]
+                if requested_external_action["policy_revision"] != policy.get("revision"):
+                    raise RevenueSprintError(
+                        "Revenue Sprint external_action policy_revision does not match the owner grant."
+                    )
+                if action_type not in policy.get("allowed_action_types", []):
+                    raise RevenueSprintError(
+                        f"Revenue Sprint external action {action_type!r} is not allowlisted."
+                    )
+                if target not in (policy.get("allowed_targets") or {}).get(action_type, []):
+                    raise RevenueSprintError(
+                        f"Revenue Sprint external action target {target!r} is not exactly allowlisted."
+                    )
+                experiment_record = next(
+                    (
+                        entry for entry in sprint.get("experiments", [])
+                        if entry.get("id") == run_record.get("experiment_id")
+                    ),
+                    {},
+                )
+                experiment_action = str(
+                    experiment_record.get("action_type") or ""
+                ).strip().lower()
+                if experiment_action and experiment_action != action_type:
+                    raise RevenueSprintError(
+                        "Revenue Sprint external_action does not match the claimed run experiment."
+                    )
+        if available < total_estimate:
             return (
                 f"Blocked: assigning this goal reserves about ${total_estimate:.2f}, "
-                f"but only ${remaining_budget(state):.2f} remains today. Raise /setbudget, "
+                f"but only ${available:.2f} remains today. Raise /setbudget, "
                 f"rescope the goal, or defer it."
             )
 
@@ -1236,17 +3029,26 @@ def assign_goal(
             "autonomous_run_id",
             "authorization_level",
             "acceptance_criteria",
+            "campaign_id",
+            "revenue_sprint_run_id",
+            "external_action",
         }
         if isinstance(project_metadata, dict):
             project.update({
                 key: deepcopy(value)
                 for key, value in project_metadata.items()
-                if key in allowed_project_metadata and value is not None
+                if key in allowed_project_metadata
+                and key not in {"revenue_sprint_run_id", "external_action"}
+                and value is not None
             })
+        project["revenue_sprint_run_id"] = requested_sprint_run_id
+        project["external_action"] = deepcopy(requested_external_action)
         state["projects"].append(project)
         state["company"]["active_project_id"] = project_id
 
         for owner, delivery, title, estimate, metadata in tasks_to_create:
+            if requested_campaign_id:
+                metadata.setdefault("campaign_id", requested_campaign_id)
             task = _new_task(project_id, owner, delivery, title, estimate, **metadata)
             if estimate:
                 reservation = _reserve_budget_in_state(
@@ -1258,6 +3060,7 @@ def assign_goal(
                     agent=owner,
                     model=task.get("model"),
                     reason=f"Planned task: {title}",
+                    campaign_id=requested_campaign_id,
                 )
                 task["budget_reservation_id"] = reservation["id"]
             state["tasks"].append(task)
@@ -1384,6 +3187,7 @@ def update_task_status(
                     state, spend, usage_records=usage, estimated=estimated, context="task",
                     project_id=task.get("project_id"), task_id=task_id, agent=task.get("owner"), model=task.get("model"),
                     reason=task.get("failure_classification") or task["status"],
+                    campaign_id=task.get("campaign_id"),
                 )
             task["reserved_usd"] = 0.0
         add_event(state, "task_updated", f"{task_id} moved to {task['status']}.", task_id=task_id, amount_usd=task["spent_usd"])
@@ -1764,6 +3568,96 @@ def set_project_revision_flag(project_id, editor_answer, path=COMPANY_STATE_FILE
     return verdict
 
 
+def bind_approved_revenue_action(
+    project_id,
+    worker_task_id,
+    payload_digest,
+    path=COMPANY_STATE_FILE,
+):
+    """Bind Vera's final approval to one exact campaign draft before provider I/O.
+
+    Only hashes and control-plane identifiers are persisted here; public post copy
+    remains in the bounded worker result. The caller must publish a payload whose
+    digest matches this record, and the action journal independently stores the
+    same digest when it claims the provider action.
+    """
+
+    normalized_digest = str(payload_digest or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", normalized_digest):
+        raise RevenueActionError("An exact SHA-256 campaign payload digest is required.")
+    normalized_project_id = str(project_id or "").strip()
+    normalized_task_id = str(worker_task_id or "").strip()
+    with _state_transaction(path) as state:
+        project = next(
+            (entry for entry in state["projects"] if entry.get("id") == normalized_project_id),
+            None,
+        )
+        if project is None or project.get("status") != "active":
+            raise RevenueActionError("The campaign project is not active for approval binding.")
+        if project.get("editor_verdict") != "approved":
+            raise RevenueActionError("Vera has not approved the current campaign draft.")
+        campaign_id = str(project.get("campaign_id") or "").strip()
+        run_id = str(project.get("revenue_sprint_run_id") or "").strip()
+        action = project.get("external_action") or {}
+        if not campaign_id or not run_id or not action:
+            raise RevenueActionError("The project lacks its exact campaign action binding.")
+        current_round = int(project.get("revision_round", 0) or 0)
+        project_task_rows = project_tasks(state, normalized_project_id)
+        candidates = [
+            task for task in project_task_rows
+            if task.get("owner") != "editor"
+            and task.get("status") in {"done", "shipped"}
+            and int(task.get("revision_round", 0) or 0) == current_round
+        ]
+        if not candidates or candidates[-1].get("id") != normalized_task_id:
+            raise RevenueActionError(
+                "The approved campaign draft is not the latest worker candidate."
+            )
+        reviewers = [
+            task for task in project_task_rows
+            if task.get("owner") == "editor"
+            and task.get("status") in {"done", "shipped"}
+            and int(task.get("revision_round", 0) or 0) == current_round
+        ]
+        if not reviewers or classify_editor_verdict(reviewers[-1].get("result")) != "approved":
+            raise RevenueActionError("The current revision has no final approved review.")
+        candidate_result = str(candidates[-1].get("result") or "")
+        candidate_result_digest = hashlib.sha256(
+            candidate_result.encode("utf-8")
+        ).hexdigest()
+        record = {
+            "worker_task_id": normalized_task_id,
+            "reviewer_task_id": str(reviewers[-1].get("id") or ""),
+            "payload_digest": normalized_digest,
+            "candidate_result_digest": candidate_result_digest,
+            "action_type": str(action.get("action_type") or ""),
+            "target": str(action.get("target") or ""),
+            "policy_revision": str(action.get("policy_revision") or ""),
+            "approved_at": _now().isoformat(),
+        }
+        existing = project.get("approved_revenue_action") or {}
+        # Normalization preserves a fixed, blank approval shape for older state
+        # files.  Treat that placeholder as unbound; only a persisted payload
+        # digest represents a real prior Vera approval.
+        if existing.get("payload_digest"):
+            comparable = {key: existing.get(key) for key in record if key != "approved_at"}
+            expected = {key: value for key, value in record.items() if key != "approved_at"}
+            if comparable != expected:
+                raise RevenueActionError(
+                    "The campaign approval binding already exists with different content."
+                )
+            return deepcopy(existing)
+        project["approved_revenue_action"] = record
+        add_event(
+            state,
+            "revenue_action_draft_approved",
+            "Bound Vera's approval to one exact campaign payload digest.",
+            project_id=normalized_project_id,
+            task_id=normalized_task_id,
+        )
+        return deepcopy(record)
+
+
 def block_project(
     project_id,
     path=COMPANY_STATE_FILE,
@@ -1928,10 +3822,19 @@ def start_revision_round(project_id, configured_agent_keys, path=COMPANY_STATE_F
             for owner, _ in specs
         }
         total_estimate = _amount(sum(estimates.values()))
-        if remaining_budget(state) < total_estimate:
+        campaign_id = str(project.get("campaign_id") or "").strip()
+        available = remaining_budget(state)
+        if campaign_id:
+            campaign_available, _campaign_snapshot = _campaign_admission_available(
+                state,
+                campaign_id,
+                allow_emergency=False,
+            )
+            available = min(available, campaign_available)
+        if available < total_estimate:
             return False, (
                 f"not enough budget left for another revision round "
-                f"(needs ~${total_estimate:.2f}, ${remaining_budget(state):.2f} remaining)"
+                f"(needs ~${total_estimate:.2f}, ${available:.2f} remaining)"
             )
 
         for preferred_owner, title in specs:
@@ -1950,6 +3853,10 @@ def start_revision_round(project_id, configured_agent_keys, path=COMPANY_STATE_F
                     "required_capabilities",
                     "estimated_input_tokens",
                     "estimated_output_tokens",
+                    "campaign_external_action",
+                    "campaign_product_url",
+                    "campaign_changed_variable",
+                    "campaign_evidence_basis",
                 )
                 if template.get(key) is not None
             }
@@ -1970,6 +3877,7 @@ def start_revision_round(project_id, configured_agent_keys, path=COMPANY_STATE_F
                 state, estimate, context="revision", project_id=project_id,
                 task_id=task["id"], agent=owner, model=task.get("model"),
                 reason=f"Revision round {round_number}",
+                campaign_id=campaign_id,
             )
             task["budget_reservation_id"] = reservation["id"]
             state["tasks"].append(task)
@@ -2052,6 +3960,7 @@ def record_adhoc_spend(
     agent="manager",
     model="",
     reason="Ad-hoc chat spend.",
+    campaign_id=None,
 ):
     """Count real spend from an ad-hoc chat turn (e.g. delegating to Miles in the
     group) against today's budget, and attach any produced artifacts to the active
@@ -2065,11 +3974,25 @@ def record_adhoc_spend(
     with _state_transaction(path) as state:
         project = active_project(state)
         effective_project_id = project_id or (project.get("id") if project else None)
+        effective_campaign_id = str(
+            campaign_id
+            or (project.get("campaign_id") if project else "")
+            or ""
+        )
+        if spend and effective_campaign_id:
+            available, _snapshot = _campaign_admission_available(
+                state, effective_campaign_id, allow_emergency=False
+            )
+            if spend > available:
+                raise BudgetExceededError(
+                    f"Cannot record ${spend:.2f}; only ${available:.2f} remains in the Revenue Sprint envelope."
+                )
         if spend or usage_records or model_route_decisions:
             _record_cost_entry_in_state(
                 state, spend, usage_records=usage_records,
                 model_route_decisions=model_route_decisions, context=context,
                 project_id=effective_project_id, task_id=task_id, agent=agent, model=model, reason=reason,
+                campaign_id=effective_campaign_id,
             )
         if project and artifacts:
             project.setdefault("artifacts", []).extend(artifacts)
@@ -2093,6 +4016,7 @@ def record_budget_deferral(
     agent="manager",
     model="",
     reason="Budget reservation was denied.",
+    campaign_id=None,
 ):
     """Persist a known-zero admission failure without changing today's spend.
 
@@ -2108,6 +4032,11 @@ def record_budget_deferral(
     with _state_transaction(path) as state:
         project = active_project(state)
         effective_project_id = project_id or (project.get("id") if project else None)
+        effective_campaign_id = str(
+            campaign_id
+            or (project.get("campaign_id") if project else "")
+            or ""
+        )
         decision = {
             "agent": agent,
             "task_type": "budget_admission",
@@ -2135,6 +4064,7 @@ def record_budget_deferral(
             agent=agent,
             model=model,
             reason=bounded_reason,
+            campaign_id=effective_campaign_id,
         )
         add_event(
             state,
@@ -2410,6 +4340,39 @@ def build_task_prompt(project, task, prior_work="", deliverable_name=None, deliv
             "do NOT create a new or companion file:\n"
             f"---\n{snippet}{truncated}\n---\n"
         )
+    campaign_action = (
+        task.get("campaign_external_action")
+        if isinstance(task.get("campaign_external_action"), dict)
+        else {}
+    )
+    campaign_product_url = str(task.get("campaign_product_url") or "").strip()
+    campaign_changed_variable = str(
+        task.get("campaign_changed_variable") or ""
+    ).strip()
+    campaign_evidence_basis = str(
+        task.get("campaign_evidence_basis") or ""
+    ).strip()
+    if campaign_action and campaign_changed_variable:
+        prompt += (
+            "\nPersisted experiment control:\n"
+            f"- change exactly this major variable: {campaign_changed_variable}\n"
+            f"- evidence basis: {campaign_evidence_basis or 'No basis was persisted; block instead of inventing one.'}\n"
+            "Keep the other major offer variables stable enough for comparison.\n"
+        )
+    if campaign_action and task.get("owner") == "editor":
+        prompt += (
+            "\nCampaign review boundary: review the exact LATEST REVIEW CANDIDATE "
+            "as a draft; do not call a campaign tool or publish it. APPROVED is valid "
+            "only when the candidate contains one strict CAMPAIGN_DRAFT_JSON envelope, "
+            "uses the exact approved target and product URL, meets every acceptance "
+            "criterion that can be evaluated before publication, and contains no "
+            "unsupported claim. Criteria requiring a provider receipt or post-action "
+            "revenue snapshot are deterministic coordinator gates after approval; assess "
+            "whether the draft/control metadata can satisfy them, but do not pretend that "
+            "post-publication evidence already exists. Otherwise request concrete "
+            "revisions or block for missing evidence/access.\n"
+        )
+
     # Legacy/manual Company Mode keeps its established produce behavior.  Autonomous
     # tasks opt into explicit authorization enforcement via structured task metadata.
     if task.get("enforce_authorization"):
@@ -2455,6 +4418,25 @@ def build_task_prompt(project, task, prior_work="", deliverable_name=None, deliv
         prompt += (
             "\nIf you produce a file or open a pull request, do it now with your tools - that "
             "saved output is recorded as this task's deliverable."
+        )
+    if campaign_action and task.get("owner") != "editor":
+        action_type = str(campaign_action.get("action_type") or "").strip().lower()
+        target = str(campaign_action.get("target") or "").strip()
+        example = {
+            "action_type": action_type,
+            "target": target,
+            "text": "<one complete 1-300 character Bluesky post containing the URL once>",
+            "url": campaign_product_url,
+        }
+        prompt += (
+            "\n\nCampaign draft boundary: do not call a campaign tool and do not publish. "
+            "The coordinator can act only after Vera approves this exact draft. Return "
+            "exactly the marker CAMPAIGN_DRAFT_JSON: on one line followed by one JSON "
+            "object on the next line, with no code fence or surrounding prose. Use only "
+            "the keys action_type, target, text, and url. The action_type, target, and "
+            "URL shown below are immutable; write only the public post text.\n"
+            "CAMPAIGN_DRAFT_JSON:\n"
+            f"{json.dumps(example, ensure_ascii=False, separators=(',', ':'))}"
         )
     prompt += (
         " Focus only on YOUR task, keep it tight and in scope, and don't repeat what a "

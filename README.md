@@ -669,8 +669,9 @@ count, and authorization levels. The preview does not invoke a model, change sta
 start work. Reply `/confirm` in the same group to append the goal/items atomically, or
 `/cancel` to leave state unchanged. Confirmation is bound to the owner who staged it and
 to the exact reviewed file revision. The importer rejects ID collisions, missing or cyclic
-dependencies, active-run races, unsupported fields, and any authorization above
-`propose`; it preserves existing projects, attempts, ideas, run history, and budget data,
+dependencies, active-run races, unsupported fields, and any non-campaign authorization
+above `propose`. A Revenue Sprint may contain only its exact revision-bound
+`external_action` entries; it preserves existing projects, attempts, ideas, run history, and budget data,
 writes a pre-import backup beside `autonomy_state.json`, and records an idempotency
 receipt. Repeating the same confirmed pack creates no duplicate work.
 
@@ -688,7 +689,19 @@ multiplier, its complete worker/reviewer units reserve about **$4.572** in total
 inside a fresh day's **$4.75 ordinary allowance** while preserving the $0.25 emergency
 reserve. Reservations are reconciled to reported usage, so actual provider spend may be
 lower and is never manufactured merely to reach $5. The pack produces reviewed audits and
-an owner runbook; current autonomy still does not modify or deploy code.
+an owner runbook; it does not modify or deploy code.
+
+The repository also includes one separately bounded, owner-confirmed Revenue Sprint for
+the existing Freelancer Cold-Email Starter Pack. It permits at most one daily standalone
+post through one exact, company-owned Bluesky account; it never falls back to a personal
+account. The campaign adds a $100 total AI ceiling, a $5 Phoenix-weekday ceiling including
+reserve, before/after Gumroad snapshots, action receipts, day-5/day-15 checkpoints, and an
+unconditional day-20 stop. Account registration remains a one-time provider bootstrap
+because signup may require terms acceptance and anti-abuse verification; after the company
+account and app password exist, the confirmed exact-target publish action may run
+unattended. Each day is draft first, Vera review/revision second, and deterministic
+publication of only the approved payload last. See [docs/revenue-sprint.md](docs/revenue-sprint.md) for the Railway variables,
+activation commands, safety boundary, and test procedure.
 
 When a run reaches `needs_human` or `blocked`, resolve the stated access problem or
 owner decision first. A `deferred` item can also be reset after you increase the available
@@ -713,11 +726,16 @@ requires deliberate configuration: set `AUTONOMY_ENABLED=true`, set
 invokes one bounded daily session; live starts are refused in DMs. The manual command
 uses the same overlap lock, budget, per-item, task-count, and time ceilings as the
 scheduled session. It can spend API budget only within the configured authorization
-ceiling. This vertical slice
-auto-executes only `observe` and `propose`; `modify_local` and `external_action` stop for
-owner review because the existing Python/GitHub helpers are not a true isolated-local
-boundary. Existing `/confirm`, PR, deployment, publishing, email, and delete gates still
-apply. Do not grant broader permissions merely to suppress an escalation.
+ceiling. Ordinary autonomy auto-executes only `observe` and `propose`; `modify_local`
+still stops because the existing Python/GitHub helpers are not a true isolated-local
+boundary. `external_action` also stops unless it belongs to a separately
+owner-confirmed Revenue Sprint. The assigned worker receives only a propose-level draft
+task, Vera reviews that exact draft, and the deterministic coordinator alone receives
+the revision-bound, exact-target capability after approval. It binds the reviewed
+payload digest before provider I/O and remains bounded by run, target, account
+ownership, daily/total count, and budget.
+Existing `/confirm`, PR, deployment, email, delete, and non-campaign publishing gates
+remain authoritative. Do not raise permissions merely to suppress an escalation.
 
 A live run defers without competing for work when a supervised Company Mode plan is
 already running, another Company project remains open, Company Mode is paused, or a
@@ -885,8 +903,13 @@ Authorization levels are ceilings, not grants: `observe` inspects, `propose` dra
 `modify_local` conceptually covers an isolated local/branch workspace, and
 `external_action` covers sending, deploying, merging, publishing, purchasing, deleting,
 or production mutation. The current runtime has no killable isolated checkout executor,
-so both `modify_local` and `external_action` remain human-gated even if the configured
-ceiling is raised. Raising the ceiling never adds tools or bypasses confirmation.
+so `modify_local` remains human-gated. Ordinary/non-campaign `external_action` work also
+remains gated. The narrow exception is an active, separately owner-confirmed Revenue
+Sprint: after a propose-only worker draft and Vera's approval, the deterministic
+coordinator may invoke one exact campaign tool only for its matching reviewed payload,
+account, target, run, policy revision, count cap, and budget. A model task never receives
+that provider capability. Raising the ceiling alone never adds tools or bypasses
+confirmation.
 
 Current limitations: sessions are sequential, select at most ten distinct roadmap items,
 and attempt each item only once per session; the JSON/file-lock design assumes every
