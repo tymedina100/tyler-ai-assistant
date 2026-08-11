@@ -2480,6 +2480,11 @@ def _campaign_experiment_control(item, sprint):
 
     if int(item.get("revenue_sprint_run_day", 0) or 0) != 6:
         return {}
+    action_type = str(
+        ((item.get("external_action") or {}).get("action_type") or "")
+    ).strip().lower()
+    if action_type not in {"publish", "outreach"}:
+        return {}
     checkpoint = next(
         (
             entry for entry in reversed((sprint or {}).get("checkpoint_results", []) or [])
@@ -2533,6 +2538,12 @@ async def _prepare_campaign_item(item, run_id, *, dry_run=False):
     campaign_id = str(item.get("revenue_sprint_id") or "").strip()
     if not campaign_id or dry_run:
         return None
+    # Stop on an unresolved provider mutation before Gumroad, Bluesky, model, or
+    # any other provider work.  The later run claim repeats this guard atomically.
+    await asyncio.to_thread(
+        company_mode.require_no_pending_revenue_action,
+        sprint_id=campaign_id,
+    )
     state = await asyncio.to_thread(company_mode.load_state)
     sprint = company_mode.active_revenue_sprint(state, campaign_id)
     if sprint is None or sprint.get("status") != "active":
@@ -2651,6 +2662,8 @@ async def _complete_campaign_item(item, run_id, result):
     succeeded_actions = [
         entry for entry in action_records
         if entry.get("status") == "succeeded"
+        and isinstance(entry.get("provider_receipt"), dict)
+        and bool(entry.get("provider_receipt"))
         and approved_digest
         and str((entry.get("metadata") or {}).get("payload_digest") or "")
         == approved_digest
@@ -2665,10 +2678,10 @@ async def _complete_campaign_item(item, run_id, result):
             "status": "needs_human",
             "failure_classification": "unavailable_tool",
             "reason": (
-                "The approved company promotional action did not produce one verified provider receipt."
+                "The approved company action did not produce one exact verified provider receipt."
             ),
             "human_action": (
-                "Fix the dedicated company promotional account credentials or provider access, "
+                "Fix the dedicated company account credentials or provider access, "
                 "then queue a new owner-confirmed sprint revision."
             ),
             "attempted": "The campaign worker and reviewer ran inside the exact action policy.",
@@ -2679,7 +2692,10 @@ async def _complete_campaign_item(item, run_id, result):
                 sprint_id=campaign_id,
                 reason="external_action_not_verified",
             )
-    else:
+    elif (
+        expected_action.get("action_type") == "publish"
+        and str(expected_action.get("target") or "").startswith("bluesky:")
+    ):
         try:
             engagement = await asyncio.to_thread(
                 revenue_actions.fetch_bluesky_engagement,
@@ -3772,8 +3788,8 @@ async def _run_one_task(project, task):
     return await _execute_routed_task(project, task, owner, prompt, sink)
 
 
-async def _publish_approved_campaign_draft(project_id):
-    """Publish only the exact worker payload that Vera approved.
+async def _execute_approved_campaign_action(project_id):
+    """Execute only the exact external-action payload that Vera approved.
 
     Model tasks never receive provider I/O for this path. The coordinator parses
     the bounded worker envelope, persists its approval binding, obtains one live
@@ -3790,7 +3806,7 @@ async def _publish_approved_campaign_draft(project_id):
         return None
     if project.get("editor_verdict") != "approved":
         raise company_mode.RevenueActionError(
-            "The campaign draft cannot publish before Vera approves it."
+            "The campaign action cannot execute before Vera approves its exact draft."
         )
     current_round = int(project.get("revision_round", 0) or 0)
     candidates = [
@@ -3821,6 +3837,17 @@ async def _publish_approved_campaign_draft(project_id):
         target=target,
         product_url=product_url,
     )
+    purchase_amount_usd = 0.0
+    if action_type == "purchase":
+        payload = parsed.get("payload") if isinstance(parsed, dict) else None
+        try:
+            purchase_amount_usd = float(
+                payload.get("amount_usd") if isinstance(payload, dict) else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise company_mode.RevenueActionError(
+                "The approved purchase draft does not contain one canonical amount_usd."
+            ) from exc
     payload_digest = str(parsed.get("payload_digest") or "")
     binding = await asyncio.to_thread(
         company_mode.bind_approved_revenue_action,
@@ -3833,12 +3860,13 @@ async def _publish_approved_campaign_draft(project_id):
         action_type,
         target,
         sprint_id=campaign_id,
+        purchase_amount_usd=purchase_amount_usd,
         policy_revision=policy_revision,
     )
     if not isinstance(capability, dict) or not capability.get("allowed"):
         reason = capability.get("reason") if isinstance(capability, dict) else "invalid capability"
         raise company_mode.RevenueActionError(
-            f"The approved campaign action lost authorization before publish: {reason}"
+            f"The approved campaign action lost authorization before execution: {reason}"
         )
     result = await asyncio.to_thread(
         revenue_actions.execute_approved_campaign_draft,
@@ -3858,6 +3886,8 @@ async def _publish_approved_campaign_draft(project_id):
     exact = [
         entry for entry in records
         if entry.get("status") == "succeeded"
+        and isinstance(entry.get("provider_receipt"), dict)
+        and bool(entry.get("provider_receipt"))
         and str((entry.get("metadata") or {}).get("payload_digest") or "")
         == payload_digest
         and str(binding.get("payload_digest") or "") == payload_digest
@@ -3871,7 +3901,15 @@ async def _publish_approved_campaign_draft(project_id):
         "payload_digest": payload_digest,
         "provider_result": str(result)[:500],
         "action_id": exact[0].get("id"),
+        "action_type": action_type,
+        "target": target,
     }
+
+
+async def _publish_approved_campaign_draft(project_id):
+    """Backward-compatible alias for the generalized reviewed-action coordinator."""
+
+    return await _execute_approved_campaign_action(project_id)
 
 
 async def _run_company_plan_locked(project_id):
@@ -3941,11 +3979,11 @@ async def _run_company_plan_locked(project_id):
                 # Only now may the coordinator expose the exact provider capability.
                 if project.get("campaign_id"):
                     try:
-                        publish_record = await _publish_approved_campaign_draft(project_id)
+                        action_record = await _execute_approved_campaign_action(project_id)
                     except Exception as exc:
                         reason = str(
                             autonomous_workflow.redact_secrets(str(exc))
-                        ).strip()[:1000] or "Approved campaign publish failed closed."
+                        ).strip()[:1000] or "Approved campaign action failed closed."
                         await asyncio.to_thread(
                             company_mode.block_project,
                             project_id,
@@ -3954,15 +3992,16 @@ async def _run_company_plan_locked(project_id):
                             failure_classification="unavailable_tool",
                         )
                         await post_to_group(
-                            f"Campaign publish stopped after review: {reason}",
+                            f"Campaign action stopped after review: {reason}",
                             "manager",
                         )
                         return
                     await post_team_handoff(
                         "manager",
                         (
-                            "Vera approved the exact draft. The coordinator published "
-                            f"one company-owned campaign action ({publish_record['action_id']})."
+                            "Vera approved the exact draft. The coordinator executed "
+                            f"one company-owned {action_record['action_type']} action "
+                            f"({action_record['action_id']})."
                         ),
                     )
 
@@ -4338,6 +4377,15 @@ async def _execute_autonomy_item(project, item, decision, run_id):
                 "model_invoked": False,
             }
         item = dict(item)
+        draft_binding = readiness.get("draft_binding")
+        if isinstance(draft_binding, dict):
+            # revenue_actions returns only immutable, secret-free provider fields.
+            # Carry that same record through worker, reviewer, and revision prompts;
+            # the model never receives the provider credential or mutation tool.
+            fixed_fields = draft_binding.get("fixed_fields")
+            item["campaign_action_binding"] = dict(
+                fixed_fields if isinstance(fixed_fields, dict) else draft_binding
+            )
         item["campaign_product_url"] = str(
             ((sprint or {}).get("product") or {}).get("gumroad_url") or ""
         ).rstrip("/")

@@ -175,6 +175,14 @@ def build_company_plan(
         common.update({
             "campaign_external_action": campaign_external_action,
             "campaign_product_url": str(item.get("campaign_product_url") or "").strip(),
+            # Provider readiness resolves immutable, secret-free fields that are
+            # needed to make the worker envelope exact (for example the company
+            # outreach recipient or deploy project/ref).  Persist the
+            # same binding on both the worker and Vera's review task so review is
+            # performed against precisely the payload the coordinator can execute.
+            "campaign_action_binding": dict(
+                item.get("campaign_action_binding") or {}
+            ) if isinstance(item.get("campaign_action_binding"), Mapping) else {},
             "campaign_changed_variable": str(
                 item.get("campaign_changed_variable") or ""
             ).strip(),

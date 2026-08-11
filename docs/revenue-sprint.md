@@ -46,6 +46,72 @@ not exist, Miles must stop with an exact owner action. After the owner completes
 that one-time provider bootstrap and installs an app password, the approved daily
 posting action can run unattended within the campaign limits.
 
+## Reviewed-action coordinator boundary
+
+The included campaign still authorizes only the Bluesky target above. The same
+coordinator can now validate other action types, but adding adapter credentials does
+not activate them. Each action must first appear in a new owner-reviewed manifest
+revision with an exact target and count/spend caps. The worker remains proposal-only,
+Vera reviews one strict `CAMPAIGN_DRAFT_JSON` object, and the deterministic coordinator
+may execute only the canonical payload whose SHA-256 digest was approved.
+
+The supported review envelopes are deliberately separate:
+
+- Bluesky publish: exact `action_type`, `target`, `text`, and product `url`;
+- signed publish webhook: exact `action_type`, `target`, and bounded public `payload`;
+- Gmail outreach: exact logical `target`, owner-configured `recipient`, `subject`, and
+  `body`; the dedicated company sender is reverified before sending;
+- Vercel deploy: exact company `account_id`, project, and immutable lowercase 40-hex
+  Git commit; production deployment is unavailable with a mutable branch name or a
+  credential not explicitly marked `company_service`;
+- signed purchase webhook: exact target, owner-configured `amount_usd`, and bounded
+  public payload. Purchases still default disabled at the independent $0 hard cap.
+
+Reviewed publish and purchase webhooks require an exact allowlisted public HTTPS host.
+Their 2xx response is not enough: success requires an HMAC-signed response that echoes
+the action ID, idempotency key, payload digest, company account, amount, status, and a
+safe receipt ID. Missing or mismatched proof becomes `uncertain`, stops the sprint, and
+is never retried blindly. If Railway stops after a persistent action claim but before a
+terminal receipt is journaled, the next run stops before model or provider work with
+`external_action_claim_pending_reconciliation`; inspect the provider and start a new
+owner-confirmed campaign revision instead of editing the ledger or replaying the call.
+
+The webhook response contract is exact and uses the same secret as the corresponding
+request (`REVENUE_PUBLISH_WEBHOOK_SECRET` or `REVENUE_PURCHASE_WEBHOOK_SECRET`):
+
+1. Read `X-Revenue-Timestamp` from the request and preserve its ASCII value exactly.
+   Do not generate a different response timestamp.
+2. Return HTTP 2xx with a canonical UTF-8 JSON object. Produce the body equivalently to
+   Python `json.dumps(value, sort_keys=True, separators=(",", ":"),
+   ensure_ascii=False).encode("utf-8")`: keys are sorted lexicographically, there is no
+   insignificant whitespace, and Unicode remains UTF-8 except where JSON itself requires
+   escaping. The required fields are:
+
+   ```json
+   {"action_id":"<exact request action_id>","amount_usd":0.0,"idempotency_key":"<exact request idempotency_key>","payload_digest":"<exact request payload_digest>","provider_account_id":"<exact configured company account ID>","receipt_id":"<non-empty provider receipt using only safe receipt characters>","status":"succeeded"}
+   ```
+
+   `amount_usd` must be `0.0` for publish and the exact approved amount for purchase.
+   The other echoed values must exactly match the signed request body. `receipt_id` is
+   limited to 1-200 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, `@`, `/`, and
+   `-`. Optional signed revenue `signals` may be included, but the required receipt
+   fields cannot be omitted or changed.
+3. Compute HMAC-SHA256 over these exact bytes:
+
+   ```text
+   <request X-Revenue-Timestamp>.<raw canonical response body>
+   ```
+
+   Set the response header to `X-Revenue-Response-Signature: sha256=<lowercase hex
+   digest>`. The body bytes used for the signature must be the same canonical JSON bytes
+   returned in the response.
+
+The coordinator does not follow webhook redirects. A redirect, non-2xx response,
+missing or malformed JSON, missing echo, account/amount/digest/idempotency mismatch,
+unsafe or empty receipt ID, missing signature, or invalid signature is persisted as an
+`uncertain` outcome. Treat that as a possible completed external action: inspect the
+provider and do not replay it blindly.
+
 The example handle is a configuration target, not proof that the handle is
 available or registered. Verify it before queuing the manifest; if the real handle
 differs, update every exact target in the manifest and the Railway mapping, then
@@ -147,6 +213,7 @@ The campaign stops or escalates rather than improvising around:
 - a target, account, policy revision, run ID, or action type mismatch;
 - insufficient daily or total AI budget;
 - an uncertain external-action result;
+- an old action claim that has no terminal, digest-bound provider receipt;
 - unavailable or mismatched public Bluesky engagement evidence;
 - repeated no progress;
 - failure to meet the day-15 continuation threshold;
@@ -212,7 +279,7 @@ The critical tests mock OpenAI, Gumroad, Bluesky, and other paid/external calls:
 
 ```powershell
 $env:PYTHONUTF8 = "1"
-.\.venv\Scripts\python.exe -m unittest tests.test_revenue_sprint_workflow tests.test_revenue_sprint_company tests.test_revenue_actions tests.test_group_autonomy
+.\.venv\Scripts\python.exe -m unittest tests.test_revenue_sprint_workflow tests.test_revenue_sprint_company tests.test_revenue_actions tests.test_revenue_action_envelopes tests.test_revenue_action_coordinator tests.test_revenue_publish_gate tests.test_group_autonomy
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 

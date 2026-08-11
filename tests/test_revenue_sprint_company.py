@@ -1262,6 +1262,65 @@ class RevenueSprintCompanyTests(unittest.TestCase):
         self.assertEqual(verdict["campaign_purchase_spend_usd"], 3.0)
         self.assertEqual(verdict["observed_contribution_before_fees_usd"], -3.0)
 
+    def test_pending_provider_claim_stops_next_run_before_any_new_action(self):
+        sprint = self.start()
+        day1, day2 = business_days(2)
+        run_id = "crash-gap-run"
+        target = "web:freelancer-cold-email-site"
+        company_mode.claim_revenue_sprint_run(
+            run_id,
+            self.experiment("crash-gap"),
+            self.path,
+            sprint_id=sprint["id"],
+            at=day1,
+        )
+        digest = hashlib.sha256(b"reviewed crash-gap payload").hexdigest()
+        self.approve_action_payload(
+            sprint["id"], run_id, "outreach", target, digest
+        )
+        action = company_mode.claim_revenue_action(
+            "outreach",
+            target,
+            run_id,
+            self.path,
+            sprint_id=sprint["id"],
+            policy_revision="owner-policy-r1",
+            approved_payload_digest=digest,
+            idempotency_key="crash-gap-action",
+            metadata={"payload_digest": digest},
+            at=day1,
+        )
+        self.assertEqual(action["status"], "claimed")
+        capability = company_mode.revenue_action_capability(
+            "outreach",
+            target,
+            self.path,
+            sprint_id=sprint["id"],
+            policy_revision="owner-policy-r1",
+            at=day1,
+        )
+        self.assertFalse(capability["allowed"])
+        self.assertEqual(capability["pending_action_claim_id"], action["id"])
+
+        with self.assertRaises(company_mode.RevenueSprintError) as caught:
+            company_mode.claim_revenue_sprint_run(
+                "next-run",
+                self.experiment("next"),
+                self.path,
+                sprint_id=sprint["id"],
+                at=day2,
+            )
+
+        self.assertIn("terminal provider receipt", str(caught.exception))
+        status = company_mode.revenue_sprint_status(
+            self.path, sprint_id=sprint["id"]
+        )
+        self.assertEqual(status["status"], "stopped")
+        self.assertEqual(
+            status["stop_reason"],
+            "external_action_claim_pending_reconciliation",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

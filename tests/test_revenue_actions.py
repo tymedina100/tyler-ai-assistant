@@ -649,7 +649,7 @@ class RevenueActionsTests(unittest.TestCase):
             "REVENUE_PURCHASE_HARD_CAP_USD": "0",
         }
         with self.configure_target(
-            "purchase", target, account_id="company-buying"
+            "purchase", target, account_id="company-buying", amount_usd=1.0
         ), patch.dict(os.environ, env, clear=False), patch.object(
             revenue_actions.requests, "post"
         ) as post, self.active(cap):
@@ -669,7 +669,7 @@ class RevenueActionsTests(unittest.TestCase):
             "REVENUE_PURCHASE_HARD_CAP_USD": "2.00",
         }
         with self.configure_target(
-            "purchase", target, account_id="company-buying"
+            "purchase", target, account_id="company-buying", amount_usd=1.25
         ), patch.dict(os.environ, env, clear=False), patch.object(
             revenue_actions.requests,
             "post",
@@ -694,7 +694,7 @@ class RevenueActionsTests(unittest.TestCase):
             "REVENUE_PURCHASE_HARD_CAP_USD": "2.00",
         }
         with self.configure_target(
-            "purchase", target, account_id="company-buying"
+            "purchase", target, account_id="company-buying", amount_usd=1.25
         ), patch.dict(os.environ, env, clear=False), patch.object(
             revenue_actions.requests,
             "post",
@@ -737,6 +737,7 @@ class RevenueActionsTests(unittest.TestCase):
         self.claim.assert_called_once()
         profile_execute.assert_called_once()
         send.assert_called_once()
+        self.assertIs(send.call_args.kwargs["service"], gmail_service)
 
     def test_vercel_uses_only_project_and_ref_pinned_to_company_team(self):
         target = "web:freelancer-cold-email-site"

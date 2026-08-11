@@ -115,6 +115,13 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
         self.group.autonomy_runner_task = None
         self.group.company_runner_task = None
         self.group.TEAM_SMOKE_SEND_INTERVAL_SECONDS = 0
+        self.pending_action_guard_patcher = patch.object(
+            self.group.company_mode,
+            "require_no_pending_revenue_action",
+            return_value=None,
+        )
+        self.pending_action_guard = self.pending_action_guard_patcher.start()
+        self.addCleanup(self.pending_action_guard_patcher.stop)
 
     async def test_telegram_roster_check_retries_without_logging_exception_text(self):
         self.fake_main.logger.warning.reset_mock()
@@ -2483,6 +2490,35 @@ class GroupAutonomyTests(unittest.IsolatedAsyncioTestCase):
             [event[0] for event in order],
             ["fetch", "claim", "engagement", "gumroad", "sync"],
         )
+
+    async def test_prepare_campaign_pending_action_stops_before_provider_reads(self):
+        item = {
+            "id": "D02",
+            "revenue_sprint_id": "sprint-1",
+            "external_action": {"action_type": "publish"},
+        }
+        self.pending_action_guard.side_effect = self.group.company_mode.RevenueSprintError(
+            "A prior external action remains claimed; reconcile action action-1."
+        )
+
+        with patch.object(
+            self.group.company_mode, "load_state"
+        ) as load_state, patch.object(
+            self.group.gumroad_helpers, "list_products"
+        ) as products, patch.object(
+            self.group.revenue_actions, "fetch_bluesky_engagement"
+        ) as engagement, patch.object(
+            self.group.company_mode, "claim_revenue_sprint_run"
+        ) as claim:
+            with self.assertRaises(self.group.company_mode.RevenueSprintError) as caught:
+                await self.group._prepare_campaign_item(item, "run-next")
+
+        self.assertIn("reconcile action", str(caught.exception))
+        self.pending_action_guard.assert_called_once_with(sprint_id="sprint-1")
+        load_state.assert_not_called()
+        products.assert_not_called()
+        engagement.assert_not_called()
+        claim.assert_not_called()
 
     async def test_prepare_campaign_fetch_failure_consumes_no_run_day(self):
         sprint = {

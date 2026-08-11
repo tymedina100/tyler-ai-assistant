@@ -487,6 +487,9 @@ def _normalize_task(task):
     item["total_tokens"] = int(item.get("total_tokens", 0) or 0)
     item.setdefault("budget_reservation_id", "")
     item["campaign_id"] = str(item.get("campaign_id") or "")
+    item["campaign_action_binding"] = _normalize_campaign_action_binding(
+        item.get("campaign_action_binding")
+    )
     item.setdefault("linear_issue_id", "")
     item.setdefault("linear_identifier", "")
     item.setdefault("linear_url", "")
@@ -613,6 +616,28 @@ def _normalize_external_action_metadata(value):
         "target": target[:512],
         "policy_revision": policy_revision[:160],
     }
+
+
+def _normalize_campaign_action_binding(value):
+    """Persist only the secret-free immutable fields used in review prompts.
+
+    The provider readiness adapter, not the roadmap or model, supplies this
+    record.  Keeping a small flat allowlist prevents an accidental credential or
+    arbitrary provider response from being copied into the Company ledger.
+    """
+
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in ("recipient", "account_id", "project", "ref"):
+        if key not in value:
+            continue
+        text = str(value.get(key) or "").strip()
+        if text:
+            result[key] = text[:500]
+    if "amount_usd" in value:
+        result["amount_usd"] = _amount(value.get("amount_usd"))
+    return result
 
 
 def _normalize_action_journal_metadata(value):
@@ -1898,6 +1923,68 @@ def _find_sprint_run(sprint, run_id):
     )
 
 
+def _stop_for_pending_revenue_action(path, sprint_id=None, at=None):
+    """Atomically stop before a new run when provider reconciliation is unknown.
+
+    A process can die after the persistent pre-I/O claim and before completion is
+    journaled. Starting another run in that state could repeat an already-completed
+    external mutation under a new run ID, so the only safe recovery is explicit
+    provider reconciliation and a new owner-confirmed campaign revision.
+    """
+
+    with _state_transaction(path) as state:
+        sprint = active_revenue_sprint(state, sprint_id)
+        if sprint is None or sprint.get("status") not in REVENUE_SPRINT_ACTIVE_STATUSES:
+            return None
+        pending = next(
+            (
+                entry
+                for entry in sprint.get("action_journal", [])
+                if isinstance(entry, dict) and entry.get("status") == "claimed"
+            ),
+            None,
+        )
+        if pending is None:
+            return None
+        _stop_sprint_in_state(
+            state,
+            sprint,
+            "external_action_claim_pending_reconciliation",
+            at,
+        )
+        add_event(
+            state,
+            "revenue_action_reconciliation_required",
+            "Stopped Revenue Sprint because a provider action claim has no terminal receipt.",
+        )
+        return deepcopy(pending)
+
+
+def require_no_pending_revenue_action(
+    path=COMPANY_STATE_FILE,
+    *,
+    sprint_id=None,
+    at=None,
+):
+    """Fail closed before any new campaign work when provider state is unknown.
+
+    This guard belongs at the very start of campaign preparation, before even
+    read-only provider preflights.  The claim path repeats the same atomic check
+    later so a concurrent process cannot open a gap between preparation and the
+    persistent run claim.
+    """
+
+    pending_action = _stop_for_pending_revenue_action(path, sprint_id, at)
+    if pending_action is not None:
+        action_id = str(pending_action.get("id") or "unknown")[:120]
+        raise RevenueSprintError(
+            "A prior external action remains claimed without a terminal provider "
+            f"receipt (action {action_id}). The sprint was stopped; inspect and "
+            "reconcile that exact provider action, then create a new owner-confirmed "
+            "campaign revision."
+        )
+
+
 def claim_revenue_sprint_run(
     run_id,
     experiment,
@@ -1912,6 +1999,7 @@ def claim_revenue_sprint_run(
     if not normalized_run_id:
         raise RevenueSprintError("Revenue Sprint run ID cannot be empty.")
     normalized_experiment = _normalize_experiment(experiment)
+    require_no_pending_revenue_action(path, sprint_id=sprint_id, at=at)
     with _state_transaction(path) as state:
         sprint = active_revenue_sprint(state, sprint_id)
         if sprint is None or sprint.get("status") not in REVENUE_SPRINT_ACTIVE_STATUSES:
@@ -2519,6 +2607,14 @@ def _revenue_action_capability_in_state(
         for entry in sprint.get("action_journal", [])
         if entry.get("budget_date") == campaign_date
     )) if sprint else 0.0
+    pending_claim = next(
+        (
+            entry
+            for entry in (sprint.get("action_journal", []) if sprint else [])
+            if isinstance(entry, dict) and entry.get("status") == "claimed"
+        ),
+        None,
+    )
     result = {
         "allowed": False,
         "reason": "",
@@ -2538,6 +2634,9 @@ def _revenue_action_capability_in_state(
         "purchase_daily_cap_usd": purchase_daily_cap,
         "purchase_committed_total_usd": purchase_total,
         "purchase_total_cap_usd": purchase_total_cap,
+        "pending_action_claim_id": (
+            str(pending_claim.get("id") or "") if pending_claim else ""
+        ),
     }
     if sprint is None:
         result["reason"] = "No Revenue Sprint is configured."
@@ -2549,6 +2648,11 @@ def _revenue_action_capability_in_state(
         result["reason"] = f"Unsupported Revenue Sprint action type: {normalized_type!r}."
     elif normalized_type not in policy.get("allowed_action_types", []):
         result["reason"] = f"Action type {normalized_type!r} is not allowlisted."
+    elif pending_claim is not None:
+        result["reason"] = (
+            "A prior external action claim requires provider reconciliation before "
+            "another action can be authorized."
+        )
     elif not normalized_target or normalized_target not in (policy.get("allowed_targets") or {}).get(normalized_type, []):
         result["reason"] = f"Target {normalized_target!r} is not exactly allowlisted for {normalized_type}."
     elif daily_cap <= 0 or daily_count >= daily_cap:
@@ -4105,6 +4209,7 @@ def start_revision_round(project_id, configured_agent_keys, path=COMPANY_STATE_F
                     "estimated_output_tokens",
                     "campaign_external_action",
                     "campaign_product_url",
+                    "campaign_action_binding",
                     "campaign_changed_variable",
                     "campaign_evidence_basis",
                 )
@@ -4596,6 +4701,11 @@ def build_task_prompt(project, task, prior_work="", deliverable_name=None, deliv
         else {}
     )
     campaign_product_url = str(task.get("campaign_product_url") or "").strip()
+    campaign_action_binding = (
+        task.get("campaign_action_binding")
+        if isinstance(task.get("campaign_action_binding"), dict)
+        else {}
+    )
     campaign_changed_variable = str(
         task.get("campaign_changed_variable") or ""
     ).strip()
@@ -4612,10 +4722,11 @@ def build_task_prompt(project, task, prior_work="", deliverable_name=None, deliv
     if campaign_action and task.get("owner") == "editor":
         prompt += (
             "\nCampaign review boundary: review the exact LATEST REVIEW CANDIDATE "
-            "as a draft; do not call a campaign tool or publish it. APPROVED is valid "
+            "as a draft; do not call a campaign tool or execute it. APPROVED is valid "
             "only when the candidate contains one strict CAMPAIGN_DRAFT_JSON envelope, "
-            "uses the exact approved target and product URL, meets every acceptance "
-            "criterion that can be evaluated before publication, and contains no "
+            "uses the exact approved target and immutable action binding (including the "
+            "product URL when the schema includes one), meets every acceptance "
+            "criterion that can be evaluated before execution, and contains no "
             "unsupported claim. Criteria requiring a provider receipt or post-action "
             "revenue snapshot are deterministic coordinator gates after approval; assess "
             "whether the draft/control metadata can satisfy them, but do not pretend that "
@@ -4672,19 +4783,83 @@ def build_task_prompt(project, task, prior_work="", deliverable_name=None, deliv
     if campaign_action and task.get("owner") != "editor":
         action_type = str(campaign_action.get("action_type") or "").strip().lower()
         target = str(campaign_action.get("target") or "").strip()
-        example = {
-            "action_type": action_type,
-            "target": target,
-            "text": "<one complete 1-300 character Bluesky post containing the URL once>",
-            "url": campaign_product_url,
-        }
+        immutable_note = "The action_type and target shown below are immutable"
+        if action_type == "publish" and target.startswith("bluesky:"):
+            example = {
+                "action_type": action_type,
+                "target": target,
+                "text": "<one complete 1-300 character Bluesky post containing the URL once>",
+                "url": campaign_product_url,
+            }
+            allowed_keys = "action_type, target, text, and url"
+            immutable_note += ", as is the URL; write only the public post text"
+        elif action_type == "publish":
+            example_payload = {
+                "message": "<one bounded public campaign payload>",
+            }
+            if campaign_product_url:
+                example_payload["url"] = campaign_product_url
+            example = {
+                "action_type": action_type,
+                "target": target,
+                "payload": example_payload,
+            }
+            allowed_keys = "action_type, target, and payload"
+            immutable_note += "; write only the bounded public webhook payload"
+        elif action_type == "outreach":
+            recipient = str(
+                campaign_action_binding.get("recipient") or target
+            ).strip()
+            example = {
+                "action_type": action_type,
+                "target": target,
+                "recipient": recipient,
+                "subject": "<one bounded outreach subject>",
+                "body": (
+                    "<one bounded outreach message with only supported claims> "
+                    + campaign_product_url
+                ).strip(),
+            }
+            allowed_keys = "action_type, target, recipient, subject, and body"
+            immutable_note += ", as is the recipient; write only the subject and body"
+        elif action_type == "deploy":
+            example = {
+                "action_type": action_type,
+                "target": target,
+                "account_id": str(campaign_action_binding.get("account_id") or "").strip(),
+                "project": str(campaign_action_binding.get("project") or "").strip(),
+                "ref": str(campaign_action_binding.get("ref") or "").strip(),
+            }
+            allowed_keys = "action_type, target, account_id, project, and ref"
+            immutable_note += ", as are account_id, project, and ref; do not alter any field"
+        elif action_type == "purchase":
+            amount_usd = campaign_action_binding.get("amount_usd", 0.0)
+            example = {
+                "action_type": action_type,
+                "target": target,
+                "amount_usd": amount_usd,
+                "payload": {
+                    "item": "<one bounded company purchase description>",
+                    "purpose": "<the approved business purpose>",
+                },
+            }
+            allowed_keys = "action_type, target, amount_usd, and payload"
+            immutable_note += (
+                ", as is the owner-configured amount_usd; write only the bounded "
+                "purchase payload. Vera must review the exact amount, and the "
+                "coordinator will enforce every owner-confirmed purchase cap"
+            )
+        else:
+            example = {"action_type": action_type, "target": target}
+            allowed_keys = "action_type and target"
+            immutable_note += "; if the action is unsupported, block instead of improvising"
         prompt += (
-            "\n\nCampaign draft boundary: do not call a campaign tool and do not publish. "
+            "\n\nCampaign draft boundary: do not call a campaign tool and do not execute "
+            "an external action. "
             "The coordinator can act only after Vera approves this exact draft. Return "
             "exactly the marker CAMPAIGN_DRAFT_JSON: on one line followed by one JSON "
-            "object on the next line, with no code fence or surrounding prose. Use only "
-            "the keys action_type, target, text, and url. The action_type, target, and "
-            "URL shown below are immutable; write only the public post text.\n"
+            f"object on the next line, with no code fence or surrounding prose. Use only "
+            f"the keys {allowed_keys}. {immutable_note}.\n"
             "CAMPAIGN_DRAFT_JSON:\n"
             f"{json.dumps(example, ensure_ascii=False, separators=(',', ':'))}"
         )

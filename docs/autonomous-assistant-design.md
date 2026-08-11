@@ -93,6 +93,17 @@ failure stops and escalates without retrying the already-verified publish; a fai
 `before` snapshot write after claim also stops before model or publish execution.
 Dry-run mode does not enter this network path.
 
+The coordinator's reviewed payload boundary is shared by all supported campaign
+adapters, although the included manifest enables only Bluesky. Action-specific strict
+JSON schemas bind a publish webhook payload, exact Gmail recipient/subject/body,
+company Vercel account/project/immutable commit, or fixed purchase amount/payload to
+Vera's final digest. The coordinator alone dispatches the adapter. Gmail and Vercel
+perform read-only identity checks and execution-time rechecks; generic webhooks require
+an exact public allowlisted host plus a signed response echoing the claim and payload;
+purchase additionally requires a fixed owner-configured amount and the independent
+hard cap. A persisted `claimed` mutation without a terminal receipt stops the sprint
+before another run can spend model budget or create a new provider idempotency key.
+
 ## Budget design
 
 Company Mode remains the source of truth for daily spend. Its JSON mutations become file-locked transactions with atomic replacement and corruption quarantine.
@@ -166,6 +177,9 @@ bot-to-bot loop.
 - Idea promotion is fail-closed: an unknown/duplicate/changed proposal, ambiguous or inactive project, active run, roadmap-ID collision, or failed atomic write creates no roadmap work. A successful repeat confirmation is an idempotent no-op.
 - Roadmap-pack import is fail-closed and additive: unsupported schema fields, changed revisions, inactive or ambiguous projects, ID collisions, bad/cyclic dependencies, active runs, non-campaign authorization above `propose`, partial prior imports, or write failures leave the primary state unchanged. Revenue Sprint items must be exact revision-bound `external_action` entries from the same validated manifest. A receipt binds successful repeats to the same intact goal/items.
 - Revenue Sprint import is additionally bound to one existing linked product, one company-owned channel, exact external-action targets, separate campaign/daily budgets, before/after revenue evidence, and checkpoint/stop rules. Public Bluesky evidence is accepted only for exact successful URI/CID receipts; only increases above persisted high-water counts produce signals, and ordinary social engagement is limited to the day-5 checkpoint. Action claims are idempotent and are persisted before mutation provider I/O; an uncertain provider outcome or already-verified publish is never retried blindly.
+- Every reviewed campaign action must persist one safe structured provider receipt. A
+  stale `claimed` action is treated as an unknown provider outcome: the next run stops
+  for reconciliation and no new action capability is granted.
 
 ## Implementation footprint
 

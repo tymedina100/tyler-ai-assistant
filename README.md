@@ -707,6 +707,16 @@ receipt alone is not progress, and day 15 still requires a Gumroad sale or an ex
 supported strong-intent signal. See [docs/revenue-sprint.md](docs/revenue-sprint.md) for the
 Railway variables, activation commands, safety boundary, and test procedure.
 
+The review-bound coordinator is action-generic even though the checked-in sprint is
+Bluesky-only. New owner-confirmed campaign revisions may use a signed publish webhook,
+one exact-recipient company Gmail message, an immutable-commit company Vercel deploy,
+or a fixed-amount signed purchase webhook. Each has a distinct strict draft schema;
+model workers never receive mutation tools. Outreach and deploy identities are checked
+read-only and rechecked at execution, webhook success requires a signed exact receipt,
+purchase remains disabled by a separate $0 hard cap, and a crash-left `claimed` action
+stops the next run for human reconciliation instead of being replayed under a new run.
+Merely setting credentials never adds one of these actions to the active policy.
+
 When a run reaches `needs_human` or `blocked`, resolve the stated access problem or
 owner decision first. A `deferred` item can also be reset after you increase the available
 budget. Then reset exactly that roadmap item from the **group operating room** without

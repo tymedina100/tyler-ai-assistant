@@ -38,7 +38,9 @@ class RevenuePublishGateTests(unittest.IsolatedAsyncioTestCase):
         self.run_id = "revenue-run-1"
         self.provider_call = Mock(
             return_value=revenue_actions.ProviderOutcome(
-                "succeeded", "Mock provider accepted one company post."
+                "succeeded",
+                "Mock provider accepted one company post.",
+                provider_receipt={"receipt_id": "mock-post-1"},
             )
         )
         self.provider_payloads = []
@@ -264,6 +266,7 @@ class RevenuePublishGateTests(unittest.IsolatedAsyncioTestCase):
                     sprint_id=kwargs.get("sprint_id"),
                     actual_purchase_usd=kwargs.get("actual_purchase_usd"),
                     result=kwargs.get("result", ""),
+                    provider_receipt=kwargs.get("provider_receipt"),
                     at=self.moment,
                 ),
             ))
