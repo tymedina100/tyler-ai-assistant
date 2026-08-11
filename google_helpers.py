@@ -280,9 +280,9 @@ def create_draft(to, subject, body):
         return f"Sorry, couldn't create the draft ({e})."
 
 
-def send_email(to, subject, body):
+def send_email(to, subject, body, *, service=None):
     try:
-        service = _gmail_service()
+        service = service or _gmail_service()
         sent = service.users().messages().send(
             userId="me", body=_build_message(to, subject, body)
         ).execute()

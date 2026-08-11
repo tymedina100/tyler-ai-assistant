@@ -52,6 +52,19 @@ CAMPAIGN_TOOL_ACTIONS = {
 CAMPAIGN_TOOL_NAMES = frozenset(CAMPAIGN_TOOL_ACTIONS)
 CAMPAIGN_DRAFT_JSON_PREFIX = "CAMPAIGN_DRAFT_JSON:"
 CAMPAIGN_DRAFT_KEYS = frozenset({"action_type", "target", "text", "url"})
+CAMPAIGN_DRAFT_SCHEMAS = {
+    "publish_bluesky": CAMPAIGN_DRAFT_KEYS,
+    "publish_webhook": frozenset({"action_type", "target", "payload"}),
+    OUTREACH_ACTION: frozenset(
+        {"action_type", "target", "recipient", "subject", "body"}
+    ),
+    DEPLOY_ACTION: frozenset(
+        {"action_type", "target", "account_id", "project", "ref"}
+    ),
+    PURCHASE_ACTION: frozenset(
+        {"action_type", "target", "amount_usd", "payload"}
+    ),
+}
 
 _ACTION_RESULT_LIMIT = 500
 _WEBHOOK_PAYLOAD_LIMIT = 20_000
@@ -312,6 +325,46 @@ def _assert_public_https_url(value: str) -> None:
     _assert_public_content(value, "campaign product URL")
 
 
+def _validated_webhook_endpoint(prefix: str, *, require_allowed_host: bool) -> str:
+    url = os.environ.get(f"REVENUE_{prefix}_WEBHOOK_URL", "").strip()
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RevenueActionDenied("The revenue webhook URL has an invalid port.") from exc
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or hostname == "localhost"
+        or hostname.endswith((".localhost", ".local", ".internal"))
+    ):
+        raise RevenueActionDenied(
+            "The revenue webhook must use one public HTTPS host without userinfo or a custom port."
+        )
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise RevenueActionDenied("The revenue webhook may not target a private address.")
+    allowed_host = os.environ.get(
+        f"REVENUE_{prefix}_WEBHOOK_ALLOWED_HOST", ""
+    ).strip().rstrip(".").lower()
+    if require_allowed_host and (not allowed_host or allowed_host != hostname):
+        raise RevenueActionDenied(
+            f"NEEDS HUMAN: set REVENUE_{prefix}_WEBHOOK_ALLOWED_HOST to the exact public webhook host."
+        )
+    if allowed_host and allowed_host != hostname:
+        raise RevenueActionDenied("The revenue webhook URL does not match its exact allowed host.")
+    _assert_public_content(url, "revenue webhook URL")
+    return url
+
+
 def _campaign_draft_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -390,21 +443,247 @@ def _canonical_bluesky_campaign_payload(
     }
 
 
+def _exact_campaign_target(action_type: str, expected_target: str, payload: Mapping[str, Any]) -> str:
+    if (
+        not isinstance(expected_target, str)
+        or expected_target != expected_target.strip()
+    ):
+        raise RevenueActionDenied("The expected campaign target must be one exact string.")
+    exact_target = _normalize_target(expected_target)
+    if payload.get("action_type") != action_type:
+        raise RevenueActionDenied(
+            f"The campaign draft action_type must be exactly {action_type!r}."
+        )
+    if payload.get("target") != exact_target:
+        raise RevenueActionDenied(
+            "The campaign draft target does not exactly match the approved target."
+        )
+    return exact_target
+
+
+def _canonical_publish_webhook_payload(
+    payload: Any,
+    *,
+    expected_target: str,
+    expected_product_url: Optional[str] = None,
+) -> dict[str, Any]:
+    keys = CAMPAIGN_DRAFT_SCHEMAS["publish_webhook"]
+    if not isinstance(payload, Mapping) or set(payload) != keys:
+        raise RevenueActionDenied(
+            "The publish draft must contain only action_type, target, and payload."
+        )
+    exact_target = _exact_campaign_target(PUBLISH_ACTION, expected_target, payload)
+    if exact_target.startswith("bluesky:"):
+        raise RevenueActionDenied("Bluesky publishes require the text and url draft schema.")
+    safe_payload = _validated_payload(payload["payload"])
+    if expected_product_url:
+        if not isinstance(expected_product_url, str):
+            raise RevenueActionDenied("The expected campaign product URL must be a string.")
+        exact_url = expected_product_url.strip()
+        if exact_url != expected_product_url:
+            raise RevenueActionDenied("The expected campaign product URL must be exact.")
+        _assert_public_https_url(exact_url)
+        if _canonical_json(safe_payload).count(exact_url) != 1:
+            raise RevenueActionDenied(
+                "The exact campaign product URL must appear once in the publish payload."
+            )
+    return {
+        "action_type": PUBLISH_ACTION,
+        "target": exact_target,
+        "payload": safe_payload,
+    }
+
+
+def _canonical_outreach_payload(
+    payload: Any,
+    *,
+    expected_target: str,
+    expected_product_url: Optional[str] = None,
+) -> dict[str, str]:
+    keys = CAMPAIGN_DRAFT_SCHEMAS[OUTREACH_ACTION]
+    if not isinstance(payload, Mapping) or set(payload) != keys:
+        raise RevenueActionDenied(
+            "The outreach draft must contain only action_type, target, recipient, subject, and body."
+        )
+    if any(not isinstance(payload[key], str) for key in keys):
+        raise RevenueActionDenied("Every outreach draft field must be a string.")
+    exact_target = _exact_campaign_target(OUTREACH_ACTION, expected_target, payload)
+    company_target = _company_target_config(OUTREACH_ACTION, exact_target)
+    configured_recipient = company_target.get("recipient")
+    if not isinstance(configured_recipient, str) or configured_recipient != configured_recipient.strip():
+        raise RevenueActionDenied(
+            "The company outreach target must contain one exact recipient field."
+        )
+    recipient = _email_target(configured_recipient)
+    if payload["recipient"] != recipient:
+        raise RevenueActionDenied(
+            "The outreach recipient does not exactly match the company target mapping."
+        )
+    subject = payload["subject"]
+    body = payload["body"]
+    if subject != subject.strip() or not subject or len(subject) > 300:
+        raise RevenueActionDenied(
+            "The outreach subject must contain exactly 1-300 bounded characters."
+        )
+    if body != body.strip() or not body or len(body) > 20_000:
+        raise RevenueActionDenied(
+            "The outreach body must contain exactly 1-20,000 bounded characters."
+        )
+    _assert_public_content(subject, "outreach subject")
+    _assert_public_content(body, "outreach body")
+    if expected_product_url:
+        if not isinstance(expected_product_url, str):
+            raise RevenueActionDenied("The expected campaign product URL must be a string.")
+        exact_url = expected_product_url.strip()
+        if exact_url != expected_product_url:
+            raise RevenueActionDenied("The expected campaign product URL must be exact.")
+        _assert_public_https_url(exact_url)
+        if body.count(exact_url) != 1:
+            raise RevenueActionDenied(
+                "The exact campaign product URL must appear once in the outreach body."
+            )
+    return {
+        "action_type": OUTREACH_ACTION,
+        "target": exact_target,
+        "recipient": recipient,
+        "subject": subject,
+        "body": body,
+    }
+
+
+def _strict_deploy_binding(target: str) -> dict[str, str]:
+    company_target = _company_target_config(DEPLOY_ACTION, target)
+    account_id = str(company_target.get("account_id") or "").strip()
+    project = str(company_target.get("project") or "").strip()
+    ref = str(company_target.get("ref") or "").strip()
+    if os.environ.get("REVENUE_DEPLOY_CREDENTIAL_OWNERSHIP", "").strip() != "company_service":
+        raise RevenueActionDenied(
+            "NEEDS HUMAN: set REVENUE_DEPLOY_CREDENTIAL_OWNERSHIP=company_service for a company-owned deploy credential."
+        )
+    if not account_id or not project or not re.fullmatch(r"[0-9a-f]{40}", ref):
+        raise RevenueActionDenied(
+            "The company deploy target must pin one account, project, and immutable lowercase 40-hex ref."
+        )
+    if (
+        os.environ.get("REVENUE_DEPLOY_VERCEL_ACCOUNT_ID", "").strip() != account_id
+        or os.environ.get("VERCEL_TEAM_ID", "").strip() != account_id
+    ):
+        raise RevenueActionDenied(
+            "NEEDS HUMAN: the deploy target must match the exact company-owned Vercel team."
+        )
+    return {"account_id": account_id, "project": project, "ref": ref}
+
+
+def _canonical_deploy_payload(
+    payload: Any,
+    *,
+    expected_target: str,
+) -> dict[str, str]:
+    keys = CAMPAIGN_DRAFT_SCHEMAS[DEPLOY_ACTION]
+    if not isinstance(payload, Mapping) or set(payload) != keys:
+        raise RevenueActionDenied(
+            "The deploy draft must contain only action_type, target, account_id, project, and ref."
+        )
+    if any(not isinstance(payload[key], str) for key in keys):
+        raise RevenueActionDenied("Every deploy draft field must be a string.")
+    exact_target = _exact_campaign_target(DEPLOY_ACTION, expected_target, payload)
+    binding = _strict_deploy_binding(exact_target)
+    for key in ("account_id", "project", "ref"):
+        if payload[key] != binding[key]:
+            raise RevenueActionDenied(
+                f"The deploy {key} does not exactly match the company target mapping."
+            )
+    return {
+        "action_type": DEPLOY_ACTION,
+        "target": exact_target,
+        **binding,
+    }
+
+
+def _canonical_purchase_payload(
+    payload: Any,
+    *,
+    expected_target: str,
+    expected_amount_usd: Optional[Any] = None,
+) -> dict[str, Any]:
+    keys = CAMPAIGN_DRAFT_SCHEMAS[PURCHASE_ACTION]
+    if not isinstance(payload, Mapping) or set(payload) != keys:
+        raise RevenueActionDenied(
+            "The purchase draft must contain only action_type, target, amount_usd, and payload."
+        )
+    exact_target = _exact_campaign_target(PURCHASE_ACTION, expected_target, payload)
+    amount = _money(payload["amount_usd"])
+    if amount <= 0:
+        raise RevenueActionDenied("The purchase draft requires a positive amount_usd.")
+    company_target = _company_target_config(PURCHASE_ACTION, exact_target)
+    configured_amount = _money(company_target.get("amount_usd", 0.0))
+    if configured_amount <= 0 or abs(amount - configured_amount) > 0.000001:
+        raise RevenueActionDenied(
+            "The purchase amount does not exactly match the owner-configured company target."
+        )
+    if expected_amount_usd is not None and abs(amount - _money(expected_amount_usd)) > 0.000001:
+        raise RevenueActionDenied(
+            "The purchase amount does not exactly match the approved capability."
+        )
+    return {
+        "action_type": PURCHASE_ACTION,
+        "target": exact_target,
+        "amount_usd": amount,
+        "payload": _validated_payload(payload["payload"]),
+    }
+
+
+def _canonical_campaign_payload(
+    payload: Any,
+    *,
+    action_type: str,
+    expected_target: str,
+    expected_product_url: Optional[str] = None,
+    expected_purchase_amount_usd: Optional[Any] = None,
+) -> dict[str, Any]:
+    normalized_type = str(action_type or "").strip().lower()
+    if normalized_type == PUBLISH_ACTION and str(expected_target).startswith("bluesky:"):
+        return _canonical_bluesky_campaign_payload(
+            payload,
+            expected_target=expected_target,
+            expected_product_url=expected_product_url,
+        )
+    if normalized_type == PUBLISH_ACTION:
+        return _canonical_publish_webhook_payload(
+            payload,
+            expected_target=expected_target,
+            expected_product_url=expected_product_url,
+        )
+    if normalized_type == OUTREACH_ACTION:
+        return _canonical_outreach_payload(
+            payload,
+            expected_target=expected_target,
+            expected_product_url=expected_product_url,
+        )
+    if normalized_type == DEPLOY_ACTION:
+        return _canonical_deploy_payload(payload, expected_target=expected_target)
+    if normalized_type == PURCHASE_ACTION:
+        return _canonical_purchase_payload(
+            payload,
+            expected_target=expected_target,
+            expected_amount_usd=expected_purchase_amount_usd,
+        )
+    raise RevenueActionDenied("The campaign draft uses an unsupported action type.")
+
+
 def parse_campaign_draft(
     text: Any,
     *,
     action_type: str,
     target: str,
-    product_url: Optional[str],
+    product_url: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Parse one reviewable worker envelope into a canonical Bluesky payload.
+    """Parse one reviewable worker envelope into one exact canonical action.
 
     The envelope may have surrounding whitespace, but it may not contain prose or
-    any JSON fields beyond the four values that will reach the publishing adapter.
-    The returned digest is SHA-256 over deterministic canonical JSON.
+    any JSON fields beyond the values that reach the selected adapter.  The returned
+    digest is SHA-256 over deterministic canonical JSON.
     """
-    if action_type != PUBLISH_ACTION:
-        raise RevenueActionDenied("Only an exact publish campaign draft is supported.")
     if not isinstance(text, str):
         raise RevenueActionDenied("The campaign draft worker output must be text.")
     envelope = text.strip()
@@ -423,8 +702,9 @@ def parse_campaign_draft(
         raise RevenueActionDenied(
             "The campaign draft envelope contains invalid JSON."
         ) from exc
-    canonical = _canonical_bluesky_campaign_payload(
+    canonical = _canonical_campaign_payload(
         parsed,
+        action_type=action_type,
         expected_target=target,
         expected_product_url=product_url,
     )
@@ -442,16 +722,22 @@ def execute_approved_campaign_draft(
     dry_run: bool = False,
 ) -> str:
     """Execute one already-reviewed canonical payload under a verified capability."""
-    if tool_names_for_capability(capability) != {CAMPAIGN_PUBLISH_BLUESKY_TOOL}:
-        raise RevenueActionDenied(
-            "The capability does not authorize the Bluesky publish adapter."
-        )
+    authorized_tools = tool_names_for_capability(capability)
+    if len(authorized_tools) != 1:
+        raise RevenueActionDenied("The capability does not authorize one exact adapter.")
     if not isinstance(parsed, Mapping) or set(parsed) != {"payload", "payload_digest"}:
         raise RevenueActionDenied("The approved campaign draft is not canonical.")
+    action_type = str(capability.get("action_type") or "").strip().lower()
     expected_target = str(capability.get("target") or "")
-    payload = _canonical_bluesky_campaign_payload(
+    payload = _canonical_campaign_payload(
         parsed["payload"],
+        action_type=action_type,
         expected_target=expected_target,
+        expected_purchase_amount_usd=(
+            capability.get("purchase_requested_usd")
+            if action_type == PURCHASE_ACTION
+            else None
+        ),
     )
     supplied_digest = parsed["payload_digest"]
     actual_digest = _payload_digest(payload)
@@ -470,12 +756,35 @@ def execute_approved_campaign_draft(
         approved_payload_digest=supplied_digest,
     )
     try:
-        return publish_bluesky(
-            payload["target"],
-            payload["text"],
-            payload["url"] or None,
-            dry_run=dry_run,
-        )
+        if authorized_tools == {CAMPAIGN_PUBLISH_BLUESKY_TOOL}:
+            return publish_bluesky(
+                payload["target"],
+                payload["text"],
+                payload["url"] or None,
+                dry_run=dry_run,
+            )
+        if authorized_tools == {CAMPAIGN_PUBLISH_WEBHOOK_TOOL}:
+            return publish_webhook(
+                payload["target"], payload["payload"], dry_run=dry_run
+            )
+        if authorized_tools == {CAMPAIGN_SEND_OUTREACH_EMAIL_TOOL}:
+            return send_outreach_email(
+                payload["recipient"],
+                payload["subject"],
+                payload["body"],
+                dry_run=dry_run,
+                campaign_target=payload["target"],
+            )
+        if authorized_tools == {CAMPAIGN_DEPLOY_VERCEL_TOOL}:
+            return deploy_vercel(payload["target"], dry_run=dry_run)
+        if authorized_tools == {CAMPAIGN_PURCHASE_WEBHOOK_TOOL}:
+            return purchase_webhook(
+                payload["target"],
+                payload["amount_usd"],
+                payload["payload"],
+                dry_run=dry_run,
+            )
+        raise RevenueActionDenied("The approved campaign adapter is unsupported.")
     finally:
         reset_campaign_action_context(token)
 
@@ -504,6 +813,22 @@ def _safe_receipt(value: Any) -> str:
         # Keep a correlation handle without persisting the suspicious value.
         return "redacted-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
     return _SAFE_RECEIPT_RE.sub("_", text)
+
+
+def _sanitized_provider_receipt(
+    receipt: Optional[Mapping[str, Any]],
+) -> Optional[dict[str, str]]:
+    if not isinstance(receipt, Mapping):
+        return None
+    safe: dict[str, str] = {}
+    for raw_key, raw_value in list(receipt.items())[:10]:
+        key = _SAFE_RECEIPT_RE.sub("_", str(raw_key or "").strip())[:50]
+        if not key or _SENSITIVE_KEY_RE.search(key):
+            continue
+        value = _safe_receipt(raw_value)
+        if value:
+            safe[key] = value
+    return safe or None
 
 
 def _bounded_response_json(response: Any) -> Optional[Mapping[str, Any]]:
@@ -614,7 +939,17 @@ def _company_target_config(action_type: str, target: str) -> dict[str, Any]:
     return dict(record)
 
 
-def _provider_ready(action_type: str, target: str) -> dict[str, Any]:
+def _provider_ready(
+    action_type: str,
+    target: str,
+    *,
+    require_review_binding: Optional[bool] = None,
+) -> dict[str, Any]:
+    if require_review_binding is None:
+        context = current_campaign_action_context()
+        require_review_binding = bool(
+            context is not None and context.approved_payload_digest
+        )
     try:
         company_target = _company_target_config(action_type, target)
     except RevenueActionDenied as exc:
@@ -625,6 +960,15 @@ def _provider_ready(action_type: str, target: str) -> dict[str, Any]:
     if action_type == OUTREACH_ACTION:
         import google_helpers
 
+        recipient = company_target.get("recipient")
+        if require_review_binding and (
+            not isinstance(recipient, str)
+            or recipient != recipient.strip()
+            or _email_target(recipient) != recipient
+        ):
+            raise RevenueActionDenied(
+                "The company outreach target must contain one exact recipient field."
+            )
         configured_sender = os.environ.get("REVENUE_OUTREACH_GMAIL_ACCOUNT", "").strip().lower()
         company_accounts = {
             value.strip().lower()
@@ -650,6 +994,8 @@ def _provider_ready(action_type: str, target: str) -> dict[str, Any]:
             )
         if not str(company_target.get("project") or "").strip() or not str(company_target.get("ref") or "").strip():
             raise RevenueActionDenied("The company deploy target must pin one Vercel project and ref.")
+        if require_review_binding:
+            _strict_deploy_binding(target)
         if not deploy_helpers.is_configured():
             raise RevenueActionDenied(
                 "NEEDS HUMAN: connect the verified company-owned Vercel account for campaign deploys."
@@ -668,14 +1014,18 @@ def _provider_ready(action_type: str, target: str) -> dict[str, Any]:
             raise RevenueActionDenied(_BLUESKY_BOOTSTRAP_MESSAGE)
         return company_target
     prefix = "PUBLISH" if action_type == PUBLISH_ACTION else "PURCHASE"
-    url = os.environ.get(f"REVENUE_{prefix}_WEBHOOK_URL", "").strip()
+    try:
+        _validated_webhook_endpoint(
+            prefix, require_allowed_host=bool(require_review_binding)
+        )
+    except RevenueActionDenied as exc:
+        raise RevenueActionDenied(
+            f"NEEDS HUMAN: the {action_type} adapter webhook is not safely configured."
+        ) from exc
     secret = os.environ.get(f"REVENUE_{prefix}_WEBHOOK_SECRET", "")
     configured_account = os.environ.get(f"REVENUE_{prefix}_WEBHOOK_ACCOUNT_ID", "").strip()
-    parsed = urlparse(url)
     if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or not secret
+        not secret
         or not configured_account
         or configured_account != account_id
     ):
@@ -683,6 +1033,17 @@ def _provider_ready(action_type: str, target: str) -> dict[str, Any]:
             f"NEEDS HUMAN: the {action_type} adapter requires an HTTPS URL, signing "
             "secret, and matching company-owned account ID."
         )
+    if action_type == PURCHASE_ACTION:
+        configured_amount = _money(company_target.get("amount_usd", 0.0))
+        hard_cap = _purchase_hard_cap()
+        if configured_amount <= 0:
+            raise RevenueActionDenied(
+                "NEEDS HUMAN: the purchase target requires one exact positive amount_usd."
+            )
+        if hard_cap <= 0 or configured_amount > hard_cap:
+            raise RevenueActionDenied(
+                "NEEDS HUMAN: the exact purchase target exceeds the independent operator hard cap."
+            )
     return company_target
 
 
@@ -694,9 +1055,11 @@ def revenue_action_target_readiness(
 ) -> dict[str, Any]:
     """Preflight one exact company target without publishing or writing a claim.
 
-    ``verify_identity=True`` performs only a bounded Bluesky session-identity check;
-    it never creates an account or content.  The returned record is deliberately
-    secret-free and suitable for an owner-facing queue confirmation.
+    ``verify_identity=True`` performs a bounded read-only identity check for native
+    Gmail, Vercel, or Bluesky adapters. It never creates an account, content, or a
+    deployment. Webhook adapters instead prove the configured company account in
+    their signed mutation receipt. The returned record is deliberately secret-free
+    and suitable for an owner-facing queue confirmation.
     """
 
     normalized_type = str(action_type or "").strip().lower()
@@ -726,7 +1089,11 @@ def revenue_action_target_readiness(
             "reason": "NEEDS HUMAN: choose one supported external action type.",
         }
     try:
-        company_target = _provider_ready(normalized_type, normalized_target)
+        company_target = _provider_ready(
+            normalized_type,
+            normalized_target,
+            require_review_binding=True,
+        )
     except RevenueActionDenied as exc:
         reason = (
             _BLUESKY_BOOTSTRAP_MESSAGE
@@ -752,15 +1119,111 @@ def revenue_action_target_readiness(
         "identity_verified": False,
         "reason": "Exact company-owned target configuration is ready.",
     }
+    if normalized_type == OUTREACH_ACTION:
+        result["draft_binding"] = {
+            "action_type": normalized_type,
+            "target": normalized_target,
+            "recipient": str(company_target["recipient"]),
+        }
+    elif normalized_type == DEPLOY_ACTION:
+        result["draft_binding"] = {
+            "action_type": normalized_type,
+            "target": normalized_target,
+            "account_id": str(company_target["account_id"]),
+            "project": str(company_target["project"]),
+            "ref": str(company_target["ref"]),
+        }
+    elif normalized_type == PURCHASE_ACTION:
+        result["draft_binding"] = {
+            "action_type": normalized_type,
+            "target": normalized_target,
+            "amount_usd": _money(company_target["amount_usd"]),
+        }
+    else:
+        result["draft_binding"] = {
+            "action_type": normalized_type,
+            "target": normalized_target,
+        }
     if not verify_identity:
+        return result
+    if normalized_type == OUTREACH_ACTION:
+        try:
+            import google_helpers
+
+            profile = (
+                google_helpers._gmail_service()
+                .users()
+                .getProfile(userId="me")
+                .execute()
+            )
+        except Exception as exc:
+            result.update(
+                ready=False,
+                needs_human=True,
+                reason=(
+                    "NEEDS HUMAN: the company Gmail identity could not be verified "
+                    f"({type(exc).__name__})."
+                ),
+            )
+            return result
+        actual = str((profile or {}).get("emailAddress") or "").strip().lower()
+        expected = str(company_target["account_id"]).strip().lower()
+        if actual != expected:
+            result.update(
+                ready=False,
+                needs_human=True,
+                reason="NEEDS HUMAN: connected Gmail identity is not the company-owned sender.",
+            )
+            return result
+        result.update(
+            identity_verified=True,
+            reason="Exact company-owned Gmail sender identity is verified; no message was sent.",
+        )
+        return result
+    if normalized_type == DEPLOY_ACTION:
+        try:
+            import deploy_helpers
+
+            project, error = deploy_helpers.get_project(str(company_target["project"]))
+        except Exception as exc:
+            project, error = None, type(exc).__name__
+        if error or not isinstance(project, Mapping):
+            result.update(
+                ready=False,
+                needs_human=True,
+                reason="NEEDS HUMAN: the company Vercel project identity could not be verified.",
+            )
+            return result
+        actual_account = str(
+            project.get("accountId") or project.get("teamId") or ""
+        ).strip()
+        expected_project = str(company_target["project"]).strip()
+        actual_projects = {
+            str(project.get("id") or "").strip(),
+            str(project.get("name") or "").strip(),
+        }
+        if (
+            actual_account != str(company_target["account_id"]).strip()
+            or expected_project not in actual_projects
+        ):
+            result.update(
+                ready=False,
+                needs_human=True,
+                reason="NEEDS HUMAN: Vercel project identity is not the reviewed company target.",
+            )
+            return result
+        result.update(
+            identity_verified=True,
+            reason="Exact company-owned Vercel project identity is verified; no deploy was started.",
+        )
         return result
     if not (
         normalized_type == PUBLISH_ACTION
         and normalized_target.startswith("bluesky:")
     ):
         result["reason"] = (
-            "Exact company-owned target configuration is ready; provider identity "
-            "verification is not implemented for this adapter."
+            "Exact company-owned webhook configuration is ready; a signed exact "
+            "provider receipt is required before success can be persisted."
         )
         return result
 
@@ -909,7 +1372,7 @@ def _complete(
         sprint_id=context.campaign_id,
         actual_purchase_usd=outcome.actual_purchase_usd,
         result=result,
-        provider_receipt=outcome.provider_receipt,
+        provider_receipt=_sanitized_provider_receipt(outcome.provider_receipt),
     )
 
 
@@ -988,9 +1451,15 @@ def _execute(
                 f"The purchase amount exceeds the configured ${hard_cap:.2f} hard cap."
             )
 
+    digest = _payload_digest(payload)
+    if context.approved_payload_digest and not hmac.compare_digest(
+        context.approved_payload_digest, digest
+    ):
+        raise RevenueActionDenied(
+            "The adapter payload does not match the exact reviewed campaign draft."
+        )
     company_target = _provider_ready(action_type, target)
     _live_capability(context, action_type, target, amount)
-    digest = _payload_digest(payload)
     # A tool argument can make a live context safer, but can never turn a dry-run
     # context live.  This prevents model-supplied dry_run=False from bypassing the
     # runtime's safety mode.
@@ -1064,9 +1533,11 @@ def send_outreach_email(
     body: str,
     *,
     dry_run: Optional[bool] = None,
+    campaign_target: Optional[str] = None,
 ) -> str:
     """Send one policy-allowlisted Gmail message after a persistent claim."""
-    target = _email_target(to)
+    recipient = _email_target(to)
+    target = _normalize_target(campaign_target) if campaign_target is not None else recipient
     subject_text = str(subject or "").strip()
     body_text = str(body or "").strip()
     if not subject_text or len(subject_text) > 300:
@@ -1075,7 +1546,13 @@ def send_outreach_email(
         raise RevenueActionDenied("Outreach body is required and limited to 20,000 characters.")
     _assert_public_content(subject_text, "outreach subject")
     _assert_public_content(body_text, "outreach body")
-    payload = {"to": target, "subject": subject_text, "body": body_text}
+    payload = {
+        "action_type": OUTREACH_ACTION,
+        "target": target,
+        "recipient": recipient,
+        "subject": subject_text,
+        "body": body_text,
+    }
 
     def provider_call(
         _claim: Mapping[str, Any], company_target: Mapping[str, Any]
@@ -1084,7 +1561,8 @@ def send_outreach_email(
 
         expected_sender = str(company_target["account_id"]).strip().lower()
         try:
-            profile = google_helpers._gmail_service().users().getProfile(userId="me").execute()
+            service = google_helpers._gmail_service()
+            profile = service.users().getProfile(userId="me").execute()
         except Exception:
             return ProviderOutcome(
                 "uncertain",
@@ -1096,11 +1574,29 @@ def send_outreach_email(
                 "failed",
                 "NEEDS HUMAN: connected Gmail identity does not match the company-owned account.",
             )
-        result = str(google_helpers.send_email(target, subject_text, body_text) or "")
+        configured_recipient = company_target.get("recipient")
+        if configured_recipient is not None and configured_recipient != recipient:
+            return ProviderOutcome(
+                "failed",
+                "NEEDS HUMAN: the reviewed recipient no longer matches the company target mapping.",
+            )
+        result = str(
+            google_helpers.send_email(
+                recipient,
+                subject_text,
+                body_text,
+                service=service,
+            )
+            or ""
+        )
         if result.startswith("Email sent to "):
             match = re.search(r"\(id ([^)]+)\)", result)
             receipt = _safe_receipt(match.group(1) if match else "accepted")
-            return ProviderOutcome("succeeded", f"Gmail accepted message {receipt}.")
+            return ProviderOutcome(
+                "succeeded",
+                f"Gmail accepted message {receipt}.",
+                provider_receipt={"message_id": receipt},
+            )
         if "isn't connected" in result or "credentials are invalid" in result:
             return ProviderOutcome("failed", "Gmail rejected the request before sending.")
         return ProviderOutcome(
@@ -1120,7 +1616,21 @@ def deploy_vercel(
 ) -> str:
     """Deploy the company-owned Vercel project/ref pinned to one logical target."""
     exact_target = _normalize_target(target)
-    payload = {"target": exact_target, "provider": "vercel", "environment": "production"}
+    context = current_campaign_action_context()
+    if context is not None and context.approved_payload_digest:
+        binding = _strict_deploy_binding(exact_target)
+    else:
+        configured = _company_target_config(DEPLOY_ACTION, exact_target)
+        binding = {
+            "account_id": str(configured.get("account_id") or "").strip(),
+            "project": str(configured.get("project") or "").strip(),
+            "ref": str(configured.get("ref") or "").strip(),
+        }
+    payload = {
+        "action_type": DEPLOY_ACTION,
+        "target": exact_target,
+        **binding,
+    }
 
     def provider_call(
         _claim: Mapping[str, Any], company_target: Mapping[str, Any]
@@ -1129,6 +1639,28 @@ def deploy_vercel(
 
         project_name = str(company_target["project"]).strip()
         ref_name = str(company_target["ref"]).strip()
+        account_id = str(company_target["account_id"]).strip()
+        if context is not None and context.approved_payload_digest:
+            project_record, identity_error = deploy_helpers.get_project(project_name)
+            if identity_error or not isinstance(project_record, Mapping):
+                return ProviderOutcome(
+                    "failed",
+                    "NEEDS HUMAN: Vercel project identity could not be verified; no deploy was attempted.",
+                )
+            actual_project_ids = {
+                str(project_record.get("id") or "").strip(),
+                str(project_record.get("name") or "").strip(),
+            }
+            actual_account_id = str(
+                project_record.get("accountId")
+                or project_record.get("teamId")
+                or ""
+            ).strip()
+            if project_name not in actual_project_ids or actual_account_id != account_id:
+                return ProviderOutcome(
+                    "failed",
+                    "NEEDS HUMAN: Vercel project identity did not match the reviewed company account/project.",
+                )
         result, err = deploy_helpers.deploy(project_name, ref_name, "production")
         if err:
             # deploy_helpers performs both preflight reads and the deployment POST
@@ -1138,12 +1670,36 @@ def deploy_vercel(
                 "uncertain",
                 "Vercel outcome is uncertain; inspect deployments before retrying.",
             )
-        receipt = _safe_receipt((result or {}).get("id") or "accepted")
+        raw_receipt = (result or {}).get("id") if isinstance(result, Mapping) else None
+        receipt = _safe_receipt(raw_receipt)
+        if (
+            not isinstance(raw_receipt, str)
+            or not raw_receipt
+            or receipt != raw_receipt
+        ):
+            return ProviderOutcome(
+                "uncertain",
+                "Vercel returned no verifiable deployment ID; inspect deployments before retrying.",
+            )
         url = str((result or {}).get("url") or "")
-        safe_url = url if url.startswith("https://") else ""
+        parsed_url = urlparse(url)
+        safe_url = (
+            url
+            if parsed_url.scheme == "https"
+            and parsed_url.hostname
+            and parsed_url.username is None
+            and parsed_url.password is None
+            and not parsed_url.query
+            and not parsed_url.fragment
+            else ""
+        )
+        provider_receipt = {"deployment_id": receipt}
+        if safe_url:
+            provider_receipt["url"] = safe_url
         return ProviderOutcome(
             "succeeded",
             f"Vercel queued deployment {receipt}{f' at {safe_url}' if safe_url else ''}.",
+            provider_receipt=provider_receipt,
         )
 
     return _execute(DEPLOY_ACTION, exact_target, payload, provider_call, dry_run=dry_run)
@@ -1462,11 +2018,31 @@ def _webhook_provider(
     def provider_call(
         claim: Mapping[str, Any], company_target: Mapping[str, Any]
     ) -> ProviderOutcome:
-        url = os.environ[f"REVENUE_{prefix}_WEBHOOK_URL"].strip()
+        context = current_campaign_action_context()
+        url = _validated_webhook_endpoint(
+            prefix,
+            require_allowed_host=bool(
+                context is not None and context.approved_payload_digest
+            ),
+        )
         secret = os.environ[f"REVENUE_{prefix}_WEBHOOK_SECRET"].encode("utf-8")
         timestamp = str(int(time.time()))
         claim_id = str(claim["id"])
         idempotency_key = str(claim.get("idempotency_key") or "")
+        reviewed_payload = {
+            "action_type": action_type,
+            "target": target,
+            **(
+                {"amount_usd": purchase_amount_usd}
+                if action_type == PURCHASE_ACTION
+                else {}
+            ),
+            "payload": payload,
+        }
+        claim_digest = str(
+            ((claim.get("metadata") or {}).get("payload_digest") or "")
+        ).strip().lower()
+        payload_digest = claim_digest or _payload_digest(reviewed_payload)
         envelope = {
             "action_id": claim_id,
             "idempotency_key": idempotency_key,
@@ -1474,6 +2050,7 @@ def _webhook_provider(
             "target": target,
             "provider_account_id": str(company_target["account_id"]),
             "amount_usd": purchase_amount_usd,
+            "payload_digest": payload_digest,
             "payload": payload,
         }
         body = _canonical_json(envelope).encode("utf-8")
@@ -1502,8 +2079,67 @@ def _webhook_provider(
                     ),
                 )
             response_json = _bounded_response_json(response)
+            response_headers = getattr(response, "headers", {})
         finally:
             _close_response(response)
+        reviewed = bool(context is not None and context.approved_payload_digest)
+        if reviewed:
+            expected_account = str(company_target["account_id"])
+            try:
+                exact_response = (
+                    isinstance(response_json, Mapping)
+                    and response_json.get("status") == "succeeded"
+                    and response_json.get("action_id") == claim_id
+                    and response_json.get("idempotency_key") == idempotency_key
+                    and response_json.get("payload_digest") == payload_digest
+                    and response_json.get("provider_account_id") == expected_account
+                    and abs(
+                        _money(response_json.get("amount_usd", -1))
+                        - purchase_amount_usd
+                    )
+                    <= 0.000001
+                )
+            except RevenueActionDenied:
+                exact_response = False
+            raw_receipt = (
+                response_json.get("receipt_id")
+                if isinstance(response_json, Mapping)
+                else None
+            )
+            exact_receipt = (
+                isinstance(raw_receipt, str)
+                and bool(raw_receipt)
+                and _safe_receipt(raw_receipt) == raw_receipt
+            )
+            response_signature = str(
+                response_headers.get("X-Revenue-Response-Signature", "")
+                if isinstance(response_headers, Mapping)
+                else ""
+            )
+            signed_body = (
+                _canonical_json(response_json).encode("utf-8")
+                if isinstance(response_json, Mapping)
+                else b""
+            )
+            expected_signature = "sha256=" + hmac.new(
+                secret,
+                timestamp.encode("ascii") + b"." + signed_body,
+                hashlib.sha256,
+            ).hexdigest()
+            if (
+                not exact_response
+                or not exact_receipt
+                or not hmac.compare_digest(response_signature, expected_signature)
+            ):
+                return ProviderOutcome(
+                    "uncertain",
+                    f"{action_type.title()} webhook returned no exact signed receipt; do not retry blindly.",
+                    actual_purchase_usd=(
+                        purchase_amount_usd
+                        if action_type == PURCHASE_ACTION
+                        else None
+                    ),
+                )
         receipt = "accepted"
         if response_json:
             receipt = _safe_receipt(
@@ -1516,6 +2152,7 @@ def _webhook_provider(
                 purchase_amount_usd if action_type == PURCHASE_ACTION else None
             ),
             response_json=response_json,
+            provider_receipt={"receipt_id": receipt},
         )
 
     return provider_call
@@ -1530,10 +2167,15 @@ def publish_webhook(
     """Invoke the configured HMAC-signed publish adapter for one exact target."""
     exact_target = _normalize_target(target)
     safe_payload = _validated_payload(payload)
+    reviewed_payload = {
+        "action_type": PUBLISH_ACTION,
+        "target": exact_target,
+        "payload": safe_payload,
+    }
     return _execute(
         PUBLISH_ACTION,
         exact_target,
-        safe_payload,
+        reviewed_payload,
         _webhook_provider(PUBLISH_ACTION, exact_target, safe_payload, 0.0),
         dry_run=dry_run,
     )
@@ -1550,10 +2192,16 @@ def purchase_webhook(
     exact_target = _normalize_target(target)
     amount = _money(amount_usd)
     safe_payload = _validated_payload(payload)
+    reviewed_payload = {
+        "action_type": PURCHASE_ACTION,
+        "target": exact_target,
+        "amount_usd": amount,
+        "payload": safe_payload,
+    }
     return _execute(
         PURCHASE_ACTION,
         exact_target,
-        safe_payload,
+        reviewed_payload,
         _webhook_provider(PURCHASE_ACTION, exact_target, safe_payload, amount),
         purchase_amount_usd=amount,
         dry_run=dry_run,

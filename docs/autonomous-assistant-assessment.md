@@ -32,7 +32,19 @@ The 2026-08-02 real-project follow-up adds the missing safe bridge from reviewed
 
 The current working tree extends the autonomous control plane with one deliberately narrow, owner-confirmed revenue experiment rather than general-purpose marketing authority. The checked-in pack binds 20 Phoenix weekdays to one existing Gumroad product, one dedicated company-owned Bluesky identity, one standalone publish action per run-day, a $5 daily AI ceiling including reserve, a $100 campaign ceiling, day-5/day-15 checkpoints, a consecutive-no-progress cutoff, and an unconditional day-20 stop. Personal-account fallback and automated account registration are explicitly rejected.
 
-Campaign execution now follows draft, review, and deterministic publish stages. The worker receives propose-level authority and returns a strict campaign-draft envelope; Vera reviews that exact candidate with bounded revisions; the coordinator may publish only after atomically matching the active campaign/run/project, action target and policy revision, worker and reviewer records, final verdict, and exact approved payload digest. Model workers never receive the provider mutation tool. Revision reservations remain attributed to the campaign and must fit both the ordinary daily budget and campaign budget. A successful provider receipt is action evidence, not commercial progress, so it cannot reset the no-progress counter without a persisted sale or supported engagement signal.
+Campaign execution now follows draft, review, and deterministic action stages. The worker receives propose-level authority and returns a strict campaign-draft envelope; Vera reviews that exact candidate with bounded revisions; the coordinator may execute only after atomically matching the active campaign/run/project, action target and policy revision, worker and reviewer records, final verdict, and exact approved payload digest. Model workers never receive the provider mutation tool. Revision reservations remain attributed to the campaign and must fit both the ordinary daily budget and campaign budget. A successful provider receipt is action evidence, not commercial progress, so it cannot reset the no-progress counter without a persisted sale or supported engagement signal.
+
+The coordinator is now action-generic without broadening the checked-in campaign. A
+new owner-confirmed revision can bind a signed publish webhook, one exact-recipient
+company Gmail message, a company Vercel deployment pinned to an immutable commit, or
+a fixed-amount signed purchase webhook to the same worker/Vera/digest/claim sequence.
+Gmail and Vercel receive read-only identity preflights and execution-time rechecks;
+webhook success requires an exact signed receipt; purchase amount is fixed in company
+target configuration and checked against campaign plus operator caps. A process crash
+that leaves a mutation `claimed` stops the next run for provider reconciliation instead
+of permitting a new run ID to repeat it. These additional adapters are not present in
+the included Bluesky-only manifest and remain inactive unless the owner confirms a new
+revision and supplies its dedicated company configuration.
 
 The 2026-08-11 scheduled production-readiness audit also exposed an ambiguous read-tool boundary: Patch selected the generic `GITHUB_REPO` file mirror (`patch-files`) instead of the scoped assistant code repository and correctly stopped for missing access. Enforced autonomous project work now withholds generic `github_*` mirror reads and exposes only `code_*` reads under the selected `projects.json` project scope. Manual non-autonomous GitHub behavior is unchanged.
 
@@ -48,7 +60,7 @@ Gumroad sale or an explicitly supported strong-intent signal. Read/persistence f
 fail closed; an already-verified post is not blindly retried, and dry runs do not enter
 the provider path.
 
-Activation remains a two-step owner action. Queueing previews and imports the manifest; confirmation performs read-only product/account preflight and activates the policy, but makes no OpenAI call and publishes nothing. If Railway restarts after import but before activation, re-queueing the same intact pack safely stages activation only. On 2026-08-11, the final full offline suite passed 553 tests with paid/provider traffic mocked; the modified Python modules also passed bytecode compilation and the complete diff passed whitespace validation. Live Gumroad identity, Bluesky authentication/publishing, public engagement reads, Telegram delivery, Railway-volume persistence, and the scheduled 08:00 execution remain unverified until a credentialed production smoke test is deliberately run.
+Activation remains a two-step owner action. Queueing previews and imports the manifest; confirmation performs read-only product/account preflight and activates the policy, but makes no OpenAI call and publishes nothing. If Railway restarts after import but before activation, re-queueing the same intact pack safely stages activation only. On 2026-08-11, the final full offline suite passed 570 tests with paid/provider traffic mocked; the modified Python modules also passed bytecode compilation and the complete diff passed whitespace validation. Live Gumroad identity, Bluesky authentication/publishing, public engagement reads, Telegram delivery, Railway-volume persistence, scheduled 08:00 execution, and every newly generalized non-Bluesky adapter remain unverified until a credentialed production smoke test is deliberately run.
 
 ## 1. What the system currently does
 
@@ -95,7 +107,7 @@ The scheduled path currently posts a morning briefing, calendar alerts, reminder
 - A default $5 daily Company Mode budget, soft task reservations, actual token-based reconciliation, cached-input pricing support, and a conservative unknown-model fallback.
 - Goal-specific work planning, sequential execution, prior-work handoff, and a final editor.
 - A three-way review verdict and a hard two-round revision ceiling.
-- Human gates for email sending, deletion, production deploys, Railway mutation, publishing, and other staged actions. The current branch preserves those gates for ordinary work and adds only the narrow, separately owner-confirmed Revenue Sprint publish exception described above.
+- Human gates for email sending, deletion, production deploys, Railway mutation, publishing, and other staged actions. The current branch preserves those gates for ordinary work and adds only the narrow, separately owner-confirmed, revision-bound Revenue Sprint coordinator exception described above; the checked-in sprint remains Bluesky-only.
 - PR-oriented code changes rather than direct base-branch merges.
 - APScheduler, persisted reminders, timezone configuration, and existing Telegram scheduled-message delivery.
 - Project registry, active-repository routing, Linear issue creation/mirroring, and source-issue workflows.
@@ -174,4 +186,4 @@ This creates useful daily autonomy without introducing parallel execution, repla
 
 ## Scope decision
 
-The autonomous session should remain sequential and bounded: at most ten distinct roadmap items, one attempt per item, and 120 minutes. Task-local blockers should not prevent unrelated work from continuing. Controlled Lumen ideation is an idle fallback only, runs as one batch of at most three ideas, and writes `proposed` backlog records that never auto-execute. Parallel agents, ordinary automatic deployment/merge/publish, broad helper rewrites, database replacement, and a full UI are intentionally deferred. The only automatic publish exception is the deterministic post-review action in an active, separately owner-confirmed Revenue Sprint; it does not grant a model general publishing authority.
+The autonomous session should remain sequential and bounded: at most ten distinct roadmap items, one attempt per item, and 120 minutes. Task-local blockers should not prevent unrelated work from continuing. Controlled Lumen ideation is an idle fallback only, runs as one batch of at most three ideas, and writes `proposed` backlog records that never auto-execute. Parallel agents, ordinary automatic deployment/merge/publish, broad helper rewrites, database replacement, and a full UI are intentionally deferred. The only automatic external-action exception is the deterministic post-review coordinator inside an active, separately owner-confirmed Revenue Sprint; it does not grant a model general sending, publishing, purchasing, or deployment authority.
