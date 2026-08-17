@@ -1,6 +1,6 @@
 # Tyler AI Assistant
 
-A personal AI assistant for the things I put off, or that need more energy than I have at the time. It runs about ten agents on Telegram, each handling a different part of my life, and routes every task to the cheapest model that can actually do it. The MVP covers three workflows I use every week. Python, runs in Docker, setup below.
+A personal AI assistant for the things I put off, or that need more energy than I have at the time. It runs about twelve agents on Telegram, each handling a different part of my life, and routes every task to the cheapest model that can actually do it. The MVP covers three workflows I use every week. Python, runs in Docker, setup below.
 
 A focused personal operating assistant for Tyler. The MVP is limited to three weekly-use workflows: Linear-driven planning, approval-based Career Ops support, and calendar/tasks/routine help that directly supports action.
 
