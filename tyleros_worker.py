@@ -2,9 +2,9 @@
 """Poll TylerOS as Miles on the Python runtime.
 
 This is not the Telegram group bot and not a specialist framework. It claims
-jobs assigned to the Miles role, reads Today's titles and dates, and proposes
-a note when there is something to say. An empty Today completes quietly.
-TylerOS writes a note only if Tyler accepts a proposal.
+jobs assigned to the Miles role as a named Python *instance* (home-desktop-python,
+backup-python, …). Prefer TYLEROS_RUNTIME_CREDENTIAL so TylerOS derives identity
+from the credential rather than a kind header. RUNTIME_TOKEN still ticks schedules.
 
 Long-running mode also POSTs a scheduler tick. The worker is a clock, not the
 source of truth for when a Miles briefing should exist.
@@ -120,6 +120,21 @@ def _append_food_section(sections: list[str], items: Any) -> None:
         sections.append("\n".join(lines))
 
 
+def identity_headers(environ: dict[str, str] | None = None) -> dict[str, str]:
+    env = os.environ if environ is None else environ
+    headers = {"X-TylerOS-Role": ROLE}
+    if env.get("TYLEROS_RUNTIME_CREDENTIAL", "").strip() == "":
+        headers["X-TylerOS-Runtime-Kind"] = RUNTIME_KIND
+    return headers
+
+
+def work_and_tick_tokens(environ: dict[str, str] | None = None) -> tuple[str, str]:
+    env = os.environ if environ is None else environ
+    instance = env.get("TYLEROS_RUNTIME_CREDENTIAL", "").strip()
+    system = env.get("RUNTIME_TOKEN", "").strip()
+    return instance or system, system
+
+
 def request_json(
     method: str,
     url: str,
@@ -134,8 +149,7 @@ def request_json(
         "Accept": "application/json",
     }
     if identity:
-        headers["X-TylerOS-Runtime-Kind"] = RUNTIME_KIND
-        headers["X-TylerOS-Role"] = ROLE
+        headers.update(identity_headers())
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -209,28 +223,34 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     base_url = os.environ.get("TYLEROS_URL", "http://localhost:3000").rstrip("/")
-    token = os.environ.get("RUNTIME_TOKEN", "").strip()
-    if len(token) < 32:
-        print("RUNTIME_TOKEN is missing or too short. Set it to the same value as TylerOS.", file=sys.stderr)
+    work_token, tick_token = work_and_tick_tokens()
+    if len(work_token) < 32:
+        print(
+            "Set TYLEROS_RUNTIME_CREDENTIAL (preferred) or RUNTIME_TOKEN to a TylerOS instance or system token.",
+            file=sys.stderr,
+        )
         return 1
 
     poll_seconds = float(os.environ.get("TYLEROS_POLL_SECONDS", "5"))
     tick_seconds = float(os.environ.get("TYLEROS_TICK_SECONDS", "60"))
 
     if args.once:
-        tick_once(base_url, token)
-        process_once(base_url, token)
+        if tick_token:
+            tick_once(base_url, tick_token)
+        process_once(base_url, work_token)
         return 0
 
-    print(f"Polling {base_url} as Miles on the Python runtime; ticking schedules every {tick_seconds:.0f}s.")
+    print(
+        f"Polling {base_url} as Miles on a Python runtime instance; ticking schedules every {tick_seconds:.0f}s."
+    )
     last_tick = 0.0
     while True:
         try:
             now = time.time()
-            if now - last_tick >= tick_seconds:
-                tick_once(base_url, token)
+            if tick_token and now - last_tick >= tick_seconds:
+                tick_once(base_url, tick_token)
                 last_tick = now
-            process_once(base_url, token)
+            process_once(base_url, work_token)
         except Exception as error:  # noqa: BLE001 — keep the poller alive
             print(f"poll failed: {error}", file=sys.stderr)
         time.sleep(poll_seconds)

@@ -24,15 +24,14 @@ approval gates determine what may run.
 
 `tyleros_worker.py` is a small poller for the TylerOS product (`new-tyler-os`).
 It ticks the TylerOS scheduler (a clock, not Miles), claims jobs assigned to
-**Miles** using the **Python** runtime, and proposes a note only when Today has
-material. An empty Today completes with no approval and no note.
-
-The weekday 06:20 America/Phoenix briefing is stored in TylerOS. This process
-must not become the source of truth for whether that job should exist.
+**Miles** as a named Python *instance*, and proposes a note only when Today has
+material. Prefer `TYLEROS_RUNTIME_CREDENTIAL` from TylerOS `pnpm runtime:bootstrap`
+so identity comes from the credential. `RUNTIME_TOKEN` still ticks schedules.
 
 ```bash
 export TYLEROS_URL=http://localhost:3000
-export RUNTIME_TOKEN=the-same-token
+export RUNTIME_TOKEN=the-system-token
+export TYLEROS_RUNTIME_CREDENTIAL=tylrt_...
 python3 tyleros_worker.py --once   # tick once, claim at most one job
 # or long-running:
 python3 tyleros_worker.py

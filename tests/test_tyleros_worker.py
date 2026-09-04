@@ -6,7 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tyleros_worker import format_briefing_date, format_today_briefing, today_has_material
+from tyleros_worker import (
+    format_briefing_date,
+    format_today_briefing,
+    identity_headers,
+    today_has_material,
+    work_and_tick_tokens,
+)
 
 
 EMPTY = {
@@ -64,6 +70,34 @@ class FormatTodayBriefingTests(unittest.TestCase):
 
     def test_briefing_date_drops_leading_zero(self):
         self.assertEqual(format_briefing_date("2026-09-04"), "4 Sep 2026")
+
+
+class CredentialIdentityTests(unittest.TestCase):
+    def test_instance_credential_does_not_send_kind_and_cannot_tick(self):
+        env = {"TYLEROS_RUNTIME_CREDENTIAL": "tylrt_" + "a" * 40}
+        headers = identity_headers(env)
+        self.assertEqual(headers["X-TylerOS-Role"], "miles")
+        self.assertNotIn("X-TylerOS-Runtime-Kind", headers)
+        work, tick = work_and_tick_tokens(env)
+        self.assertEqual(work, env["TYLEROS_RUNTIME_CREDENTIAL"])
+        self.assertEqual(tick, "")
+
+    def test_system_token_still_sends_kind_and_ticks(self):
+        env = {"RUNTIME_TOKEN": "system-token-value-that-is-long-enough"}
+        headers = identity_headers(env)
+        self.assertEqual(headers["X-TylerOS-Runtime-Kind"], "python")
+        work, tick = work_and_tick_tokens(env)
+        self.assertEqual(work, tick)
+        self.assertEqual(work, env["RUNTIME_TOKEN"])
+
+    def test_instance_credential_wins_work_token_over_system(self):
+        env = {
+            "TYLEROS_RUNTIME_CREDENTIAL": "tylrt_instance",
+            "RUNTIME_TOKEN": "system-token-value-that-is-long-enough",
+        }
+        work, tick = work_and_tick_tokens(env)
+        self.assertEqual(work, "tylrt_instance")
+        self.assertEqual(tick, "system-token-value-that-is-long-enough")
 
 
 if __name__ == "__main__":
