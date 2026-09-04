@@ -6,7 +6,17 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tyleros_worker import format_briefing_date, format_today_briefing
+from tyleros_worker import format_briefing_date, format_today_briefing, today_has_material
+
+
+EMPTY = {
+    "today": "2026-09-04",
+    "overdue": [],
+    "dueToday": [],
+    "upcoming": [],
+    "needsTriage": [],
+    "expiringSoon": [],
+}
 
 
 class FormatTodayBriefingTests(unittest.TestCase):
@@ -41,19 +51,16 @@ class FormatTodayBriefingTests(unittest.TestCase):
         self.assertNotIn("secret", body)
         self.assertNotIn("do not leak", body)
 
-    def test_empty_today_says_nothing_needs_you(self):
-        title, body = format_today_briefing(
-            {
-                "today": "2026-09-04",
-                "overdue": [],
-                "dueToday": [],
-                "upcoming": [],
-                "needsTriage": [],
-                "expiringSoon": [],
-            }
-        )
+    def test_empty_today_is_not_material(self):
+        self.assertFalse(today_has_material(EMPTY))
+        title, body = format_today_briefing(EMPTY)
         self.assertEqual(title, "Today briefing — 4 Sep 2026")
-        self.assertIn("Nothing needs you right now.", body)
+        self.assertNotIn("Nothing needs you right now.", body)
+
+    def test_titles_make_today_material(self):
+        self.assertTrue(today_has_material({**EMPTY, "overdue": [{"title": "Pay rent"}]}))
+        self.assertTrue(today_has_material({**EMPTY, "expiringSoon": [{"name": "Milk"}]}))
+        self.assertFalse(today_has_material({**EMPTY, "overdue": [{"title": "  "}]}))
 
     def test_briefing_date_drops_leading_zero(self):
         self.assertEqual(format_briefing_date("2026-09-04"), "4 Sep 2026")
