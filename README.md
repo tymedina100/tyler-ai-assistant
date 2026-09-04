@@ -20,6 +20,24 @@ The aim is a bounded, owner-directed AI team, not an uncontrolled do-everything 
 platform. Roadmap priority, budget, authorization ceilings, review limits, and human
 approval gates determine what may run.
 
+## TylerOS runtime worker
+
+`tyleros_worker.py` is a small poller for the TylerOS product (`new-tyler-os`).
+It claims jobs assigned to **Miles** (Chief of Staff) using the **Python**
+runtime, reads Today's titles and dates, and proposes a note. TylerOS writes
+the note only if you accept it on `/runs`.
+
+This is not the Telegram roster and not a replacement for Miles. Miles is the
+role; Python is one interchangeable backend.
+
+```bash
+# In new-tyler-os: set RUNTIME_TOKEN, migrate, start the app.
+# Then here:
+export TYLEROS_URL=http://localhost:3000
+export RUNTIME_TOKEN=the-same-token
+python tyleros_worker.py --once
+```
+
 ## Features
 
 - Chat with an AI assistant from the terminal
