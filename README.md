@@ -23,19 +23,19 @@ approval gates determine what may run.
 ## TylerOS runtime worker
 
 `tyleros_worker.py` is a small poller for the TylerOS product (`new-tyler-os`).
-It claims jobs assigned to **Miles** (Chief of Staff) using the **Python**
-runtime, reads Today's titles and dates, and proposes a note. TylerOS writes
-the note only if you accept it on `/runs`.
+It ticks the TylerOS scheduler (a clock, not Miles), claims jobs assigned to
+**Miles** using the **Python** runtime, and proposes a note only when Today has
+material. An empty Today completes with no approval and no note.
 
-This is not the Telegram roster and not a replacement for Miles. Miles is the
-role; Python is one interchangeable backend.
+The weekday 06:20 America/Phoenix briefing is stored in TylerOS. This process
+must not become the source of truth for whether that job should exist.
 
 ```bash
-# In new-tyler-os: set RUNTIME_TOKEN, migrate, start the app.
-# Then here:
 export TYLEROS_URL=http://localhost:3000
 export RUNTIME_TOKEN=the-same-token
-python tyleros_worker.py --once
+python3 tyleros_worker.py --once   # tick once, claim at most one job
+# or long-running:
+python3 tyleros_worker.py
 ```
 
 ## Features

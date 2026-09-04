@@ -3,7 +3,11 @@
 
 This is not the Telegram group bot and not a specialist framework. It claims
 jobs assigned to the Miles role, reads Today's titles and dates, and proposes
-a note. TylerOS writes the note only if Tyler accepts it.
+a note when there is something to say. An empty Today completes quietly.
+TylerOS writes a note only if Tyler accepts a proposal.
+
+Long-running mode also POSTs a scheduler tick. The worker is a clock, not the
+source of truth for when a Miles briefing should exist.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from typing import Any
 
 ROLE = "miles"
 RUNTIME_KIND = "python"
+EMPTY_TODAY_SUMMARY = "No material Today items."
 MONTHS = (
     "Jan",
     "Feb",
@@ -33,11 +38,26 @@ MONTHS = (
     "Nov",
     "Dec",
 )
+MATERIAL_ITEM_KEYS = ("overdue", "dueToday", "needsTriage", "upcoming")
 
 
 def format_briefing_date(iso: str) -> str:
     year, month, day = iso.split("-")
     return f"{int(day)} {MONTHS[int(month) - 1]} {year}"
+
+
+def today_has_material(context: dict[str, Any]) -> bool:
+    for key in MATERIAL_ITEM_KEYS:
+        items = context.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict) and str(item.get("title") or "").strip():
+                return True
+    food = context.get("expiringSoon")
+    if not isinstance(food, list):
+        return False
+    return any(isinstance(item, dict) and str(item.get("name") or "").strip() for item in food)
 
 
 def format_today_briefing(context: dict[str, Any]) -> tuple[str, str]:
@@ -51,11 +71,7 @@ def format_today_briefing(context: dict[str, Any]) -> tuple[str, str]:
     _append_item_section(sections, "Next 7 days", context.get("upcoming"))
     _append_food_section(sections, context.get("expiringSoon"))
 
-    if not sections:
-        body = f"{title}\n\nNothing needs you right now."
-    else:
-        body = f"{title}\n\n" + "\n\n".join(sections)
-
+    body = f"{title}\n\n" + "\n\n".join(sections) if sections else title
     return title, body
 
 
@@ -110,14 +126,16 @@ def request_json(
     token: str,
     *,
     payload: dict[str, Any] | None = None,
+    identity: bool = True,
 ) -> Any:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {token}",
-        "X-TylerOS-Runtime-Kind": RUNTIME_KIND,
-        "X-TylerOS-Role": ROLE,
         "Accept": "application/json",
     }
+    if identity:
+        headers["X-TylerOS-Runtime-Kind"] = RUNTIME_KIND
+        headers["X-TylerOS-Role"] = ROLE
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -132,6 +150,16 @@ def request_json(
         raise RuntimeError(f"{method} {url} failed: HTTP {error.code} {body}") from error
 
 
+def tick_once(base_url: str, token: str) -> Any:
+    return request_json(
+        "POST",
+        f"{base_url}/api/runtime/schedules/tick",
+        token,
+        payload={},
+        identity=False,
+    )
+
+
 def process_once(base_url: str, token: str) -> bool:
     claimed = request_json("GET", f"{base_url}/api/runtime/jobs/next", token)
     job = None if not isinstance(claimed, dict) else claimed.get("job")
@@ -144,6 +172,21 @@ def process_once(base_url: str, token: str) -> bool:
     if not isinstance(context, dict):
         raise RuntimeError("Today context was not an object.")
 
+    usage = {"provider": "none", "model": "deterministic"}
+    if not today_has_material(context):
+        request_json(
+            "POST",
+            f"{base_url}/api/runtime/runs/{run_id}/complete",
+            token,
+            payload={
+                "status": "succeeded",
+                "resultSummary": EMPTY_TODAY_SUMMARY,
+                "usage": usage,
+            },
+        )
+        print(f"Quiet success for job {job.get('id')}: {EMPTY_TODAY_SUMMARY}")
+        return True
+
     title, body = format_today_briefing(context)
     request_json(
         "POST",
@@ -153,7 +196,7 @@ def process_once(base_url: str, token: str) -> bool:
             "status": "succeeded",
             "resultSummary": "Drafted today's briefing.",
             "proposal": {"kind": "create_note", "title": title, "body": body},
-            "usage": {"provider": "none", "model": "deterministic"},
+            "usage": usage,
         },
     )
     print(f"Proposed note for job {job.get('id')}: {title}")
@@ -162,7 +205,7 @@ def process_once(base_url: str, token: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--once", action="store_true", help="claim at most one job and exit")
+    parser.add_argument("--once", action="store_true", help="tick once, claim at most one job, exit")
     args = parser.parse_args(argv)
 
     base_url = os.environ.get("TYLEROS_URL", "http://localhost:3000").rstrip("/")
@@ -171,18 +214,26 @@ def main(argv: list[str] | None = None) -> int:
         print("RUNTIME_TOKEN is missing or too short. Set it to the same value as TylerOS.", file=sys.stderr)
         return 1
 
-    interval = float(os.environ.get("TYLEROS_POLL_SECONDS", "5"))
+    poll_seconds = float(os.environ.get("TYLEROS_POLL_SECONDS", "5"))
+    tick_seconds = float(os.environ.get("TYLEROS_TICK_SECONDS", "60"))
+
     if args.once:
+        tick_once(base_url, token)
         process_once(base_url, token)
         return 0
 
-    print(f"Polling {base_url} as Miles on the Python runtime.")
+    print(f"Polling {base_url} as Miles on the Python runtime; ticking schedules every {tick_seconds:.0f}s.")
+    last_tick = 0.0
     while True:
         try:
+            now = time.time()
+            if now - last_tick >= tick_seconds:
+                tick_once(base_url, token)
+                last_tick = now
             process_once(base_url, token)
         except Exception as error:  # noqa: BLE001 — keep the poller alive
             print(f"poll failed: {error}", file=sys.stderr)
-        time.sleep(interval)
+        time.sleep(poll_seconds)
 
 
 if __name__ == "__main__":
