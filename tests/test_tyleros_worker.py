@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -10,6 +11,7 @@ from tyleros_worker import (
     format_briefing_date,
     format_today_briefing,
     identity_headers,
+    process_once,
     today_has_material,
     work_and_tick_tokens,
 )
@@ -98,6 +100,75 @@ class CredentialIdentityTests(unittest.TestCase):
         work, tick = work_and_tick_tokens(env)
         self.assertEqual(work, "tylrt_instance")
         self.assertEqual(tick, "system-token-value-that-is-long-enough")
+
+
+class ProcessOnceRoutingTests(unittest.TestCase):
+    def test_deterministic_job_with_material_still_proposes_locally(self):
+        calls: list[tuple[str, str]] = []
+
+        def fake_request(method, url, token, payload=None, identity=True, timeout=30):
+            calls.append((method, url))
+            if url.endswith("/jobs/next"):
+                return {
+                    "job": {"id": "job-1", "kind": "today_briefing"},
+                    "run": {"id": "run-1"},
+                }
+            if url.endswith("/context/today"):
+                return {**EMPTY, "dueToday": [{"title": "Review TylerOS runtime PR"}]}
+            return {"ok": True}
+
+        with patch("tyleros_worker.request_json", side_effect=fake_request):
+            self.assertTrue(process_once("http://localhost:3000", "token"))
+
+        self.assertTrue(any(url.endswith("/complete") for _, url in calls))
+        self.assertFalse(any("/brief" in url for _, url in calls))
+
+    def test_ai_job_with_material_posts_brief_not_complete(self):
+        calls: list[tuple[str, str]] = []
+
+        def fake_request(method, url, token, payload=None, identity=True, timeout=30):
+            calls.append((method, url))
+            if url.endswith("/jobs/next"):
+                return {
+                    "job": {"id": "job-ai", "kind": "today_briefing_ai"},
+                    "run": {"id": "run-ai"},
+                }
+            if url.endswith("/context/today"):
+                return {**EMPTY, "dueToday": [{"title": "Review TylerOS runtime PR"}]}
+            if url.endswith("/brief"):
+                self.assertEqual(timeout, 60)
+                return {"ok": True, "status": "needs_approval"}
+            raise AssertionError(f"unexpected {method} {url}")
+
+        with patch("tyleros_worker.request_json", side_effect=fake_request):
+            self.assertTrue(process_once("http://localhost:3000", "token"))
+
+        self.assertTrue(any(url.endswith("/brief") for _, url in calls))
+        self.assertFalse(any(url.endswith("/complete") for _, url in calls))
+
+    def test_ai_job_empty_today_completes_without_brief(self):
+        calls: list[tuple[str, str]] = []
+
+        def fake_request(method, url, token, payload=None, identity=True, timeout=30):
+            calls.append((method, url))
+            if url.endswith("/jobs/next"):
+                return {
+                    "job": {"id": "job-ai", "kind": "today_briefing_ai"},
+                    "run": {"id": "run-ai"},
+                }
+            if url.endswith("/context/today"):
+                return EMPTY
+            if url.endswith("/complete"):
+                self.assertEqual(payload["usage"]["provider"], "none")
+                self.assertEqual(payload["usage"]["model"], "deterministic")
+                self.assertNotIn("proposal", payload)
+                return {"ok": True}
+            raise AssertionError(f"unexpected {method} {url}")
+
+        with patch("tyleros_worker.request_json", side_effect=fake_request):
+            self.assertTrue(process_once("http://localhost:3000", "token"))
+
+        self.assertFalse(any("/brief" in url for _, url in calls))
 
 
 if __name__ == "__main__":

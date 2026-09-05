@@ -142,6 +142,7 @@ def request_json(
     *,
     payload: dict[str, Any] | None = None,
     identity: bool = True,
+    timeout: float = 30,
 ) -> Any:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     headers = {
@@ -154,7 +155,7 @@ def request_json(
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read()
             if not raw:
                 return None
@@ -199,6 +200,18 @@ def process_once(base_url: str, token: str) -> bool:
             },
         )
         print(f"Quiet success for job {job.get('id')}: {EMPTY_TODAY_SUMMARY}")
+        return True
+
+    if job.get("kind") == "today_briefing_ai":
+        result = request_json(
+            "POST",
+            f"{base_url}/api/runtime/runs/{run_id}/brief",
+            token,
+            payload={},
+            timeout=60,
+        )
+        status = result.get("status") if isinstance(result, dict) else None
+        print(f"AI briefing for job {job.get('id')}: {status or 'done'}")
         return True
 
     title, body = format_today_briefing(context)
