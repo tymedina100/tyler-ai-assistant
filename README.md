@@ -25,8 +25,9 @@ approval gates determine what may run.
 `tyleros_worker.py` is a small poller for the TylerOS product (`new-tyler-os`).
 It ticks the TylerOS scheduler (a clock, not Miles), claims jobs assigned to
 **Miles** as a named Python *instance*, and proposes a note only when Today has
-material. Prefer `TYLEROS_RUNTIME_CREDENTIAL` from TylerOS `pnpm runtime:bootstrap`
-so identity comes from the credential. `RUNTIME_TOKEN` still ticks schedules.
+material. Prefer `TYLEROS_RUNTIME_CREDENTIAL` from TylerOS
+`pnpm runtime:bootstrap -- --role miles` so identity comes from the credential.
+`RUNTIME_TOKEN` still ticks schedules.
 
 ```bash
 export TYLEROS_URL=http://localhost:3000
