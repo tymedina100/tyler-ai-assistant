@@ -1463,3 +1463,25 @@ weather, or Todoist, and keep `HOME_LOCATION`/`BRIEFING_TIME`/`DAILY_REPORT_TIME
 **One thing to remember:** the core `BOT_KEYS` roster is code-defined. Optional bot keys
 already listed in `OPTIONAL_BOT_KEYS` activate when their token secret is present. A
 brand-new agent requires both a code roster entry and a token before redeploying.
+
+## Private subscription analysis adapter (local opt-in)
+
+`codex_subscription.analyze` uses the installed official Codex CLI and its existing
+ChatGPT login. It requires an explicit model/effort, `enabled=True`, and quota
+observed within five minutes with at least 10% remaining. API-key login is rejected;
+service secrets/API keys are excluded from the child environment. Each invocation
+uses an ephemeral temporary working directory, read-only sandbox, disabled shell,
+apps/plugins/multi-agent tools and web search, structured JSON output, and a bounded
+wall timeout. Failed or timed-out invocations are not retried by this adapter.
+The CLI may perform its own transport retries. Quota admission is not a hard token
+or monetary reservation. Usage is reported as returned, never inferred as zero.
+
+This is not wired into the production poller, schedules, or arbitrary public
+requests. No API fallback or new credentials are configured. The live local
+subscription probe used synthetic context and produced structured output; queue
+integration, capacity reservation/concurrent execution, durable attempt receipts,
+and specialist decision quality remain unfinished.
+
+Supported interfaces verified against [non-interactive Codex](https://learn.chatgpt.com/docs/non-interactive-mode),
+[authentication](https://learn.chatgpt.com/docs/auth), and
+[configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
