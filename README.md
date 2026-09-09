@@ -1463,3 +1463,112 @@ weather, or Todoist, and keep `HOME_LOCATION`/`BRIEFING_TIME`/`DAILY_REPORT_TIME
 **One thing to remember:** the core `BOT_KEYS` roster is code-defined. Optional bot keys
 already listed in `OPTIONAL_BOT_KEYS` activate when their token secret is present. A
 brand-new agent requires both a code roster entry and a token before redeploying.
+
+## Private subscription analysis adapter (local opt-in)
+
+`codex_subscription.analyze` uses the installed official Codex CLI and its existing
+ChatGPT login. It requires an explicit model/effort, `enabled=True`, and quota
+observed within five minutes with at least 10% remaining. API-key login is rejected;
+service secrets/API keys are excluded from the child environment. Each invocation
+uses an ephemeral temporary working directory, read-only sandbox, disabled shell,
+apps/plugins/multi-agent tools and web search, structured JSON output, and a bounded
+wall timeout. Failed or timed-out invocations are not retried by this adapter.
+The CLI may perform its own transport retries. Quota admission is not a hard token
+or monetary reservation. Usage is reported as returned, never inferred as zero.
+
+This is not wired into the production poller, schedules, or arbitrary public
+requests. No API fallback or new credentials are configured. The live local
+subscription probe used synthetic context and produced structured output; queue
+integration, capacity reservation/concurrent execution, durable attempt receipts,
+and specialist decision quality remain unfinished.
+
+Supported interfaces verified against [non-interactive Codex](https://learn.chatgpt.com/docs/non-interactive-mode),
+[authentication](https://learn.chatgpt.com/docs/auth), and
+[configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+### Durable attempts before queue integration
+
+Use `subscription_attempts.analyze_once` with the queue's persisted UUID and one
+private absolute SQLite ledger path per account. Identical successful retries read
+the saved result without executing Codex again; changed input under an existing ID
+is rejected. An atomic account-wide running slot prevents concurrent invocations
+through that ledger. Failed attempts remain failed; a process that exits mid-call
+leaves a running record held for explicit reconciliation. Do not automatically
+replace its ID or delete the ledger to retry. The ledger stores the request hash,
+status and output receipt, not the prompt or credentials, and uses mode600 outside
+this repository. Returned summaries can contain personal information.
+
+This local boundary does not reserve quota across unrelated Codex apps or hosts.
+Production enablement and safe resolution of uncertain attempts are still pending.
+
+### One-shot subscription briefing consumer
+
+`codex_briefing_worker.py` claims only `today_briefing_codex` jobs. Configure the
+existing runtime credential and HTTPS `TYLEROS_URL`, then explicitly pass
+`--enable-subscription --binary /trusted/path/to/codex --ledger /private/attempts.db`.
+An optional `--quota-file /private/quota.json` overrides the default live read. Quota JSON contains `observed_at` (Unix seconds),
+`used_percent`, and optional `exhausted`, sourced from a fresh supported account
+usage observation. Do not invent quota values when unavailable. The selected
+server profile supplies the model; this first workflow uses low reasoning effort.
+
+Preparation freezes context on the server. Empty days skip the CLI; other runs
+request bounded structured Miles judgment. Server completion validates it and
+creates a pending note proposal under the existing approval rules. Existing
+production workers do not claim this job kind. `--resume-run UUID` resumes a known
+attempt; a completed local receipt avoids another model call after a failed
+completion request. An interrupted or failed local inference remains held for
+reconciliation. There is no automatic scheduling or API fallback. Quota now refreshes through the
+supported app-server account interface before each new claim.
+Server migrations0013/0014 and this worker need an approved release before use in
+production. A real isolated HTTP/CLI/approval/note flow was verified locally.
+
+
+### Live account quota admission
+
+`codex_quota.read_quota` uses documented `initialize`, `initialized`, and
+`account/rateLimits/read` RPC over private stdio. It starts no model turn, thread,
+reset redemption, credit purchase or owner email. It strips inherited API keys,
+requires ChatGPT auth, bounds response size/time, and terminates its helper process.
+The configured standard `codex` bucket must be present; the most consumed primary
+or secondary window controls admission. Unknown, malformed, expired or exhausted
+limits do not claim work. No fallback to a different bucket or legacy value when
+a multi-bucket response omits the requested bucket. Optional manual evidence is
+validated before claiming too. Other model-specific quota buckets need explicit
+mapping before use; this default is for standard Codex subscription profiles.
+
+Completed durable receipts can still be delivered without another quota read or
+model call through `--resume-run`; new inference obtains live quota if not supplied.
+This remains admission control, not a hard token reservation across all hosts.
+Reference: https://learn.chatgpt.com/docs/app-server
+
+
+### Inspect and deliver subscription receipts
+
+Run `python3 codex_briefing_worker.py --inspect-ledger --ledger /private/attempts.db`
+to inspect the latest 100 attempts. This command opens the existing SQLite ledger
+read-only, requires no runtime token or Codex binary, and makes no network/model
+calls. It prints IDs, timestamps, status and recovery guidance; it does not print
+prompts, hashes, judgments or credentials. A missing ledger is an error and is not
+created. `running` means the outcome is uncertain, not proof a process is alive.
+
+Use `--deliver-run UUID` instead of `--resume-run UUID` when only delivery is
+intended. Supply the original binary path, ledger and explicit enable flag as
+above. Delivery-only requires a successful local receipt before contacting the
+server and cannot start inference, even if no receipt exists. It validates the
+frozen intent before sending the saved judgment. The server still enforces run
+ownership, current claim and approval rules. If the server already completed the
+run but its response was lost, preparation acknowledges the successful run with
+its current job status. `needs_approval` still requires the existing approval flow;
+it is not a saved note. Recovery sends no second completion request. Wrong-owner
+and failed attempts are not acknowledged as successful.
+
+Neither command clears a held attempt, invents a successful result, nor retries a
+failed/uncertain model call. Explicit resolution of interrupted attempts remains
+unfinished; do not delete the ledger or replace an attempt ID to bypass the hold.
+
+
+Before claiming a new job, the consumer opens its configured ledger and refuses
+admission if any prior attempt is still running/uncertain. Invalid ledger paths
+also fail before claim. This check does not clear old rows or infer process death.
+The atomic slot in analyze_once remains the final concurrency guard before model
+execution; the earlier check is not a cross-host quota or queue reservation.
