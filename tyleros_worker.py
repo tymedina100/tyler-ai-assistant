@@ -67,6 +67,7 @@ def format_today_briefing(context: dict[str, Any]) -> tuple[str, str]:
     title = f"Today briefing — {format_briefing_date(today)}" if today else "Today briefing"
 
     sections: list[str] = []
+    _append_operations_section(sections, context.get("operations"))
     _append_item_section(sections, "Overdue", context.get("overdue"))
     _append_item_section(sections, "Due today", context.get("dueToday"))
     _append_item_section(sections, "Needs triage", context.get("needsTriage"), include_due=False)
@@ -75,6 +76,25 @@ def format_today_briefing(context: dict[str, Any]) -> tuple[str, str]:
 
     body = f"{title}\n\n" + "\n\n".join(sections) if sections else title
     return title, body
+
+
+def _append_operations_section(sections: list[str], operations: Any) -> None:
+    if not isinstance(operations, dict):
+        return
+    lines = ["## Since yesterday"]
+    labels = {
+        "savedNotes": ("briefing note", "saved after approval or standing authority"),
+        "pendingApprovals": ("proposal", "waiting for your decision (including older requests)"),
+        "failedJobs": ("job", "failed in the last 24 hours"),
+    }
+    for key, (noun, detail) in labels.items():
+        value = operations.get(key)
+        if type(value) is int and value > 0:
+            plural = "" if value == 1 else "s"
+            lines.append(f"- {value} {noun}{plural} {detail}.")
+    if len(lines) > 1:
+        lines.append("Review Miles activity in TylerOS → Runs.")
+        sections.append("\n".join(lines))
 
 
 def _append_item_section(
