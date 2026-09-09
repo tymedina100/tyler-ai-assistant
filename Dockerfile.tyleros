@@ -1,0 +1,8 @@
+# Isolated stdlib TylerOS worker. No Telegram dependencies or model SDKs.
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+COPY tyleros_worker.py ./
+USER 65534:65534
+ENTRYPOINT ["python", "tyleros_worker.py"]
+# No AI or scheduler flags: deterministic execution only by default.

@@ -11,6 +11,7 @@ from tyleros_worker import (
     format_briefing_date,
     format_today_briefing,
     identity_headers,
+    main,
     process_once,
     today_has_material,
     work_and_tick_tokens,
@@ -108,7 +109,7 @@ class ProcessOnceRoutingTests(unittest.TestCase):
 
         def fake_request(method, url, token, payload=None, identity=True, timeout=30):
             calls.append((method, url))
-            if url.endswith("/jobs/next"):
+            if url.split("?", 1)[0].endswith("/jobs/next"):
                 return {
                     "job": {"id": "job-1", "kind": "today_briefing"},
                     "run": {"id": "run-1"},
@@ -128,7 +129,7 @@ class ProcessOnceRoutingTests(unittest.TestCase):
 
         def fake_request(method, url, token, payload=None, identity=True, timeout=30):
             calls.append((method, url))
-            if url.endswith("/jobs/next"):
+            if url.split("?", 1)[0].endswith("/jobs/next"):
                 return {
                     "job": {"id": "job-ai", "kind": "today_briefing_ai"},
                     "run": {"id": "run-ai"},
@@ -141,7 +142,7 @@ class ProcessOnceRoutingTests(unittest.TestCase):
             raise AssertionError(f"unexpected {method} {url}")
 
         with patch("tyleros_worker.request_json", side_effect=fake_request):
-            self.assertTrue(process_once("http://localhost:3000", "token"))
+            self.assertTrue(process_once("http://localhost:3000", "token", allow_ai=True))
 
         self.assertTrue(any(url.endswith("/brief") for _, url in calls))
         self.assertFalse(any(url.endswith("/complete") for _, url in calls))
@@ -151,7 +152,7 @@ class ProcessOnceRoutingTests(unittest.TestCase):
 
         def fake_request(method, url, token, payload=None, identity=True, timeout=30):
             calls.append((method, url))
-            if url.endswith("/jobs/next"):
+            if url.split("?", 1)[0].endswith("/jobs/next"):
                 return {
                     "job": {"id": "job-ai", "kind": "today_briefing_ai"},
                     "run": {"id": "run-ai"},
@@ -166,9 +167,65 @@ class ProcessOnceRoutingTests(unittest.TestCase):
             raise AssertionError(f"unexpected {method} {url}")
 
         with patch("tyleros_worker.request_json", side_effect=fake_request):
-            self.assertTrue(process_once("http://localhost:3000", "token"))
+            self.assertTrue(process_once("http://localhost:3000", "token", allow_ai=True))
 
         self.assertFalse(any("/brief" in url for _, url in calls))
+
+
+class NoCostSafetyTests(unittest.TestCase):
+    def test_default_refuses_ai_and_unknown_before_reading_context(self):
+        for kind in ("today_briefing_ai", "send_email", None):
+            with self.subTest(kind=kind):
+                calls = []
+                def fake_request(method, url, token, **kwargs):
+                    calls.append((method, url, kwargs.get("payload")))
+                    if url.split("?", 1)[0].endswith("/jobs/next"):
+                        return {"job": {"id": "job-safe", "kind": kind}, "run": {"id": "run-safe"}}
+                    self.assertTrue(url.endswith("/complete"))
+                    self.assertEqual(kwargs["payload"]["status"], "failed")
+                    self.assertNotIn("proposal", kwargs["payload"])
+                    self.assertEqual(kwargs["payload"]["usage"]["provider"], "none")
+                    return {"ok": True}
+                with patch("tyleros_worker.request_json", side_effect=fake_request):
+                    self.assertTrue(process_once("http://localhost:3000", "token"))
+                self.assertEqual(len(calls), 2)
+
+    def test_claim_advertises_only_explicitly_enabled_job_kinds(self):
+        for allow_ai in (False, True):
+            with self.subTest(allow_ai=allow_ai), patch("tyleros_worker.request_json", return_value={"job": None}) as request:
+                self.assertFalse(process_once("http://localhost:3000", "token", allow_ai=allow_ai))
+                url = request.call_args.args[1]
+                self.assertIn("?kind=today_briefing", url)
+                self.assertEqual("&kind=today_briefing_ai" in url, allow_ai)
+
+    def test_unknown_kind_refused_even_with_ai_opt_in(self):
+        with patch("tyleros_worker.request_json", side_effect=[
+            {"job": {"id": "j", "kind": "arbitrary_request"}, "run": {"id": "r"}}, {"ok": True},
+        ]) as request:
+            self.assertTrue(process_once("http://localhost:3000", "token", allow_ai=True))
+        self.assertEqual(request.call_args.kwargs["payload"]["status"], "failed")
+
+    def test_once_does_not_tick_or_enable_ai_just_because_token_exists(self):
+        with patch.dict("os.environ", {"RUNTIME_TOKEN": "x" * 40}, clear=True), \
+             patch("tyleros_worker.tick_once") as tick, \
+             patch("tyleros_worker.process_once") as process:
+            self.assertEqual(main(["--once"]), 0)
+        tick.assert_not_called()
+        process.assert_called_once_with("http://localhost:3000", "x" * 40, allow_ai=False)
+
+    def test_explicit_scheduler_tick_requires_system_token(self):
+        with patch.dict("os.environ", {"TYLEROS_RUNTIME_CREDENTIAL": "x" * 40}, clear=True), \
+             patch("tyleros_worker.request_json") as request:
+            self.assertEqual(main(["--once", "--tick-schedules"]), 1)
+        request.assert_not_called()
+
+    def test_scheduler_tick_only_after_explicit_flag(self):
+        with patch.dict("os.environ", {"RUNTIME_TOKEN": "x" * 40}, clear=True), \
+             patch("tyleros_worker.tick_once") as tick, \
+             patch("tyleros_worker.process_once") as process:
+            self.assertEqual(main(["--once", "--tick-schedules"]), 0)
+        tick.assert_called_once_with("http://localhost:3000", "x" * 40)
+        self.assertFalse(process.call_args.kwargs["allow_ai"])
 
 
 if __name__ == "__main__":
