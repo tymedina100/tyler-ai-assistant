@@ -41,7 +41,7 @@ def analyze_once(prompt: str, *, attempt_id: str, ledger_path: str, **options) -
     attempt_id = str(UUID(attempt_id))
     # Quota observations and timeout are execution conditions, not analysis intent.
     intent = {"prompt": prompt, "model": options.get("model"), "effort": options.get("effort"),
-              "binary": options.get("binary"), "adapter": 1}
+              "binary": options.get("binary"), "response_kind": options.get("response_kind", "summary"), "adapter": 1}
     fingerprint = hashlib.sha256(json.dumps(intent, sort_keys=True).encode()).hexdigest()
     db = _connect(ledger_path)
     try:

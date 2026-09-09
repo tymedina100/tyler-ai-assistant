@@ -1500,3 +1500,23 @@ this repository. Returned summaries can contain personal information.
 
 This local boundary does not reserve quota across unrelated Codex apps or hosts.
 Production queue wiring and a user-visible reconciliation flow are still pending.
+
+### One-shot subscription briefing consumer
+
+`codex_briefing_worker.py` claims only `today_briefing_codex` jobs. Configure the
+existing runtime credential and HTTPS `TYLEROS_URL`, then explicitly pass
+`--enable-subscription --binary /trusted/path/to/codex --ledger /private/attempts.db
+--quota-file /private/quota.json`. Quota JSON contains `observed_at` (Unix seconds),
+`used_percent`, and optional `exhausted`, sourced from a fresh supported account
+usage observation. Do not invent quota values when unavailable. The selected
+server profile supplies the model; this first workflow uses low reasoning effort.
+
+Preparation freezes context on the server. Empty days skip the CLI; other runs
+request bounded structured Miles judgment. Server completion validates it and
+creates a pending note proposal under the existing approval rules. Existing
+production workers do not claim this job kind. `--resume-run UUID` resumes a known
+attempt; a completed local receipt avoids another model call after a failed
+completion request. An interrupted or failed local inference remains held for
+reconciliation. There is no automatic scheduling, API fallback, or quota refresh.
+Server migrations0013/0014 and this worker need an approved release before use in
+production. A real isolated HTTP/CLI/approval/note flow was verified locally.

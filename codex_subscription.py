@@ -26,7 +26,9 @@ class SubscriptionUnavailable(RuntimeError):
 
 
 def analyze(prompt: str, *, binary: str, model: str, effort: str,
-            quota: QuotaEvidence, enabled: bool = False, timeout: int = 90) -> dict:
+            quota: QuotaEvidence, enabled: bool = False, timeout: int = 90, response_kind: str = "summary") -> dict:
+    if response_kind not in {"summary", "miles_judgment"}:
+        raise ValueError("Unknown structured analysis kind.")
     if not enabled:
         raise SubscriptionUnavailable("Subscription execution is not enabled.")
     age = time.time() - quota.observed_at
@@ -50,8 +52,11 @@ def analyze(prompt: str, *, binary: str, model: str, effort: str,
         root = Path(directory)
         schema = root / "schema.json"
         output = root / "result.json"
-        schema.write_text(json.dumps({"type": "object", "properties": {"summary": {"type": "string"}},
-                                      "required": ["summary"], "additionalProperties": False}))
+        properties = {"summary": {"type": "string"}}
+        if response_kind == "miles_judgment":
+            properties.update({key: {"type": "array", "items": {"type": "string"}} for key in ("priorities", "needsTyler", "watch")})
+        schema.write_text(json.dumps({"type": "object", "properties": properties,
+                                      "required": list(properties), "additionalProperties": False}))
         command = [binary, "exec", "--ignore-user-config", "--strict-config", "--ephemeral",
                    "--skip-git-repo-check", "--sandbox", "read-only", "--cd", directory,
                    "--model", model, "--config", f'model_reasoning_effort="{effort}"',
@@ -67,13 +72,15 @@ def analyze(prompt: str, *, binary: str, model: str, effort: str,
         if not output.exists() or output.stat().st_size > 20000:
             raise SubscriptionUnavailable("Missing or oversized structured result.")
         data = json.loads(output.read_text())
-        if not isinstance(data, dict) or set(data) != {"summary"} or not isinstance(data["summary"], str) or not 1 <= len(data["summary"]) <= 4000:
+        if not isinstance(data, dict) or set(data) != set(properties) or not isinstance(data["summary"], str) or not 1 <= len(data["summary"]) <= 4000:
             raise SubscriptionUnavailable("Invalid structured result.")
+        if response_kind == "miles_judgment" and (len(data["summary"]) > 400 or any(not isinstance(data[key], list) or len(data[key]) > 5 or any(not isinstance(value, str) or not 1 <= len(value.strip()) <= 160 for value in data[key]) for key in ("priorities", "needsTyler", "watch"))):
+            raise SubscriptionUnavailable("Invalid Miles judgment.")
         events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         if any(event.get("item", {}).get("type") in {"command_execution", "mcp_tool_call", "web_search", "file_change"} for event in events):
             raise SubscriptionUnavailable("Analysis unexpectedly attempted a tool action.")
         completed = [event for event in events if event.get("type") == "turn.completed"]
         if len(completed) != 1 or any(event.get("type") in {"turn.failed", "error"} for event in events):
             raise SubscriptionUnavailable("Run did not finish exactly one successful turn.")
-        return {"summary": data["summary"], "provider": "openai", "product": "codex_chatgpt",
+        return {**({"judgment": data} if response_kind == "miles_judgment" else {"summary": data["summary"]}), "provider": "openai", "product": "codex_chatgpt",
                 "model": model, "usage": completed[0].get("usage"), "automaticRetry": False}
