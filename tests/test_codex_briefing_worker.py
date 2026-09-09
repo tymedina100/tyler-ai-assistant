@@ -33,7 +33,28 @@ class BriefingWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch("codex_briefing_worker.request_json", side_effect=transport), patch("subscription_attempts.analyze", return_value={"judgment":judgment,"usage":{"input_tokens":10,"output_tokens":5}}) as execute:
             options = dict(ledger_path=str(Path(directory)/"attempts.db"),binary="/trusted/codex",quota=QuotaEvidence(time.time(),0),enabled=True)
             with self.assertRaises(RuntimeError): resume_run("http://localhost:3004","fixture",run_id,**options)
-            self.assertEqual(resume_run("http://localhost:3004","fixture",run_id,**options),{"jobStatus":"needs_approval"})
+            self.assertEqual(resume_run("http://localhost:3004","fixture",run_id,delivery_only=True,**options),{"jobStatus":"needs_approval"})
             execute.assert_called_once()
             self.assertEqual(completed[0],completed[1])
             self.assertEqual(completed[0]["usage"]["outputTokens"],5)
+
+    def test_delivery_only_unknown_receipt_does_not_contact_server_or_model(self):
+        with tempfile.TemporaryDirectory() as directory, patch("codex_briefing_worker.request_json") as request, patch("codex_briefing_worker.analyze_once") as analyze:
+            from subscription_attempts import _connect
+            ledger = str(Path(directory) / "attempts.db")
+            _connect(ledger).close()
+            with self.assertRaisesRegex(SubscriptionUnavailable, "completed local receipt"):
+                resume_run("http://localhost:3004", "fixture", str(uuid4()), ledger_path=ledger, binary="unused", enabled=True, delivery_only=True)
+            request.assert_not_called()
+            analyze.assert_not_called()
+
+    def test_inspect_cli_needs_no_runtime_credentials_or_binary(self):
+        import contextlib
+        import io
+        from codex_briefing_worker import main
+        with patch("sys.argv", ["worker", "--inspect-ledger", "--ledger", "/private/ledger.db"]), patch("codex_briefing_worker.inspect_attempts", return_value=[]) as inspect, patch("codex_briefing_worker.work_and_tick_tokens") as credentials, patch("codex_briefing_worker.read_quota") as quota, contextlib.redirect_stdout(io.StringIO()) as output:
+            main()
+            self.assertEqual(output.getvalue().strip(), "[]")
+            inspect.assert_called_once_with("/private/ledger.db")
+            credentials.assert_not_called()
+            quota.assert_not_called()

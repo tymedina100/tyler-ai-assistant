@@ -36,7 +36,7 @@ def _connect(path: str) -> sqlite3.Connection:
     return db
 
 
-def analyze_once(prompt: str, *, attempt_id: str, ledger_path: str, **options) -> dict:
+def analyze_once(prompt: str, *, attempt_id: str, ledger_path: str, delivery_only: bool = False, **options) -> dict:
     """The queue must persist attempt_id before calling and reuse it after restart."""
     attempt_id = str(UUID(attempt_id))
     # Quota observations and timeout are execution conditions, not analysis intent.
@@ -54,6 +54,9 @@ def analyze_once(prompt: str, *, attempt_id: str, ledger_path: str, **options) -
             if previous["status"] == "succeeded":
                 return json.loads(previous["result"])
             raise SubscriptionUnavailable("Previous attempt is running, interrupted, or failed; reconcile it explicitly.")
+        if delivery_only:
+            db.rollback()
+            raise SubscriptionUnavailable("No completed receipt exists; delivery-only never starts inference.")
         if db.execute("select 1 from attempts where status='running'").fetchone():
             db.rollback()
             raise SubscriptionUnavailable("Another subscription attempt holds this account ledger.")
@@ -70,5 +73,29 @@ def analyze_once(prompt: str, *, attempt_id: str, ledger_path: str, **options) -
         db.execute("update attempts set status='succeeded',finished_at=?,result=? where id=?",
                    (time.time(), encoded, attempt_id))
         return result
+    finally:
+        db.close()
+
+
+def inspect_attempts(ledger_path: str, *, attempt_id: str | None = None) -> list[dict]:
+    """Read bounded status metadata without creating a ledger or exposing results."""
+    target = Path(ledger_path).expanduser()
+    if not target.is_absolute() or target.is_symlink():
+        raise ValueError("Use an absolute private ledger path, not a symlink.")
+    if attempt_id is not None:
+        attempt_id = str(UUID(attempt_id))
+    db = sqlite3.connect(target.as_uri() + "?mode=ro", uri=True, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("pragma query_only=on")
+        columns = "id,status,started_at,finished_at,error_type"
+        rows = db.execute(
+            f"select {columns} from attempts" + (" where id=?" if attempt_id else "") +
+            " order by started_at desc limit 100", (attempt_id,) if attempt_id else ()).fetchall()
+        return [dict(row) | {"recovery": {
+            "succeeded": "saved_result_available_for_delivery",
+            "running": "outcome_uncertain_keep_held",
+            "failed": "failed_do_not_retry_automatically",
+        }[row["status"]]} for row in rows]
     finally:
         db.close()

@@ -1499,7 +1499,7 @@ status and output receipt, not the prompt or credentials, and uses mode600 outsi
 this repository. Returned summaries can contain personal information.
 
 This local boundary does not reserve quota across unrelated Codex apps or hosts.
-Production queue wiring and a user-visible reconciliation flow are still pending.
+Production enablement and safe resolution of uncertain attempts are still pending.
 
 ### One-shot subscription briefing consumer
 
@@ -1540,3 +1540,27 @@ Completed durable receipts can still be delivered without another quota read or
 model call through `--resume-run`; new inference obtains live quota if not supplied.
 This remains admission control, not a hard token reservation across all hosts.
 Reference: https://learn.chatgpt.com/docs/app-server
+
+
+### Inspect and deliver subscription receipts
+
+Run `python3 codex_briefing_worker.py --inspect-ledger --ledger /private/attempts.db`
+to inspect the latest 100 attempts. This command opens the existing SQLite ledger
+read-only, requires no runtime token or Codex binary, and makes no network/model
+calls. It prints IDs, timestamps, status and recovery guidance; it does not print
+prompts, hashes, judgments or credentials. A missing ledger is an error and is not
+created. `running` means the outcome is uncertain, not proof a process is alive.
+
+Use `--deliver-run UUID` instead of `--resume-run UUID` when only delivery is
+intended. Supply the original binary path, ledger and explicit enable flag as
+above. Delivery-only requires a successful local receipt before contacting the
+server and cannot start inference, even if no receipt exists. It validates the
+frozen intent before sending the saved judgment. The server still enforces run
+ownership, current claim and approval rules. If the server already completed the
+run but its response was lost, it may reject recovery as a stale claim; inspect
+server state rather than starting a replacement job. This change does not yet
+reconcile that server receipt automatically.
+
+Neither command clears a held attempt, invents a successful result, nor retries a
+failed/uncertain model call. Explicit resolution of interrupted attempts remains
+unfinished; do not delete the ledger or replace an attempt ID to bypass the hold.

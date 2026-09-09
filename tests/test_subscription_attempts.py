@@ -11,7 +11,7 @@ from uuid import uuid4
 from unittest.mock import patch
 
 from codex_subscription import SubscriptionUnavailable
-from subscription_attempts import analyze_once
+from subscription_attempts import analyze_once, inspect_attempts
 
 
 class AttemptTests(unittest.TestCase):
@@ -71,3 +71,34 @@ class AttemptTests(unittest.TestCase):
             with self.assertRaises(SubscriptionUnavailable):
                 analyze_once("fixture", **self.options)
             execute.assert_not_called()
+
+    def test_inspection_is_read_only_and_omits_private_receipt(self):
+        with patch("subscription_attempts.analyze", return_value={"summary": "private output"}):
+            analyze_once("private input", **self.options)
+        before = Path(self.path).read_bytes()
+        inspected = inspect_attempts(self.path)
+        self.assertEqual(inspected[0]["recovery"], "saved_result_available_for_delivery")
+        self.assertEqual(inspected[0]["id"], self.options["attempt_id"])
+        self.assertNotIn("private", json.dumps(inspected))
+        self.assertEqual(before, Path(self.path).read_bytes())
+        self.assertEqual(inspect_attempts(self.path, attempt_id=str(uuid4())), [])
+
+    def test_inspection_missing_ledger_does_not_create_it(self):
+        with self.assertRaises(sqlite3.OperationalError):
+            inspect_attempts(self.path)
+        self.assertFalse(Path(self.path).exists())
+
+    def test_delivery_only_never_infers_missing_or_failed_attempt(self):
+        with patch("subscription_attempts.analyze") as execute:
+            with self.assertRaisesRegex(SubscriptionUnavailable, "delivery-only"):
+                analyze_once("fixture", delivery_only=True, **self.options)
+            execute.assert_not_called()
+        self.assertEqual(inspect_attempts(self.path), [])
+        with patch("subscription_attempts.analyze", side_effect=RuntimeError):
+            with self.assertRaises(RuntimeError):
+                analyze_once("fixture", **self.options)
+        with patch("subscription_attempts.analyze") as execute:
+            with self.assertRaises(SubscriptionUnavailable):
+                analyze_once("fixture", delivery_only=True, **self.options)
+            execute.assert_not_called()
+        self.assertEqual(inspect_attempts(self.path)[0]["recovery"], "failed_do_not_retry_automatically")
