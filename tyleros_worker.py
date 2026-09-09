@@ -68,6 +68,7 @@ def format_today_briefing(context: dict[str, Any]) -> tuple[str, str]:
 
     sections: list[str] = []
     _append_operations_section(sections, context.get("operations"))
+    _append_consumption_section(sections, context.get("consumptionYesterday"))
     _append_item_section(sections, "Overdue", context.get("overdue"))
     _append_item_section(sections, "Due today", context.get("dueToday"))
     _append_item_section(sections, "Needs triage", context.get("needsTriage"), include_due=False)
@@ -76,6 +77,23 @@ def format_today_briefing(context: dict[str, Any]) -> tuple[str, str]:
 
     body = f"{title}\n\n" + "\n\n".join(sections) if sections else title
     return title, body
+
+
+def _append_consumption_section(sections: list[str], summary: Any) -> None:
+    if not isinstance(summary, dict):
+        return
+    food, drink = summary.get("food"), summary.get("drink")
+    if type(food) is not int or type(drink) is not int or food < 0 or drink < 0:
+        return
+    if food == 0 and drink == 0:
+        return
+    # Render only counts. Calendar boundaries are calculated by the server in
+    # Tyler's configured zone; meal prose is never needed for this section.
+    sections.append(
+        "## Food & drink logged yesterday\n"
+        f"- {food} food entries and {drink} drink entries.\n"
+        "Review your history and feedback in TylerOS → Food & drink."
+    )
 
 
 def _append_operations_section(sections: list[str], operations: Any) -> None:
