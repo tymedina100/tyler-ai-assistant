@@ -4,9 +4,10 @@
 This is not the Telegram group bot and not a specialist framework. It claims
 jobs assigned to the Miles role as a named Python *instance* (home-desktop-python,
 backup-python, …). Prefer TYLEROS_RUNTIME_CREDENTIAL so TylerOS derives identity
-from the credential rather than a kind header. RUNTIME_TOKEN still ticks schedules.
+from the credential rather than a kind header. RUNTIME_TOKEN authenticates optional ticks.
 
-Long-running mode also POSTs a scheduler tick. The worker is a clock, not the
+AI inference and scheduler ticks are disabled by default. Enable them only with
+explicit process flags after authorization. The worker is a clock, not the
 source of truth for when a Miles briefing should exist.
 """
 
@@ -19,6 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from typing import Any
 
 ROLE = "miles"
@@ -135,6 +137,13 @@ def work_and_tick_tokens(environ: dict[str, str] | None = None) -> tuple[str, st
     return instance or system, system
 
 
+class RejectRuntimeRedirects(urllib.request.HTTPRedirectHandler):
+    """Credentials must never follow an unexpected deployment redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("Runtime endpoint redirected; verify the configured origin.")
+
+
 def request_json(
     method: str,
     url: str,
@@ -149,20 +158,30 @@ def request_json(
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
+    bypass = os.environ.get("TYLEROS_VERCEL_PROTECTION_BYPASS", "")
+    if bypass:
+        expected = urlsplit(os.environ.get("TYLEROS_URL", ""))
+        destination = urlsplit(url)
+        if (expected.scheme != "https" or not expected.hostname or
+                destination.scheme != expected.scheme or destination.netloc != expected.netloc or
+                not destination.path.startswith("/api/runtime/") or
+                any(ord(char) < 33 or ord(char) > 126 for char in bypass)):
+            raise RuntimeError("Protection bypass requires the configured HTTPS runtime origin.")
+        headers["x-vercel-protection-bypass"] = bypass
     if identity:
         headers.update(identity_headers())
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with urllib.request.build_opener(RejectRuntimeRedirects()).open(req, timeout=timeout) as response:
             raw = response.read()
             if not raw:
                 return None
             return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{method} {url} failed: HTTP {error.code} {body}") from error
+        # Upstream error pages may reflect headers or private request content.
+        raise RuntimeError(f"Runtime request failed: HTTP {error.code}") from None
 
 
 def tick_once(base_url: str, token: str) -> Any:
@@ -175,14 +194,34 @@ def tick_once(base_url: str, token: str) -> Any:
     )
 
 
-def process_once(base_url: str, token: str) -> bool:
-    claimed = request_json("GET", f"{base_url}/api/runtime/jobs/next", token)
+def process_once(base_url: str, token: str, *, allow_ai: bool = False) -> bool:
+    kinds_query = "kind=today_briefing"
+    if allow_ai:
+        kinds_query += "&kind=today_briefing_ai"
+    claimed = request_json("GET", f"{base_url}/api/runtime/jobs/next?{kinds_query}", token)
     job = None if not isinstance(claimed, dict) else claimed.get("job")
     run = None if not isinstance(claimed, dict) else claimed.get("run")
     if not job or not run:
         return False
 
     run_id = run.get("id")
+    kind = job.get("kind")
+    refusal = None
+    if kind not in ("today_briefing", "today_briefing_ai"):
+        refusal = "Unsupported job kind; this worker only handles Today briefings."
+    elif kind == "today_briefing_ai" and not allow_ai:
+        refusal = "AI briefing disabled: this worker requires explicit --allow-ai authorization."
+    if refusal:
+        request_json(
+            "POST", f"{base_url}/api/runtime/runs/{run_id}/complete", token,
+            payload={
+                "status": "failed", "resultSummary": refusal,
+                "usage": {"provider": "none", "model": "deterministic"},
+            },
+        )
+        print(f"Refused job {job.get('id')}: {refusal}")
+        return True
+
     context = request_json("GET", f"{base_url}/api/runtime/context/today", token)
     if not isinstance(context, dict):
         raise RuntimeError("Today context was not an object.")
@@ -232,7 +271,9 @@ def process_once(base_url: str, token: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--once", action="store_true", help="tick once, claim at most one job, exit")
+    parser.add_argument("--once", action="store_true", help="claim at most one job, exit")
+    parser.add_argument("--allow-ai", action="store_true", help="explicitly permit potentially paid AI briefing calls")
+    parser.add_argument("--tick-schedules", action="store_true", help="tick canonical schedules (may enqueue AI jobs); requires RUNTIME_TOKEN")
     args = parser.parse_args(argv)
 
     base_url = os.environ.get("TYLEROS_URL", "http://localhost:3000").rstrip("/")
@@ -244,28 +285,32 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    if args.tick_schedules and not tick_token:
+        print("--tick-schedules requires RUNTIME_TOKEN.", file=sys.stderr)
+        return 1
+
     poll_seconds = float(os.environ.get("TYLEROS_POLL_SECONDS", "5"))
     tick_seconds = float(os.environ.get("TYLEROS_TICK_SECONDS", "60"))
 
     if args.once:
-        if tick_token:
+        if args.tick_schedules:
             tick_once(base_url, tick_token)
-        process_once(base_url, work_token)
+        process_once(base_url, work_token, allow_ai=args.allow_ai)
         return 0
 
     print(
-        f"Polling {base_url} as Miles on a Python runtime instance; ticking schedules every {tick_seconds:.0f}s."
+        f"Polling {base_url} as Miles; AI enabled: {args.allow_ai}; scheduler enabled: {args.tick_schedules}."
     )
     last_tick = 0.0
     while True:
         try:
             now = time.time()
-            if tick_token and now - last_tick >= tick_seconds:
+            if args.tick_schedules and now - last_tick >= tick_seconds:
                 tick_once(base_url, tick_token)
                 last_tick = now
-            process_once(base_url, work_token)
+            process_once(base_url, work_token, allow_ai=args.allow_ai)
         except Exception as error:  # noqa: BLE001 — keep the poller alive
-            print(f"poll failed: {error}", file=sys.stderr)
+            print(f"poll failed ({type(error).__name__}); verify runtime connectivity and authentication.", file=sys.stderr)
         time.sleep(poll_seconds)
 
 

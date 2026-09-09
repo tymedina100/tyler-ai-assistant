@@ -23,20 +23,59 @@ approval gates determine what may run.
 ## TylerOS runtime worker
 
 `tyleros_worker.py` is a small poller for the TylerOS product (`new-tyler-os`).
-It ticks the TylerOS scheduler (a clock, not Miles), claims jobs assigned to
+It optionally ticks the TylerOS scheduler (a clock, not Miles), claims jobs assigned to
 **Miles** as a named Python *instance*, and proposes a note only when Today has
 material. Prefer `TYLEROS_RUNTIME_CREDENTIAL` from TylerOS
 `pnpm runtime:bootstrap -- --role miles` so identity comes from the credential.
-`RUNTIME_TOKEN` still ticks schedules.
+`RUNTIME_TOKEN` is required when explicitly enabling scheduler ticks.
 
 ```bash
 export TYLEROS_URL=http://localhost:3000
 export RUNTIME_TOKEN=the-system-token
 export TYLEROS_RUNTIME_CREDENTIAL=tylrt_...
-python3 tyleros_worker.py --once   # tick once, claim at most one job
+python3 tyleros_worker.py --once   # claim at most one job; no AI or scheduler ticks
 # or long-running:
 python3 tyleros_worker.py
 ```
+
+### Safe standalone deployment
+
+Run `scripts/start_tyleros_worker.sh --once` for a single deterministic claim or omit
+`--once` for continuous polling. This worker uses only Python's standard library;
+it needs no pip install, Telegram token, or model provider key. `TYLEROS_PYTHON`
+can select the interpreter. Pass credentials through the process environment and
+keep them out of Git, command-line arguments, mobile clients, and logs.
+
+`Dockerfile.tyleros` packages only the worker and runs it as an unprivileged user:
+
+```bash
+docker build -f Dockerfile.tyleros -t tyleros-worker .
+# Supply TYLEROS_URL and TYLEROS_RUNTIME_CREDENTIAL in the host environment.
+docker run --rm -e TYLEROS_URL -e TYLEROS_RUNTIME_CREDENTIAL tyleros-worker --once
+```
+
+For a pre-existing, authorized container host, select this Dockerfile and set those
+two environment variables server-side. This does not provision hosting or authorize
+spending. The other Dockerfiles run Telegram and do not package this worker.
+
+The default process **never calls AI** and does **not tick schedules**, even when
+`RUNTIME_TOKEN` exists. It advertises `?kind=today_briefing` to the canonical claim
+API, leaving AI jobs queued for capable, authorized workers. The API accepts
+repeated `kind` parameters; omitting them preserves the legacy claim protocol.
+Deploy the matching TylerOS API change before connecting this worker to a mixed
+queue. As a defense against an older server ignoring the filter, any claimed AI
+job is completed as failed with an explicit explanation and no proposal. Unknown
+kinds are always refused before reading context, even with AI opted in.
+
+Only after explicit spending authorization, `--allow-ai` enables the existing
+potentially paid `/brief` route. Separately, `--tick-schedules` requires
+`RUNTIME_TOKEN` and enables canonical schedule ticks, which may enqueue AI jobs.
+Neither opt-in overrides canonical approval or standing-authority rules. Do not
+pass either flag for the mobile no-cost verification path.
+
+The existing no-model flow is Today briefing -> draft note proposal -> Tyler's
+approval (or matching standing authority) -> canonical note. General Miles chat,
+email sending and arbitrary job instructions are not executed by this worker.
 
 ## Features
 
