@@ -1485,3 +1485,18 @@ and specialist decision quality remain unfinished.
 Supported interfaces verified against [non-interactive Codex](https://learn.chatgpt.com/docs/non-interactive-mode),
 [authentication](https://learn.chatgpt.com/docs/auth), and
 [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+### Durable attempts before queue integration
+
+Use `subscription_attempts.analyze_once` with the queue's persisted UUID and one
+private absolute SQLite ledger path per account. Identical successful retries read
+the saved result without executing Codex again; changed input under an existing ID
+is rejected. An atomic account-wide running slot prevents concurrent invocations
+through that ledger. Failed attempts remain failed; a process that exits mid-call
+leaves a running record held for explicit reconciliation. Do not automatically
+replace its ID or delete the ledger to retry. The ledger stores the request hash,
+status and output receipt, not the prompt or credentials, and uses mode600 outside
+this repository. Returned summaries can contain personal information.
+
+This local boundary does not reserve quota across unrelated Codex apps or hosts.
+Production queue wiring and a user-visible reconciliation flow are still pending.
