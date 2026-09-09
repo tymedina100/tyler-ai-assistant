@@ -58,3 +58,24 @@ class BriefingWorkerTests(unittest.TestCase):
             inspect.assert_called_once_with("/private/ledger.db")
             credentials.assert_not_called()
             quota.assert_not_called()
+
+    def test_response_lost_after_server_commit_is_acknowledged_without_second_delivery(self):
+        run_id = str(uuid4())
+        prepared = {"status": "prepared", "request": {"runId": run_id, "model": "explicit", "effort": "low", "prompt": "frozen context"}}
+        committed = False
+        deliveries = []
+        def transport(method, url, token, **kwargs):
+            nonlocal committed
+            if url.endswith("/prepare"):
+                return {"status": "succeeded", "jobStatus": "needs_approval"} if committed else prepared
+            deliveries.append(kwargs["payload"])
+            committed = True
+            raise RuntimeError("Response lost after server commit")
+        with tempfile.TemporaryDirectory() as directory, patch("codex_briefing_worker.request_json", side_effect=transport), patch("subscription_attempts.analyze", return_value={"judgment": {"summary": "fixture", "priorities": [], "needsTyler": [], "watch": []}}) as execute:
+            options = dict(ledger_path=str(Path(directory)/"attempts.db"), binary="/trusted/codex", enabled=True)
+            with self.assertRaises(RuntimeError):
+                resume_run("http://localhost:3004", "fixture", run_id, **options)
+            result = resume_run("http://localhost:3004", "fixture", run_id, delivery_only=True, **options)
+            self.assertEqual(result, {"status": "succeeded", "jobStatus": "needs_approval"})
+            execute.assert_called_once()
+            self.assertEqual(len(deliveries), 1)

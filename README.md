@@ -1557,9 +1557,10 @@ above. Delivery-only requires a successful local receipt before contacting the
 server and cannot start inference, even if no receipt exists. It validates the
 frozen intent before sending the saved judgment. The server still enforces run
 ownership, current claim and approval rules. If the server already completed the
-run but its response was lost, it may reject recovery as a stale claim; inspect
-server state rather than starting a replacement job. This change does not yet
-reconcile that server receipt automatically.
+run but its response was lost, preparation acknowledges the successful run with
+its current job status. `needs_approval` still requires the existing approval flow;
+it is not a saved note. Recovery sends no second completion request. Wrong-owner
+and failed attempts are not acknowledged as successful.
 
 Neither command clears a held attempt, invents a successful result, nor retries a
 failed/uncertain model call. Explicit resolution of interrupted attempts remains
