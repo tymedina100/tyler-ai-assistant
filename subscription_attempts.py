@@ -99,3 +99,17 @@ def inspect_attempts(ledger_path: str, *, attempt_id: str | None = None) -> list
         }[row["status"]]} for row in rows]
     finally:
         db.close()
+
+
+def assert_ledger_available(ledger_path: str) -> None:
+    """Fail before claiming another job when a prior model outcome is uncertain.
+
+    This is admission evidence, not a reservation. analyze_once still owns the
+    atomic execution slot and rechecks it immediately before inference.
+    """
+    db = _connect(ledger_path)
+    try:
+        if db.execute("select 1 from attempts where status='running' limit 1").fetchone():
+            raise SubscriptionUnavailable("A subscription attempt holds this ledger; no new job claimed.")
+    finally:
+        db.close()

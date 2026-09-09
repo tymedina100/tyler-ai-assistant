@@ -1565,3 +1565,10 @@ and failed attempts are not acknowledged as successful.
 Neither command clears a held attempt, invents a successful result, nor retries a
 failed/uncertain model call. Explicit resolution of interrupted attempts remains
 unfinished; do not delete the ledger or replace an attempt ID to bypass the hold.
+
+
+Before claiming a new job, the consumer opens its configured ledger and refuses
+admission if any prior attempt is still running/uncertain. Invalid ledger paths
+also fail before claim. This check does not clear old rows or infer process death.
+The atomic slot in analyze_once remains the final concurrency guard before model
+execution; the earlier check is not a cross-host quota or queue reservation.

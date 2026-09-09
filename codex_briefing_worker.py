@@ -8,7 +8,7 @@ from uuid import UUID
 
 from codex_subscription import QuotaEvidence, SubscriptionUnavailable, validate_quota
 from codex_quota import read_quota
-from subscription_attempts import analyze_once, inspect_attempts
+from subscription_attempts import analyze_once, inspect_attempts, assert_ledger_available
 from tyleros_worker import request_json, work_and_tick_tokens
 
 
@@ -45,6 +45,7 @@ def process_once(base_url, token, **options):
     if options.get("quota") is None:
         options["quota"] = read_quota(options["binary"])
     validate_quota(options["quota"])
+    assert_ledger_available(options["ledger_path"])
     claimed = request_json("GET", base_url + "/api/runtime/jobs/next?kind=today_briefing_codex", token)
     if not claimed or not claimed.get("job"):
         return None

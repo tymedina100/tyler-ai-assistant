@@ -79,3 +79,24 @@ class BriefingWorkerTests(unittest.TestCase):
             self.assertEqual(result, {"status": "succeeded", "jobStatus": "needs_approval"})
             execute.assert_called_once()
             self.assertEqual(len(deliveries), 1)
+
+    def test_interrupted_ledger_leaves_next_job_unclaimed(self):
+        import sqlite3
+        from subscription_attempts import _connect
+        with tempfile.TemporaryDirectory() as directory, patch("codex_briefing_worker.request_json") as request:
+            ledger = str(Path(directory)/"attempts.db")
+            db = _connect(ledger)
+            db.execute("insert into attempts(id,request_hash,status,started_at) values(?,?,'running',?)", (str(uuid4()), 'fixture', time.time()))
+            db.close()
+            with self.assertRaisesRegex(SubscriptionUnavailable, "no new job claimed"):
+                process_once("http://localhost:3004", "fixture", ledger_path=ledger, binary="/trusted/codex", enabled=True, quota=QuotaEvidence(time.time(),0))
+            request.assert_not_called()
+            with sqlite3.connect(ledger) as db:
+                self.assertEqual(db.execute("select status from attempts").fetchone()[0], "running")
+
+    def test_new_ledger_admits_empty_queue_without_inference(self):
+        with tempfile.TemporaryDirectory() as directory, patch("codex_briefing_worker.request_json", return_value={"job": None}) as request, patch("codex_briefing_worker.analyze_once") as analyze:
+            result = process_once("http://localhost:3004", "fixture", ledger_path=str(Path(directory)/"attempts.db"), binary="/trusted/codex", enabled=True, quota=QuotaEvidence(time.time(),0))
+            self.assertIsNone(result)
+            request.assert_called_once()
+            analyze.assert_not_called()
