@@ -105,3 +105,14 @@ command can handle its own automation access; that does not automatically give
 the independently running worker an equivalent credential.
 
 Tests: `python3 -m unittest tests.test_tyleros_launchd tests.test_tyleros_worker tests.test_tyleros_worker_transport`.
+
+## Operations briefing context (release pending)
+
+The worker renders optional canonical `operations` counts alongside the existing
+Today task and food sections. It labels saved notes, waiting proposals and recent
+failed jobs separately. Missing fields preserve legacy behavior. Counts never
+turn an otherwise empty day into a new briefing, preventing the worker's own
+pending note from generating more pending notes. No new flags or paid execution
+are enabled. Release together with the web operations-summary change.
+
+Verify: `python3 -m unittest tests.test_tyleros_operations tests.test_tyleros_worker tests.test_tyleros_worker_transport`.
