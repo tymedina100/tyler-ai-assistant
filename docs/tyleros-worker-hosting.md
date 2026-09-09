@@ -34,15 +34,36 @@ unknown keys, insecure remote HTTP, weak credential format, permissive modes, an
 symlinked config files. It executes Python directly with an isolated environment;
 AI and scheduler flags remain off.
 
-From the repo, prepare a plist in your private working directory:
+On macOS, do not launch scripts or read configuration from Documents/Desktop/Downloads.
+Background LaunchAgents can be denied access by TCC even when the same command
+works in a terminal. The observed symptom is Python exiting 2 with “Operation not
+permitted” opening the script. Use a private runtime directory under
+`~/Library/Application Support/TylerOS/MobileCompanion` (mode 700), with this layout:
+
+```text
+MobileCompanion/
+  tyleros_worker.py
+  scripts/tyleros_launchd.py
+  worker.json
+```
+
+Copy only the worker, helper, and private configuration there with file mode 600;
+keep `scripts/` mode 700. No model SDKs, repository `.env`, or personal snapshots
+are needed. When updating code, stop this service after active work completes,
+copy the verified worker/helper, then restart it. Record the installed worker
+hash with verification evidence so the runtime copy can be compared to source.
+Use a Python executable outside Documents as well; the Xcode Python executable
+was verified on this Mac.
+
+Run the **copied** helper to prepare a plist in that same private directory:
 
 ```sh
-python3 scripts/tyleros_launchd.py prepare /absolute/private/worker.json --output /absolute/private/com.tyleros.mobile-companion.plist
+python3 "$HOME/Library/Application Support/TylerOS/MobileCompanion/scripts/tyleros_launchd.py" prepare "$HOME/Library/Application Support/TylerOS/MobileCompanion/worker.json" --output /absolute/private/com.tyleros.mobile-companion.plist
 plutil -lint /absolute/private/com.tyleros.mobile-companion.plist
 ```
 
 Preparation does not install or start a service. Existing plist files are never
-overwritten. Keep this checkout, its Python executable, and the config in place:
+overwritten. Keep the private runtime copy, its Python executable, and the config in place:
 the generated plist contains their absolute paths but no secrets. Both log streams
 go to `/dev/null`; inspect authenticated fleet health and job results for health,
 and use `launchctl print` for process state.
