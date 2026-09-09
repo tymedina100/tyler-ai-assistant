@@ -1505,8 +1505,8 @@ Production queue wiring and a user-visible reconciliation flow are still pending
 
 `codex_briefing_worker.py` claims only `today_briefing_codex` jobs. Configure the
 existing runtime credential and HTTPS `TYLEROS_URL`, then explicitly pass
-`--enable-subscription --binary /trusted/path/to/codex --ledger /private/attempts.db
---quota-file /private/quota.json`. Quota JSON contains `observed_at` (Unix seconds),
+`--enable-subscription --binary /trusted/path/to/codex --ledger /private/attempts.db`.
+An optional `--quota-file /private/quota.json` overrides the default live read. Quota JSON contains `observed_at` (Unix seconds),
 `used_percent`, and optional `exhausted`, sourced from a fresh supported account
 usage observation. Do not invent quota values when unavailable. The selected
 server profile supplies the model; this first workflow uses low reasoning effort.
@@ -1517,6 +1517,26 @@ creates a pending note proposal under the existing approval rules. Existing
 production workers do not claim this job kind. `--resume-run UUID` resumes a known
 attempt; a completed local receipt avoids another model call after a failed
 completion request. An interrupted or failed local inference remains held for
-reconciliation. There is no automatic scheduling, API fallback, or quota refresh.
+reconciliation. There is no automatic scheduling or API fallback. Quota now refreshes through the
+supported app-server account interface before each new claim.
 Server migrations0013/0014 and this worker need an approved release before use in
 production. A real isolated HTTP/CLI/approval/note flow was verified locally.
+
+
+### Live account quota admission
+
+`codex_quota.read_quota` uses documented `initialize`, `initialized`, and
+`account/rateLimits/read` RPC over private stdio. It starts no model turn, thread,
+reset redemption, credit purchase or owner email. It strips inherited API keys,
+requires ChatGPT auth, bounds response size/time, and terminates its helper process.
+The configured standard `codex` bucket must be present; the most consumed primary
+or secondary window controls admission. Unknown, malformed, expired or exhausted
+limits do not claim work. No fallback to a different bucket or legacy value when
+a multi-bucket response omits the requested bucket. Optional manual evidence is
+validated before claiming too. Other model-specific quota buckets need explicit
+mapping before use; this default is for standard Codex subscription profiles.
+
+Completed durable receipts can still be delivered without another quota read or
+model call through `--resume-run`; new inference obtains live quota if not supplied.
+This remains admission control, not a hard token reservation across all hosts.
+Reference: https://learn.chatgpt.com/docs/app-server

@@ -6,6 +6,7 @@ Caller supplies explicit model/effort and freshly observed account quota.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -25,15 +26,26 @@ class SubscriptionUnavailable(RuntimeError):
     pass
 
 
+def validate_quota(quota: QuotaEvidence) -> None:
+    if (type(quota.observed_at) not in (int, float) or not math.isfinite(quota.observed_at)
+            or type(quota.used_percent) not in (int, float) or not math.isfinite(quota.used_percent)
+            or type(quota.exhausted) is not bool):
+        raise SubscriptionUnavailable("Invalid quota evidence.")
+    age = time.time() - quota.observed_at
+    if not 0 <= age <= 300 or not 0 <= quota.used_percent <= 90 or quota.exhausted:
+        raise SubscriptionUnavailable("Fresh quota with at least 10% reserve is required.")
+
+
 def analyze(prompt: str, *, binary: str, model: str, effort: str,
-            quota: QuotaEvidence, enabled: bool = False, timeout: int = 90, response_kind: str = "summary") -> dict:
+            quota: QuotaEvidence | None = None, enabled: bool = False, timeout: int = 90, response_kind: str = "summary") -> dict:
     if response_kind not in {"summary", "miles_judgment"}:
         raise ValueError("Unknown structured analysis kind.")
     if not enabled:
         raise SubscriptionUnavailable("Subscription execution is not enabled.")
-    age = time.time() - quota.observed_at
-    if not 0 <= age <= 300 or not 0 <= quota.used_percent <= 90 or quota.exhausted:
-        raise SubscriptionUnavailable("Fresh quota with at least 10% reserve is required.")
+    if quota is None:
+        from codex_quota import read_quota
+        quota = read_quota(binary)
+    validate_quota(quota)
     if not model or effort not in {"low", "medium", "high"}:
         raise ValueError("An explicit model and supported effort are required.")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 20000:

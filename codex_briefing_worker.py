@@ -6,12 +6,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from codex_subscription import QuotaEvidence, SubscriptionUnavailable
+from codex_subscription import QuotaEvidence, SubscriptionUnavailable, validate_quota
+from codex_quota import read_quota
 from subscription_attempts import analyze_once
 from tyleros_worker import request_json, work_and_tick_tokens
 
 
-def resume_run(base_url, token, run_id, *, ledger_path, binary, quota, enabled=False):
+def resume_run(base_url, token, run_id, *, ledger_path, binary, quota=None, enabled=False):
     if not enabled:
         raise SubscriptionUnavailable("Subscription execution is not enabled.")
     run_id = str(UUID(run_id))
@@ -36,6 +37,10 @@ def resume_run(base_url, token, run_id, *, ledger_path, binary, quota, enabled=F
 def process_once(base_url, token, **options):
     if not options.get("enabled"):
         raise SubscriptionUnavailable("Subscription execution is not enabled.")
+    options = dict(options)
+    if options.get("quota") is None:
+        options["quota"] = read_quota(options["binary"])
+    validate_quota(options["quota"])
     claimed = request_json("GET", base_url + "/api/runtime/jobs/next?kind=today_briefing_codex", token)
     if not claimed or not claimed.get("job"):
         return None
@@ -49,7 +54,7 @@ def main():
     parser.add_argument("--enable-subscription", action="store_true")
     parser.add_argument("--ledger", required=True)
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--quota-file", required=True)
+    parser.add_argument("--quota-file", help="Optional fresh quota evidence override; otherwise read supported app-server limits")
     parser.add_argument("--resume-run")
     args = parser.parse_args()
     if not args.enable_subscription:
@@ -61,7 +66,7 @@ def main():
     token, _ = work_and_tick_tokens()
     if len(token) < 32:
         parser.error("Configure the existing runtime credential.")
-    quota = QuotaEvidence(**json.loads(Path(args.quota_file).read_text()))
+    quota = QuotaEvidence(**json.loads(Path(args.quota_file).read_text())) if args.quota_file else None
     options = dict(ledger_path=args.ledger, binary=args.binary, quota=quota, enabled=True)
     result = resume_run(base_url, token, args.resume_run, **options) if args.resume_run else process_once(base_url, token, **options)
     print(json.dumps(result))
