@@ -36,8 +36,9 @@ reports, reminders, memory, and Office state then survive redeploys together. Wh
 `DATA_DIR` is unset, the code uses Railway's `RAILWAY_VOLUME_MOUNT_PATH` when available,
 then the repository directory.
 
-Worthlane uses the `vantage` project key and intentionally targets the
-`tymedina100/vantage` GitHub repo. Local folder names may differ and should not
+Worthlane retains the legacy `vantage` project key for persisted selections and
+`LINEAR_PROJECT_ID_VANTAGE` configuration, and targets the current
+`tymedina100/worthlane` GitHub repo. Local folder names may differ and should not
 be treated as the canonical repo name.
 
 ## 2. Switching the active project
@@ -94,7 +95,7 @@ key + GitHub repo, so they stay traceable:
 ---
 Created by Tyler AI Assistant
 Project key: vantage
-GitHub repo: tymedina100/vantage
+GitHub repo: tymedina100/worthlane
 ```
 
 If `LINEAR_API_KEY` isn't set, every `/linear` command returns a friendly

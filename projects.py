@@ -88,6 +88,8 @@ def find_by_linear_project(linear_project_name):
         linked = (profile.get("linear_project") or "").strip().lower()
         if linked and linked == name:
             return key
+    if name == "vantage" and "vantage" in load_registry():
+        return "vantage"  # Historical Linear project name.
     # Fallback: match against the human name (handles "Worthlane / Vantage" vs "Worthlane").
     for key, profile in load_registry().items():
         human = (profile.get("name") or "").strip().lower()

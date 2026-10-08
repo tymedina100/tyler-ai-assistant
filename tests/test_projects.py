@@ -38,13 +38,13 @@ class ProjectRegistryTests(unittest.TestCase):
         self.assertIn("assistant", reg)
         self.assertIn("vantage", reg)
         self.assertIn("card-tracker", reg)
-        self.assertEqual(reg["vantage"]["repo"], "tymedina100/vantage")
+        self.assertEqual(reg["vantage"]["repo"], "tymedina100/worthlane")
 
     def test_set_active_project_selects_and_persists(self):
         with patch.dict(os.environ, self._env(), clear=False):
             profile, err = projects.set_active_project("vantage")
             self.assertIsNone(err)
-            self.assertEqual(profile["repo"], "tymedina100/vantage")
+            self.assertEqual(profile["repo"], "tymedina100/worthlane")
 
             key, prof = projects.get_active_project()
             self.assertEqual(key, "vantage")
@@ -79,7 +79,7 @@ class ProjectRegistryTests(unittest.TestCase):
                 projects.end_scoped_project(tokens)
 
             self.assertEqual(projects.get_active_project()[0], "vantage")
-            self.assertEqual(github_helpers._code_config()[1], "tymedina100/vantage")
+            self.assertEqual(github_helpers._code_config()[1], "tymedina100/worthlane")
 
     def test_falls_back_to_env_without_active_project(self):
         env = self._env(GITHUB_TOKEN="tok", GITHUB_CODE_REPO="me/envrepo", GITHUB_CODE_BASE="dev")
