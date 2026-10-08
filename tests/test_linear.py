@@ -78,7 +78,7 @@ class LinearHelpersTests(unittest.TestCase):
         desc = captured["json"]["variables"]["input"]["description"]
         self.assertIn("body", desc)
         self.assertIn("Project key: vantage", desc)
-        self.assertIn("tymedina100/vantage", desc)
+        self.assertIn("tymedina100/worthlane", desc)
 
     def test_api_error_is_reported_cleanly(self):
         with patch.dict(os.environ, {"LINEAR_API_KEY": "k"}, clear=True), \
